@@ -1,3 +1,5 @@
+use std::ops::{BitAnd, BitOr, BitXor};
+
 use crate::{
     bus::Bus,
     dram::{Dram, DRAM_SIZE},
@@ -38,21 +40,12 @@ impl Cpu {
     }
 
     pub fn run(&mut self) -> Result<(), std::io::Error> {
-        loop {
-            let inst = match self.fetch() {
-                Ok(inst) => inst,
-                Err(_) => break,
-            };
-
+        while let Ok(inst) = self.fetch() {
             self.pc += 4;
 
             // 3. Decode.
             // 4. Execute.
-            match self.execute(inst) {
-                // Break the loop if an error occurs.
-                Ok(_) => {}
-                Err(_) => break,
-            }
+            while self.execute(inst).is_ok() {}
 
             // This is a workaround for avoiding an infinite loop.
             if self.pc == 0 {
@@ -91,6 +84,7 @@ impl Cpu {
         let rs1 = ((inst >> 15) & 0x1f) as usize;
         let rs2 = ((inst >> 20) & 0x1f) as usize;
         let funct3 = (inst >> 12) & 0x7;
+        let funct7 = (inst >> 25) & 0x7f;
         match opcode {
             // load
             0x03 => {
@@ -144,18 +138,98 @@ impl Cpu {
                     _ => Err(())?,
                 }
             }
-            // addi
+            // base imm
             0x13 => {
                 let imm = ((inst & 0xfff00000) as i32 as i64 >> 20) as u64;
-                self.regs[rd] = self.regs[rs1].wrapping_add(imm);
+                let imm04 = rs2;
+                match (funct3, funct7) {
+                    (0x0, _) => {
+                        // addi
+                        self.regs[rd] = self.regs[rs1].wrapping_add(imm);
+                    }
+                    (0x4, _) => {
+                        // xori
+                        self.regs[rd] = self.regs[rs1].bitxor(imm);
+                    }
+                    (0x6, _) => {
+                        // ori
+                        self.regs[rd] = self.regs[rs1].bitor(imm);
+                    }
+                    (0x7, _) => {
+                        // andi
+                        self.regs[rd] = self.regs[rs1].bitand(imm);
+                    }
+                    (0x1, 0x00) => {
+                        // slli
+                        self.regs[rd] = self.regs[rs1].wrapping_shr(imm04 as u32);
+                    }
+                    (0x5, 0x00) => {
+                        // srli
+                        self.regs[rd] = self.regs[rs1].wrapping_shl(imm04 as u32);
+                    }
+                    (0x5, 0x20) => {
+                        // srai
+                        self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(imm04 as u32) as u64;
+                    }
+                    (0x2, _) => {
+                        // slti
+                        self.regs[rd] = ((self.regs[rs1] as i64) < (imm as i64)) as u64
+                    }
+                    (0x3, _) => {
+                        // sltiu
+                        self.regs[rd] = (self.regs[rs1] < imm) as u64
+                    }
+                    _ => Err(())?,
+                }
             }
-            // add
+            // base R
             0x33 => {
-                self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
+                match (funct3, funct7) {
+                    (0x0, 0x0) => {
+                        // add
+                        self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
+                    }
+                    (0x0, 0x20) => {
+                        // sub
+                        self.regs[rd] = self.regs[rs1].wrapping_sub(self.regs[rs2]);
+                    }
+                    (0x4, 0x0) => {
+                        // xor
+                        self.regs[rd] = self.regs[rs1].bitxor(self.regs[rs2]);
+                    }
+                    (0x6, 0x0) => {
+                        // and
+                        self.regs[rd] = self.regs[rs1].bitand(self.regs[rs2]);
+                    }
+                    (0x1, 0x0) => {
+                        // sll logical
+                        self.regs[rd] = self.regs[rs1].wrapping_shl(self.regs[rs2] as u32);
+                    }
+                    (0x5, 0x0) => {
+                        // srl logical
+                        self.regs[rd] = self.regs[rs1].wrapping_shr(self.regs[rs2] as u32);
+                    }
+                    (0x5, 0x20) => {
+                        // sra
+                        self.regs[rd] =
+                            (self.regs[rs1] as i64).wrapping_shr(self.regs[rs2] as u32) as u64;
+                    }
+                    (0x2, 0x0) => {
+                        // slt
+                        self.regs[rd] = ((self.regs[rs1] as i64) < (self.regs[rs2] as i64)) as u64
+                    }
+                    (0x3, 0x0) => {
+                        // sltu
+                        self.regs[rd] = (self.regs[rs1] < self.regs[rs2]) as u64
+                    }
+                    _ => Err(())?,
+                }
             }
-            0b1110011 => {
+
+            0x73 => {
                 // csr
 
+                todo!();
                 match funct3 {
                     _ => Err(())?,
                 }
