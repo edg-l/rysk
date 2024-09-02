@@ -8,7 +8,17 @@ pub struct Cpu {
     pub regs: [u64; 32],
     pub pc: u64,
     pub bus: Bus,
+    /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
+    /// space (csr[11:0]) for up to 4096 CSRs.
+    pub csrs: [u64; 4096],
 }
+
+const MIP: usize = 0x344;
+const MIE: usize = 0x304;
+const SIP: usize = 0x144;
+const SIE: usize = 0x104;
+const MEDELEG: usize = 0x302;
+const MIDELEG: usize = 0x303;
 
 impl Cpu {
     pub fn new(code: Vec<u8>) -> Self {
@@ -18,6 +28,7 @@ impl Cpu {
             bus: Bus {
                 dram: Dram::new(code),
             },
+            csrs: [0; 4096],
         };
 
         cpu.regs[0] = 0;
@@ -50,6 +61,23 @@ impl Cpu {
         }
 
         Ok(())
+    }
+
+    fn load_csr(&self, addr: usize) -> u64 {
+        match addr {
+            SIE => self.csrs[MIE] & self.csrs[MIDELEG],
+            _ => self.csrs[addr],
+        }
+    }
+
+    fn store_csr(&mut self, addr: usize, value: u64) {
+        match addr {
+            SIE => {
+                self.csrs[MIE] =
+                    (self.csrs[MIE] & !self.csrs[MIDELEG]) | (value & self.csrs[MIDELEG]);
+            }
+            _ => self.csrs[addr] = value,
+        }
     }
 
     #[inline]
@@ -85,7 +113,7 @@ impl Cpu {
                     }
                     0x3 => {
                         // ld
-                        self.regs[rd] = self.bus.load(addr, 32)? as i64 as u64;
+                        self.regs[rd] = self.bus.load(addr, 64)? as i64 as u64;
                     }
                     0x4 => {
                         // lbu
@@ -125,6 +153,13 @@ impl Cpu {
             0x33 => {
                 self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
             }
+            0b1110011 => {
+                // csr
+
+                match funct3 {
+                    _ => Err(())?,
+                }
+            }
 
             x => unimplemented!("{:#09b}", x),
         }
@@ -134,7 +169,7 @@ impl Cpu {
 
     pub fn dump_registers(&self) {
         for (i, r) in self.regs.iter().enumerate() {
-            print!("r{:02} = 0x{:08x},\t\t", i, r);
+            print!("x{:02} = 0x{:08x},\t\t", i, r);
             if (i + 1) % 4 == 0 {
                 println!()
             }

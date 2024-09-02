@@ -10,7 +10,7 @@ pub struct Dram {
 impl Dram {
     pub fn new(code: Vec<u8>) -> Dram {
         let mut dram = vec![0; DRAM_SIZE as usize];
-        dram.splice(..code.len(), code.into_iter());
+        dram.splice(..code.len(), code);
 
         Self { dram }
     }
@@ -29,10 +29,22 @@ impl Dram {
     #[inline]
     pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
         match size {
-            8 => Ok(self.store8(addr, value)),
-            16 => Ok(self.store16(addr, value)),
-            32 => Ok(self.store32(addr, value)),
-            64 => Ok(self.store64(addr, value)),
+            8 => {
+                self.store8(addr, value);
+                Ok(())
+            }
+            16 => {
+                self.store16(addr, value);
+                Ok(())
+            }
+            32 => {
+                self.store32(addr, value);
+                Ok(())
+            }
+            64 => {
+                self.store64(addr, value);
+                Ok(())
+            }
             _ => Err(()),
         }
     }
@@ -40,14 +52,14 @@ impl Dram {
     #[inline]
     fn load64(&self, addr: u64) -> u64 {
         let index = (addr - DRAM_BASE) as usize;
-        return (self.dram[index] as u64)
+        (self.dram[index] as u64)
             | ((self.dram[index + 1] as u64) << 8)
             | ((self.dram[index + 2] as u64) << 16)
             | ((self.dram[index + 3] as u64) << 24)
             | ((self.dram[index + 4] as u64) << 32)
             | ((self.dram[index + 5] as u64) << 38)
             | ((self.dram[index + 6] as u64) << 46)
-            | ((self.dram[index + 7] as u64) << 54);
+            | ((self.dram[index + 7] as u64) << 54)
     }
 
     #[inline]
@@ -66,10 +78,10 @@ impl Dram {
     #[inline]
     fn load32(&self, addr: u64) -> u64 {
         let index = (addr - DRAM_BASE) as usize;
-        return (self.dram[index] as u64)
+        (self.dram[index] as u64)
             | ((self.dram[index + 1] as u64) << 8)
             | ((self.dram[index + 2] as u64) << 16)
-            | ((self.dram[index + 3] as u64) << 24);
+            | ((self.dram[index + 3] as u64) << 24)
     }
 
     #[inline]
@@ -84,7 +96,7 @@ impl Dram {
     #[inline]
     fn load16(&self, addr: u64) -> u64 {
         let index = (addr - DRAM_BASE) as usize;
-        return (self.dram[index] as u64) | ((self.dram[index + 1] as u64) << 8);
+        (self.dram[index] as u64) | ((self.dram[index + 1] as u64) << 8)
     }
 
     #[inline]
@@ -97,7 +109,7 @@ impl Dram {
     #[inline]
     fn load8(&self, addr: u64) -> u64 {
         let index = (addr - DRAM_BASE) as usize;
-        return self.dram[index] as u64;
+        self.dram[index] as u64
     }
 
     #[inline]
