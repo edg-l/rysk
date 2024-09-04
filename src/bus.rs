@@ -1,3 +1,5 @@
+use tracing::{debug, instrument};
+
 use crate::dram::Dram;
 
 /// The address which dram starts, same as QEMU virt machine.
@@ -9,14 +11,18 @@ pub struct Bus {
 }
 
 impl Bus {
+    #[instrument(skip(self))]
     pub fn load(&self, addr: u64, size: u64) -> Result<u64, ()> {
+        debug!("load");
         if DRAM_BASE <= addr {
             return self.dram.load(addr, size);
         }
         Err(())
     }
 
+    #[instrument(skip(self))]
     pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
+        debug!("store");
         if DRAM_BASE <= addr {
             return self.dram.store(addr, size, value);
         }

@@ -4,7 +4,7 @@ pub const DRAM_SIZE: u64 = 1024 * 1024 * 128; // 128MiB
 
 #[derive(Debug, Clone)]
 pub struct Dram {
-    dram: Vec<u8>,
+    pub dram: Vec<u8>,
 }
 
 impl Dram {

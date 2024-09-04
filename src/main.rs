@@ -1,12 +1,8 @@
 use std::{env, fs::File, io::Read};
 
-use cpu::Cpu;
+use rysk::cpu::Cpu;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-mod bus;
-mod cpu;
-mod dram;
 
 fn main() -> Result<(), std::io::Error> {
     tracing::subscriber::set_global_default(

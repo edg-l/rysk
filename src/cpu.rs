@@ -17,12 +17,12 @@ pub struct Cpu {
     pub csrs: [u64; 4096],
 }
 
-const MIP: usize = 0x344;
-const MIE: usize = 0x304;
-const SIP: usize = 0x144;
-const SIE: usize = 0x104;
-const MEDELEG: usize = 0x302;
-const MIDELEG: usize = 0x303;
+pub const MIP: usize = 0x344;
+pub const MIE: usize = 0x304;
+pub const SIP: usize = 0x144;
+pub const SIE: usize = 0x104;
+pub const MEDELEG: usize = 0x302;
+pub const MIDELEG: usize = 0x303;
 
 impl Cpu {
     pub fn new(code: Vec<u8>) -> Self {
@@ -51,6 +51,8 @@ impl Cpu {
                 break;
             }
 
+            self.regs[0] = 0;
+
             // This is a workaround for avoiding an infinite loop.
             if self.pc == 0 {
                 break;
@@ -60,14 +62,18 @@ impl Cpu {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn load_csr(&self, addr: usize) -> u64 {
+        debug!("loading csr");
         match addr {
             SIE => self.csrs[MIE] & self.csrs[MIDELEG],
             _ => self.csrs[addr],
         }
     }
 
+    #[instrument(skip(self))]
     fn store_csr(&mut self, addr: usize, value: u64) {
+        debug!("storing csr");
         match addr {
             SIE => {
                 self.csrs[MIE] =
