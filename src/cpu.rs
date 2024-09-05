@@ -276,6 +276,11 @@ impl Cpu {
                     }
                     (0x6, 0x0) => {
                         // and
+                        debug!("OR");
+                        self.regs[rd] = self.regs[rs1].bitor(self.regs[rs2]);
+                    }
+                    (0x7, 0x0) => {
+                        // and
                         debug!("AND");
                         self.regs[rd] = self.regs[rs1].bitand(self.regs[rs2]);
                     }
@@ -322,6 +327,71 @@ impl Cpu {
                             self.regs[rd] = self.regs[rs1];
                         }
                     }
+                    (0x0, 0x1) => {
+                        // mul
+                        debug!("MUL");
+                        self.regs[rd] = self.regs[rs1].wrapping_mul(self.regs[rs2]);
+                    }
+                    (0x1, 0x1) => {
+                        // mulh
+                        debug!("MULH");
+                        self.regs[rd] = ((self.regs[rs1] as i128)
+                            .wrapping_mul(self.regs[rs2] as i128)
+                            >> 64) as u64;
+                    }
+                    (0x3, 0x1) => {
+                        // mulhu
+                        debug!("MULHU");
+                        self.regs[rd] = ((self.regs[rs1] as u128)
+                            .wrapping_mul(self.regs[rs2] as u128)
+                            >> 64) as u64;
+                    }
+                    (0x2, 0x1) => {
+                        // mulhsu
+                        debug!("MULHSU");
+                        self.regs[rd] = ((self.regs[rs1] as i128)
+                            .wrapping_mul(self.regs[rs2] as u128 as i128)
+                            >> 64) as u64;
+                    }
+                    (0x4, 0x1) => {
+                        // div
+                        debug!("DIV");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] =
+                                (self.regs[rs1] as i64).wrapping_div(self.regs[rs2] as i64) as u64;
+                        }
+                    }
+                    (0x5, 0x1) => {
+                        // divu
+                        debug!("DIVU");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] = self.regs[rs1].wrapping_div(self.regs[rs2]);
+                        }
+                    }
+                    (0x6, 0x1) => {
+                        // rem
+                        debug!("REM");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] =
+                                (self.regs[rs1] as i64).wrapping_rem(self.regs[rs2] as i64) as u64;
+                        }
+                    }
+                    (0x7, 0x1) => {
+                        // remu
+                        debug!("REMU");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] = self.regs[rs1].wrapping_rem(self.regs[rs2]);
+                        }
+                    }
+                    // todo: mulw and friends
                     _ => Err(())?,
                 }
             }

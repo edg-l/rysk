@@ -11,8 +11,8 @@ Work in progress.
 
 Extensions implemented:
 
-- RV32I
 - RV64I
+- RV64M
 - Ziscr
 - Zicntr
 - Zicond
