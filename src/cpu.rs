@@ -1,4 +1,7 @@
-use std::ops::{BitAnd, BitOr, BitXor};
+use std::{
+    ops::{BitAnd, BitOr, BitXor},
+    time::Instant,
+};
 
 use tracing::{debug, error, instrument};
 
@@ -15,6 +18,7 @@ pub struct Cpu {
     /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
     /// space (csr[11:0]) for up to 4096 CSRs.
     pub csrs: [u64; 4096],
+    pub start: Instant,
 }
 
 pub const MIP: usize = 0x344;
@@ -23,6 +27,9 @@ pub const SIP: usize = 0x144;
 pub const SIE: usize = 0x104;
 pub const MEDELEG: usize = 0x302;
 pub const MIDELEG: usize = 0x303;
+pub const RDCYCLE: usize = 0xC00;
+pub const RDTIME: usize = 0xC01;
+pub const INSTRET: usize = 0xC02;
 
 impl Cpu {
     pub fn new(code: Vec<u8>) -> Self {
@@ -33,6 +40,7 @@ impl Cpu {
                 dram: Dram::new(code),
             },
             csrs: [0; 4096],
+            start: Instant::now(),
         };
 
         cpu.regs[0] = 0;
@@ -44,6 +52,11 @@ impl Cpu {
     pub fn run(&mut self) -> Result<(), std::io::Error> {
         while let Ok(inst) = self.fetch() {
             self.pc += 4;
+
+            // Update counters
+            self.csrs[RDCYCLE] += 1;
+            self.csrs[INSTRET] += 1;
+            self.csrs[RDTIME] = self.start.elapsed().as_secs();
 
             // 3. Decode.
             // 4. Execute.
