@@ -122,30 +122,37 @@ impl Cpu {
                 match funct3 {
                     0x0 => {
                         // lb
+                        debug!("LB");
                         self.regs[rd] = self.bus.load(addr, 8)? as i8 as i64 as u64;
                     }
                     0x1 => {
                         // lh
+                        debug!("LH");
                         self.regs[rd] = self.bus.load(addr, 16)? as i16 as i64 as u64;
                     }
                     0x2 => {
                         // lw
+                        debug!("LW");
                         self.regs[rd] = self.bus.load(addr, 32)? as i32 as i64 as u64;
                     }
                     0x3 => {
                         // ld
+                        debug!("LD");
                         self.regs[rd] = self.bus.load(addr, 64)? as i64 as u64;
                     }
                     0x4 => {
                         // lbu
+                        debug!("LBU");
                         self.regs[rd] = self.bus.load(addr, 8)?;
                     }
                     0x5 => {
                         // lhu
+                        debug!("LHU");
                         self.regs[rd] = self.bus.load(addr, 16)?;
                     }
                     0x6 => {
                         // lwu
+                        debug!("LWU");
                         self.regs[rd] = self.bus.load(addr, 32)?;
                     }
                     _ => Err(())?,
@@ -274,7 +281,29 @@ impl Cpu {
                     _ => Err(())?,
                 }
             }
-
+            0b0110111 => {
+                // LUI
+                let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
+                tracing::Span::current().record("imm", imm32);
+                debug!("LUI");
+                self.regs[rd] = imm32;
+            }
+            0b0010111 => {
+                // AUIPC
+                let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
+                tracing::Span::current().record("imm", imm32);
+                debug!("AUIPC");
+            }
+            0b1101111 => {
+                // JAL
+                // imm[20|10:1|11|19:12] = inst[31|30:21|20|19:12]
+                let imm = (((inst & 0x80000000) as i32 as i64 >> 11) as u64) // imm[20]
+                    | (inst & 0xff000) // imm[19:12]
+                    | ((inst >> 9) & 0x800) // imm[11]
+                    | ((inst >> 20) & 0x7fe); // imm[10:1]
+                self.regs[rd] = self.pc;
+                self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+            }
             0x73 => {
                 // csr
                 let csr_addr = ((inst & 0xfff00000) >> 20) as usize;
