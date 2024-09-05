@@ -6,6 +6,7 @@ use rysk::cpu::Cpu;
 #[rstest]
 #[case::addi("tests/addi.bin", &[(31, 6)], &[], &[])]
 #[case::csr("tests/csr.bin", &[(5, 1), (6, 2), (7, 3)], &[], &[(256, 4), (261, 5), (321, 6), (768, 1), (773, 2), (833, 3)])]
+#[case::fib("tests/fib.bin", &[(14, 1), (15, 0x37)], &[], &[])]
 fn run_test(
     #[case] path: &str,
     #[case] expected_regs: &[(usize, u64)],

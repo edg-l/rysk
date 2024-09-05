@@ -1,4 +1,4 @@
-use tracing::{debug, instrument};
+use tracing::{instrument, trace};
 
 use crate::dram::Dram;
 
@@ -13,7 +13,7 @@ pub struct Bus {
 impl Bus {
     #[instrument(skip(self))]
     pub fn load(&self, addr: u64, size: u64) -> Result<u64, ()> {
-        debug!("load");
+        trace!("load");
         if DRAM_BASE <= addr {
             return self.dram.load(addr, size);
         }
@@ -22,7 +22,7 @@ impl Bus {
 
     #[instrument(skip(self))]
     pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
-        debug!("store");
+        trace!("store");
         if DRAM_BASE <= addr {
             return self.dram.store(addr, size, value);
         }

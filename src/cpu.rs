@@ -90,13 +90,9 @@ impl Cpu {
 
     #[instrument(
         skip(self),
-        fields(opcode, rd, rs1, rs2, funct3, funct7, imm, imm04, csr, csr_addr)
+        fields(opcode, rd, rs1, rs2, funct3, funct7, imm, shamt, csr, csr_addr)
     )]
     fn execute(&mut self, inst: u64) -> Result<(), ()> {
-        if inst == 0 {
-            Err(())?
-        }
-
         let opcode = inst & 0x7f;
         let rd = ((inst >> 7) & 0x1f) as usize;
         let rs1 = ((inst >> 15) & 0x1f) as usize;
@@ -166,10 +162,22 @@ impl Cpu {
                 let addr = self.regs[rs1].wrapping_add(imm);
 
                 match funct3 {
-                    0x0 => self.bus.store(addr, 8, self.regs[rs2])?, // sb
-                    0x1 => self.bus.store(addr, 16, self.regs[rs2])?, // sh
-                    0x2 => self.bus.store(addr, 32, self.regs[rs2])?, // sb
-                    0x3 => self.bus.store(addr, 64, self.regs[rs2])?, // sb
+                    0x0 => {
+                        debug!("SB");
+                        self.bus.store(addr, 8, self.regs[rs2])?
+                    }
+                    0x1 => {
+                        debug!("SH");
+                        self.bus.store(addr, 16, self.regs[rs2])?
+                    }
+                    0x2 => {
+                        debug!("SW");
+                        self.bus.store(addr, 32, self.regs[rs2])?
+                    }
+                    0x3 => {
+                        debug!("SD");
+                        self.bus.store(addr, 64, self.regs[rs2])?
+                    }
                     _ => Err(())?,
                 }
             }
@@ -177,8 +185,10 @@ impl Cpu {
             0x13 => {
                 let imm = ((inst & 0xfff00000) as i32 as i64 >> 20) as u64;
                 tracing::Span::current().record("imm", imm);
-                let imm04 = rs2;
-                tracing::Span::current().record("imm04", imm04);
+
+                // "The shift amount is encoded in the lower 6 bits of the I-immediate field for RV64I."
+                let shamt = (imm & 0x3f) as u32;
+                tracing::Span::current().record("shamt", shamt);
 
                 match (funct3, funct7) {
                     (0x0, _) => {
@@ -204,17 +214,17 @@ impl Cpu {
                     (0x1, 0x00) => {
                         // slli
                         debug!("SLLI");
-                        self.regs[rd] = self.regs[rs1].wrapping_shr(imm04 as u32);
+                        self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
                     }
                     (0x5, 0x00) => {
                         // srli
                         debug!("SRLI");
-                        self.regs[rd] = self.regs[rs1].wrapping_shl(imm04 as u32);
+                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
                     }
                     (0x5, 0x20) => {
                         // srai
                         debug!("SRAI");
-                        self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(imm04 as u32) as u64;
+                        self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
                     }
                     (0x2, _) => {
                         // slti
@@ -231,6 +241,10 @@ impl Cpu {
             }
             // base R
             0x33 => {
+                // In RV64I, only the low 6 bits of rs2 are considered for the shift amount."
+                let shamt = (self.regs[rs2] & 0x3f) as u32;
+                tracing::Span::current().record("shamt", shamt);
+
                 match (funct3, funct7) {
                     (0x0, 0x0) => {
                         // add
@@ -255,18 +269,17 @@ impl Cpu {
                     (0x1, 0x0) => {
                         // sll logical
                         debug!("SLL");
-                        self.regs[rd] = self.regs[rs1].wrapping_shl(self.regs[rs2] as u32);
+                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
                     }
                     (0x5, 0x0) => {
                         // srl logical
                         debug!("SRL");
-                        self.regs[rd] = self.regs[rs1].wrapping_shr(self.regs[rs2] as u32);
+                        self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
                     }
                     (0x5, 0x20) => {
                         // sra
                         debug!("SRA");
-                        self.regs[rd] =
-                            (self.regs[rs1] as i64).wrapping_shr(self.regs[rs2] as u32) as u64;
+                        self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
                     }
                     (0x2, 0x0) => {
                         // slt
@@ -281,28 +294,164 @@ impl Cpu {
                     _ => Err(())?,
                 }
             }
-            0b0110111 => {
+            0x3b => {
+                // addw and family
+                let shamt = (self.regs[rs2] & 0x1f) as u32;
+                match (funct3, funct7) {
+                    (0x0, 0x0) => {
+                        debug!("ADDW");
+                        self.regs[rd] =
+                            self.regs[rs1].wrapping_add(self.regs[rs2]) as i32 as i64 as u64;
+                    }
+                    (0x0, 0x20) => {
+                        debug!("SUBW");
+                        self.regs[rd] =
+                            self.regs[rs1].wrapping_sub(self.regs[rs2]) as i32 as i64 as u64;
+                    }
+                    (0x1, 0x00) => {
+                        debug!("SLLW");
+                        self.regs[rd] = (self.regs[rs1] as u32).wrapping_shl(shamt) as i32 as u64;
+                    }
+                    (0x5, 0x00) => {
+                        debug!("SRLW");
+                        self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as u64;
+                    }
+                    (0x5, 0x20) => {
+                        debug!("SRAW");
+                        self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
+                    }
+                    _ => {
+                        error!("unimplemented instruction");
+                        unimplemented!("{:#09b} {:#03b} {:#03b}", inst, funct3, funct7)
+                    }
+                }
+            }
+            0x1b => {
+                // addiw and family
+
+                let imm = ((inst as i32 as i64) >> 20) as u64;
+                let shamt = (imm & 0x1f) as u32;
+
+                match (funct3, funct7) {
+                    (0x0, _) => {
+                        tracing::Span::current().record("imm", imm);
+                        debug!("ADDIW");
+                        self.regs[rd] = self.regs[rs1].wrapping_add(imm) as i32 as i64 as u64;
+                    }
+                    (0x1, _) => {
+                        tracing::Span::current().record("shamt", shamt);
+                        debug!("SLLIW");
+                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt) as i32 as i64 as u64;
+                    }
+                    (0x5, 0) => {
+                        tracing::Span::current().record("shamt", shamt);
+                        debug!("SRLIW");
+                        self.regs[rd] =
+                            (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as i64 as u64;
+                    }
+                    (0x5, 0x20) => {
+                        tracing::Span::current().record("shamt", shamt);
+                        debug!("SRAIW");
+                        self.regs[rd] = (self.regs[rs1] as i32).wrapping_shr(shamt) as i64 as u64;
+                    }
+                    _ => {
+                        error!("unimplemented instruction");
+                        unimplemented!("{:#09b} {:#03b} {:#03b}", inst, funct3, funct7)
+                    }
+                }
+            }
+            0x63 => {
+                // branching
+                // imm[12|10:5|4:1|11] = inst[31|30:25|11:8|7]
+                let imm = (((inst & 0x80000000) as i32 as i64 >> 19) as u64)
+                    | ((inst & 0x80) << 4) // imm[11]
+                    | ((inst >> 20) & 0x7e0) // imm[10:5]
+                    | ((inst >> 7) & 0x1e); // imm[4:1]
+                tracing::Span::current().record("imm", imm);
+
+                match funct3 {
+                    0x0 => {
+                        debug!("BEQ");
+
+                        if self.regs[rs1] == self.regs[rs2] {
+                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                        }
+                    }
+                    0x1 => {
+                        debug!("BNE");
+
+                        if self.regs[rs1] != self.regs[rs2] {
+                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                        }
+                    }
+                    0x4 => {
+                        debug!("BLT");
+
+                        if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) {
+                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                        }
+                    }
+                    0x5 => {
+                        debug!("BGE");
+
+                        if (self.regs[rs1] as i64) >= (self.regs[rs2] as i64) {
+                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                        }
+                    }
+                    0x6 => {
+                        debug!("BLTU");
+
+                        if self.regs[rs1] < self.regs[rs2] {
+                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                        }
+                    }
+                    0x7 => {
+                        debug!("BGEU");
+
+                        if self.regs[rs1] >= self.regs[rs2] {
+                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                        }
+                    }
+                    x => {
+                        error!("unimplemented instruction");
+                        unimplemented!("{:#09b} {:#03b}", x, funct3)
+                    }
+                }
+            }
+            0x37 => {
                 // LUI
                 let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
                 tracing::Span::current().record("imm", imm32);
                 debug!("LUI");
                 self.regs[rd] = imm32;
             }
-            0b0010111 => {
+            0x17 => {
                 // AUIPC
                 let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
                 tracing::Span::current().record("imm", imm32);
                 debug!("AUIPC");
             }
-            0b1101111 => {
+            0x6f => {
                 // JAL
                 // imm[20|10:1|11|19:12] = inst[31|30:21|20|19:12]
                 let imm = (((inst & 0x80000000) as i32 as i64 >> 11) as u64) // imm[20]
                     | (inst & 0xff000) // imm[19:12]
                     | ((inst >> 9) & 0x800) // imm[11]
                     | ((inst >> 20) & 0x7fe); // imm[10:1]
+                tracing::Span::current().record("imm", imm);
+                debug!("JAL");
                 self.regs[rd] = self.pc;
                 self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+            }
+            0x67 => {
+                // JALR
+                let imm = ((((inst & 0xfff00000) as i32) as i64) >> 20) as u64;
+                tracing::Span::current().record("imm", imm);
+
+                self.regs[rd] = self.pc;
+                let addr = self.regs[rs1].wrapping_add(imm) & !1;
+                self.pc = addr;
+                debug!("JALR");
             }
             0x73 => {
                 // csr
@@ -386,6 +535,7 @@ impl Cpu {
                     _ => Err(())?,
                 }
             }
+            0 => Err(())?,
 
             x => {
                 error!("unimplemented instruction");

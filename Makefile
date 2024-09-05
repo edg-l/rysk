@@ -16,7 +16,7 @@ test_files: $(PROGS) $(C_PROGS)
 	riscv64-unknown-elf-objcopy -O binary $@ $@
 
 %.s: %.c
-	riscv64-unknown-elf-gcc -S $< -o $@
+	riscv64-unknown-elf-gcc -march=rv64g -S $< -o $@
 
 .PHONY: clean
 clean:
