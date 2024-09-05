@@ -304,6 +304,24 @@ impl Cpu {
                         debug!("SLTU");
                         self.regs[rd] = (self.regs[rs1] < self.regs[rs2]) as u64
                     }
+                    (0x5, 0x7) => {
+                        debug!("CZERO.EQZ");
+
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = 0;
+                        } else {
+                            self.regs[rd] = self.regs[rs1];
+                        }
+                    }
+                    (0x7, 0x7) => {
+                        debug!("CZERO.NEZ");
+
+                        if self.regs[rs2] != 0 {
+                            self.regs[rd] = 0;
+                        } else {
+                            self.regs[rd] = self.regs[rs1];
+                        }
+                    }
                     _ => Err(())?,
                 }
             }
