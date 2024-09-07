@@ -421,6 +421,49 @@ impl Cpu {
                         debug!("SRAW");
                         self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
                     }
+                    (0x0, 0x1) => {
+                        debug!("MULW");
+                        self.regs[rd] = (self.regs[rs1] as i32).wrapping_mul(self.regs[rs2] as i32)
+                            as i64 as u64
+                    }
+                    (0x4, 0x1) => {
+                        debug!("DIVW");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] = (self.regs[rs1] as i32)
+                                .wrapping_div(self.regs[rs2] as i32)
+                                as i64 as u64
+                        }
+                    }
+                    (0x5, 0x1) => {
+                        debug!("DIVUW");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] =
+                                (self.regs[rs1] as u32).wrapping_div(self.regs[rs2] as u32) as u64;
+                        }
+                    }
+                    (0x6, 0x1) => {
+                        debug!("REMW");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] = (self.regs[rs1] as i32)
+                                .wrapping_rem(self.regs[rs2] as i32)
+                                as i64 as u64;
+                        }
+                    }
+                    (0x7, 0x1) => {
+                        debug!("REMUW");
+                        if self.regs[rs2] == 0 {
+                            self.regs[rd] = u64::MAX;
+                        } else {
+                            self.regs[rd] =
+                                (self.regs[rs1] as u32).wrapping_rem(self.regs[rs2] as u32) as u64;
+                        }
+                    }
                     _ => {
                         error!("unimplemented instruction");
                         unimplemented!("{:#09b} {:#03b} {:#03b}", inst, funct3, funct7)
