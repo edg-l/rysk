@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ops::{BitAnd, BitOr, BitXor},
     time::Instant,
 };
@@ -38,6 +39,7 @@ impl Cpu {
             pc: DRAM_BASE,
             bus: Bus {
                 dram: Dram::new(code),
+                reservations: HashMap::default(),
             },
             csrs: [0; 4096],
             start: Instant::now(),
@@ -677,6 +679,241 @@ impl Cpu {
                         }
                     }
                     _ => Err(())?,
+                }
+            }
+            0x2f => {
+                // atomic extension
+                let aq = (funct7 >> 1) & 0x1;
+                let rl = funct7 & 0x1;
+                let funct5 = (funct7 >> 2) & 0x1f;
+
+                match funct3 {
+                    0b010 => {
+                        match funct5 {
+                            0b00010 => {
+                                // lr.w
+                                debug!("LR.W");
+                                let addr = self.regs[rs1];
+                                let dword = self.bus.load(addr, 32)? as i32 as i64 as u64;
+                                self.regs[rd] = dword;
+                                self.bus.reservations.insert(addr, (dword, false));
+                            }
+                            0b00011 => {
+                                // sc.w
+                                debug!("SC.W");
+                                let addr = self.regs[rs1];
+
+                                if let Some((_, changed)) = self.bus.reservations.get(&addr) {
+                                    if !changed {
+                                        self.regs[rd] = 0;
+                                        self.bus.store(addr, 32, self.regs[rs2])?;
+                                    } else {
+                                        self.regs[rd] = 1;
+                                    }
+                                } else {
+                                    self.regs[rd] = 1;
+                                }
+                                self.bus.reservations.remove(&addr);
+                            }
+                            0x1 => {
+                                // amoswap.w
+                                debug!("AMOSWAP.W");
+                                /* load a data value from the address in rs1, place the value into register rd, apply
+                                a binary operator to the loaded value and the original value in rs2, then store the result back to the
+                                original address in rs1.  */
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, src)?;
+                            }
+                            0x0 => {
+                                debug!("AMOADD.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = src + data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value)?;
+                            }
+                            0x4 => {
+                                debug!("AMOXOR.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = src ^ data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value)?;
+                            }
+                            0x0c => {
+                                debug!("AMOAND.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = src & data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value)?;
+                            }
+                            0x8 => {
+                                debug!("AMOOR.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = src | data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value)?;
+                            }
+                            0x10 => {
+                                debug!("AMOMIN.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = (src as i32).min(data as i32);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value as i64 as u64)?;
+                            }
+                            0x14 => {
+                                debug!("AMOMAX.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = (src as i32).max(data as i32);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value as i64 as u64)?;
+                            }
+                            0x18 => {
+                                debug!("AMOMINU.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = src.min(data);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value)?;
+                            }
+                            0x1c => {
+                                debug!("AMOMAXU.W");
+                                let data = self.bus.load(self.regs[rs1], 32)?;
+                                let src = self.regs[rs2];
+                                let value = src.max(data);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 32, value)?;
+                            }
+                            _ => {
+                                error!("unimplemented atomic instruction");
+                                unimplemented!("{:#09b}", funct5)
+                            }
+                        }
+                    }
+                    0b011 => {
+                        match funct5 {
+                            0b00010 => {
+                                debug!("LR.D");
+
+                                /* LR.W loads a word from the address in rs1,
+                                places the sign-extended value in rd, and registers a reservation set—a
+                                set of bytes that subsumes the
+                                bytes in the addressed word. */
+
+                                let addr = self.regs[rs1];
+                                let dword = self.bus.load(addr, 64)?;
+                                self.regs[rd] = dword;
+                                self.bus.reservations.insert(addr, (dword, false));
+                            }
+                            0b00011 => {
+                                // sc.w
+                                debug!("SC.D");
+                                /* SC.W conditionally writes a word in rs2 to the address in rs1: the SC.W
+                                succeeds only if the reservation is still valid and
+                                the reservation set contains the bytes being written. If
+                                14.1. Specifying Ordering of Atomic Instructions | Page 68
+                                The RISC-V Instruction Set Manual Volume I | © RISC-V
+                                the SC.W succeeds, the instruction writes the word in rs2 to memory, and it writes zero to rd. If the
+                                SC.W fails, the instruction does not write to memory, and it writes a nonzero value to rd.
+                                */
+                                let addr = self.regs[rs1];
+
+                                if let Some((_, changed)) = self.bus.reservations.get(&addr) {
+                                    if !changed {
+                                        self.regs[rd] = 0;
+                                        self.bus.store(addr, 64, self.regs[rs2])?;
+                                    } else {
+                                        self.regs[rd] = 1;
+                                    }
+                                } else {
+                                    self.regs[rd] = 1;
+                                }
+                                self.bus.reservations.remove(&addr);
+                            }
+                            0x1 => {
+                                debug!("AMOSWAP.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, src)?;
+                            }
+                            0x0 => {
+                                debug!("AMOADD.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = src + data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value)?;
+                            }
+                            0x4 => {
+                                debug!("AMOXOR.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = src ^ data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value)?;
+                            }
+                            0x0c => {
+                                debug!("AMOAND.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = src & data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value)?;
+                            }
+                            0x8 => {
+                                debug!("AMOOR.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = src | data;
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value)?;
+                            }
+                            0x10 => {
+                                debug!("AMOMIN.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = (src as i64).min(data as i64);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value as u64)?;
+                            }
+                            0x14 => {
+                                debug!("AMOMAX.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = (src as i64).max(data as i64);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value as u64)?;
+                            }
+                            0x18 => {
+                                debug!("AMOMINU.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = src.min(data);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value)?;
+                            }
+                            0x1c => {
+                                debug!("AMOMAXU.D");
+                                let data = self.bus.load(self.regs[rs1], 64)?;
+                                let src = self.regs[rs2];
+                                let value = src.max(data);
+                                self.regs[rd] = data;
+                                self.bus.store(self.regs[rs1], 64, value)?;
+                            }
+                            _ => {
+                                error!("unimplemented atomic instruction");
+                                unimplemented!("{:#09b}", funct5)
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
             0 => Err(())?,

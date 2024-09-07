@@ -13,6 +13,9 @@ Extensions implemented:
 
 - RV64I
 - RV64M
+- RV64A
 - Ziscr
 - Zicntr
 - Zicond
+- Zaamo
+= Zalscr
