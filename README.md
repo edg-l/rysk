@@ -18,4 +18,10 @@ Extensions implemented:
 - Zicntr
 - Zicond
 - Zaamo
-= Zalscr
+- Zalscr
+
+Todo:
+- Zacas
+
+Maybe todo:
+- Zawrds
