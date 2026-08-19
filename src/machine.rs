@@ -175,30 +175,28 @@ impl Machine {
             self.bus.poll();
             let mut ran = false;
             for hart in 0..self.harts.len() {
-                match self.run_hart(hart, self.quantum) {
-                    Some(halt) => return halt,
-                    None => ran |= !self.harts[hart].waiting,
+                if !ready(&mut self.harts[hart], &self.bus) {
+                    continue;
+                }
+                ran = true;
+                if let Some(halt) = self.run_hart(hart, self.quantum) {
+                    return halt;
                 }
             }
-            // Every hart is parked, so the only thing that can change is a device, and
-            // the devices advance with the wall clock.
+            // Every hart is parked, so nothing but a device can change what any of
+            // them will do next, and the devices advance with the wall clock.
             if !ran {
                 std::hint::spin_loop();
             }
         }
     }
 
-    /// Run one hart for up to `steps` instructions, stopping early if it parks on a
-    /// `wfi`. Answers the trap that nothing handled, if that is how it stopped.
+    /// Run one hart, which has to be one that may run, for up to `steps` instructions,
+    /// stopping early if it parks on a `wfi`. Answers the trap that nothing handled,
+    /// if that is how it stopped.
     fn run_hart(&mut self, hart: usize, steps: u64) -> Option<Halt> {
         let cpu = &mut self.harts[hart];
         let bus = &mut self.bus;
-        if cpu.waiting {
-            cpu.wake(bus);
-            if cpu.waiting {
-                return None;
-            }
-        }
         for _ in 0..steps {
             if let Some(trap) = tick(cpu, bus) {
                 return Some(Halt { hart, trap });
@@ -211,19 +209,25 @@ impl Machine {
     }
 
     /// Run a single instruction on one hart, for a caller that needs to look at the
-    /// machine between instructions rather than leave it running.
+    /// machine between instructions rather than leave it running. A hart that is
+    /// parked and has nothing to wake it runs nothing.
     pub fn step(&mut self, hart: usize) -> Option<Trap> {
         self.bus.poll();
-        let cpu = &mut self.harts[hart];
-        let bus = &mut self.bus;
-        if cpu.waiting {
-            cpu.wake(bus);
-            if cpu.waiting {
-                return None;
-            }
+        if !ready(&mut self.harts[hart], &self.bus) {
+            return None;
         }
-        tick(cpu, bus)
+        tick(&mut self.harts[hart], &mut self.bus)
     }
+}
+
+/// Whether a hart may execute at all. A parked one may once something it has enabled
+/// is pending, which is the only thing that can change while it is not executing.
+#[inline]
+fn ready(cpu: &mut Cpu, bus: &Bus) -> bool {
+    if cpu.waiting {
+        cpu.wake(bus);
+    }
+    !cpu.waiting
 }
 
 /// One instruction on one hart: offer it an interrupt, then execute. Answers the trap
