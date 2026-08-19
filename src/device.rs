@@ -5,7 +5,31 @@
 //! asserting an interrupt. It never learns its own address, which controller its line
 //! runs to, or what else exists.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use crate::trap::Exception;
+
+/// The wire between a device and an interrupt controller. The device drives it and the
+/// controller reads it, and neither knows anything else about the other: which line a
+/// device got, and which controller it runs to, are the machine's to decide.
+///
+/// It is shared rather than polled so that swapping the controller a line runs to is a
+/// change to how the machine is built and to nothing else.
+#[derive(Debug, Clone, Default)]
+pub struct Line(Arc<AtomicBool>);
+
+impl Line {
+    pub fn set(&self, raised: bool) {
+        self.0.store(raised, Ordering::Relaxed);
+    }
+
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 pub trait Device: std::fmt::Debug {
     /// Read `size` bits at `offset` from the device's base.

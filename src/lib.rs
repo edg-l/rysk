@@ -24,4 +24,6 @@ pub mod elf;
 pub mod htif;
 pub mod inst;
 pub mod machine;
+pub mod plic;
 pub mod trap;
+pub mod uart;

@@ -11,4 +11,5 @@ mod memory;
 mod muldiv;
 mod privilege;
 mod program;
+mod serial;
 mod traps;

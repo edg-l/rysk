@@ -107,7 +107,13 @@ impl Cpu {
     ///
     /// The RISC-V Instruction Set Manual Volume II, 3.1.9 and 12.1.3.
     pub fn interrupt(&mut self) -> Option<Interrupt> {
-        self.refresh_mip();
+        // Asking the devices costs a read of the host clock, and it cannot change the
+        // answer unless one of the bits they drive is enabled, so when none is the
+        // question is answered out of `mip` alone. Software still sees the true value:
+        // reading the register is what refreshes it.
+        if self.csrs[MIE] & MIP_DEVICE != 0 {
+            self.refresh_mip();
+        }
         let ready = self.csrs[MIP] & self.csrs[MIE];
         if ready == 0 {
             return None;
