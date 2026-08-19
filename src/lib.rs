@@ -29,6 +29,7 @@ pub mod elf;
 pub mod fdt;
 pub mod fpu;
 pub mod htif;
+pub mod icache;
 pub mod inst;
 pub mod machine;
 pub mod mmu;

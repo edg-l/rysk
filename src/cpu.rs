@@ -10,6 +10,7 @@ use crate::{
     dram::Dram,
     elf::{Error as ElfError, Image},
     fpu::{self, F32, F64, Format, Round},
+    icache::Icache,
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
     mmu::{Access, Tlb},
     rvc,
@@ -36,6 +37,8 @@ pub struct Cpu {
     pub mode: Mode,
     /// What the last few page table walks found, so most of them do not happen.
     pub tlb: Tlb,
+    /// What the last few fetches decoded to, so most of them do not happen either.
+    pub icache: Icache,
     pub start: Instant,
 }
 
@@ -55,6 +58,7 @@ impl Cpu {
             fregs: [0; 32],
             mode: Mode::Machine,
             tlb: Tlb::default(),
+            icache: Icache::default(),
             start: Instant::now(),
         };
 
@@ -450,6 +454,9 @@ impl Cpu {
     #[inline]
     fn fetch(&mut self) -> Result<(Inst, u32), Exception> {
         let pa = self.translate(self.pc, Access::Fetch)?;
+        if let Some(decoded) = self.icache.get(pa) {
+            return Ok(decoded);
+        }
         // The whole word at once, where both halves are certain to be in the same page
         // and in dram. A page is the granularity of translation and of dram alike, so
         // reading the wider one there cannot fault where the two narrower ones would
@@ -463,10 +470,15 @@ impl Cpu {
         };
         // A compressed instruction is the low half alone, and the high half of what was
         // read is not part of it.
-        if inst::length(word as u16) == 2 {
-            return Ok((rvc::decode(word as u16)?, word & 0xffff));
-        }
-        Ok((decode(word)?, word))
+        let decoded = if inst::length(word as u16) == 2 {
+            (rvc::decode(word as u16)?, word & 0xffff)
+        } else {
+            (decode(word)?, word)
+        };
+        // Only what decoded. An encoding this machine refuses raises the same exception
+        // every time it is fetched, and remembering it would save nothing.
+        self.icache.insert(pa, decoded.0, decoded.1);
+        Ok(decoded)
     }
 
     /// The instruction at `pa`, read a halfword at a time, with the second half
@@ -761,7 +773,13 @@ impl Cpu {
             }
             // One in-order hart observes its own accesses in order, and there is no
             // instruction cache to keep coherent.
-            Op::Fence | Op::FenceI => {}
+            // A fence orders memory that is already ordered, since there is one hart
+            // and nothing between it and dram. `fence.i` orders the stores this hart
+            // has made against its own instruction fetch, which is exactly the
+            // question the decoded instructions answer.
+            // The RISC-V Instruction Set Manual Volume I, 5.
+            Op::Fence => {}
+            Op::FenceI => self.icache.flush(),
 
             // ------------------------------------------------- floating point
             Op::FpLoad { .. } | Op::FpStore { .. } | Op::Fp { .. } | Op::FpFused { .. }

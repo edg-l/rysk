@@ -1,0 +1,69 @@
+//! The instructions already decoded, kept by the address they were fetched from.
+//!
+//! Decoding the same word over and over is most of what an interpreter does inside a
+//! loop, and the answer cannot change while the bytes do not. RISC-V does not
+//! guarantee that a store to instruction memory is visible to instruction fetch until
+//! the hart executes a `fence.i`, so that instruction, and only that instruction,
+//! empties this.
+//!
+//! The RISC-V Instruction Set Manual Volume I, 5.
+
+use crate::inst::Inst;
+
+/// One decoded instruction, and the physical address whose bytes it came from. The
+/// encoding is kept beside it because a trap that rejects an instruction owes `mtval`
+/// the bits it was given.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    pa: u64,
+    inst: Inst,
+    encoding: u32,
+}
+
+/// A direct-mapped cache of them.
+///
+/// Keyed by physical address rather than virtual, which is what lets it survive a
+/// change of address space: the fetch translates first either way, so permissions,
+/// `satp` and the mode it is running in are all still checked on every instruction,
+/// and `sfence.vma` has nothing to say about what is in here.
+#[derive(Debug)]
+pub struct Icache {
+    entries: Box<[Option<Entry>]>,
+}
+
+impl Default for Icache {
+    fn default() -> Self {
+        Self {
+            entries: vec![None; Self::SIZE].into_boxed_slice(),
+        }
+    }
+}
+
+impl Icache {
+    /// Enough entries to hold a page of compressed instructions, and small enough that
+    /// the whole table stays in the cache the host has for it.
+    const SIZE: usize = 2048;
+
+    /// Every instruction is two-byte aligned, so the bit below that carries nothing.
+    #[inline]
+    const fn slot(pa: u64) -> usize {
+        (pa >> 1) as usize & (Self::SIZE - 1)
+    }
+
+    #[inline]
+    pub fn get(&self, pa: u64) -> Option<(Inst, u32)> {
+        self.entries[Self::slot(pa)]
+            .filter(|entry| entry.pa == pa)
+            .map(|entry| (entry.inst, entry.encoding))
+    }
+
+    #[inline]
+    pub fn insert(&mut self, pa: u64, inst: Inst, encoding: u32) {
+        self.entries[Self::slot(pa)] = Some(Entry { pa, inst, encoding });
+    }
+
+    /// Forget everything, which is what `fence.i` means.
+    pub fn flush(&mut self) {
+        self.entries.fill(None);
+    }
+}

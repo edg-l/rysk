@@ -1,4 +1,5 @@
 use crate::common::*;
+use rysk::bus::DRAM_BASE;
 
 // ------------------------------------------------------------------ loads and stores
 
@@ -73,4 +74,30 @@ fn a_negative_offset_addresses_below_the_base() {
         .run();
     assert_eq!(cpu.reg(T2), 0x1234);
     assert_eq!(cpu.load(SCRATCH - 8, 8), 0x1234);
+}
+
+// ------------------------------------------------------------------ instruction memory
+
+#[test]
+fn a_rewritten_instruction_takes_effect_after_fence_i() {
+    // The first instruction runs, is overwritten with a different one, and is reached
+    // again. RISC-V does not promise a store to instruction memory is visible to
+    // fetch until the hart executes `fence.i`, so this is what that instruction has
+    // to mean: The RISC-V Instruction Set Manual Volume I, 5.
+    let cpu = prog(&[
+        addi(A0, A0, 1),
+        bne(A1, ZERO, 20),
+        addi(A1, ZERO, 1),
+        sw(T2, T1, 0),
+        fence_i(),
+        jalr(ZERO, T1, 0),
+    ])
+    .reg(T1, DRAM_BASE)
+    .reg(T2, addi(A0, A0, 16) as u64)
+    .run();
+    assert_eq!(
+        cpu.reg(A0),
+        17,
+        "the second pass ran the instruction that is there now, not the one that was"
+    );
 }
