@@ -16,7 +16,8 @@ macro_rules! trace_mem {
 
 /// What this machine implements, in the spelling a device tree wants. It is here
 /// rather than in `csr` because `misa` has a bit per letter and no room for the rest.
-pub const ISA: &str = "rv64imac_zicsr_zifencei_zicntr_zicond_zaamo_zalrsc_zacas_zabha_zawrs_svade";
+pub const ISA: &str =
+    "rv64imafdc_zicsr_zifencei_zicntr_zicond_zaamo_zalrsc_zacas_zabha_zawrs_svade";
 
 pub mod bus;
 pub mod clint;
