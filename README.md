@@ -61,8 +61,8 @@ RUST_LOG=trace cargo run --features trace -- tests/fib.bin   # bus loads and sto
 
 The `trace` feature is off by default because the spans and their fields cost
 about six times what interpreting the instruction does. Without it the tracing
-compiles to nothing, and rysk runs at roughly 120 million instructions per
-second on a tight loop.
+compiles to nothing, and rysk runs at roughly 78 million instructions per
+second on `bench/loop.bin`.
 
 ## Testing
 

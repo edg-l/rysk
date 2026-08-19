@@ -69,9 +69,24 @@ $(CORPUS)/.stamp: | $(CORPUS_SRC)
 	@touch $@
 	@echo "built $$(ls $(CORPUS) | grep -c .) corpus tests into $(CORPUS)"
 
+# The interpreter benchmark. The .bin is committed like the test fixtures, so
+# profiling needs no cross toolchain.
+.PHONY: bench
+bench: bench/loop.bin
+	cargo build --release
+	hyperfine -w3 -r15 -N './target/release/rysk $<'
+
+# Same run under perf. dwarf unwinding, not fp: rust omits frame pointers and fp
+# walks garbage.
+.PHONY: bench-profile
+bench-profile: bench/loop.bin
+	CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release
+	perf record --call-graph dwarf -F 999 -o bench/perf.data ./target/release/rysk $<
+	perf report -i bench/perf.data --no-children --percent-limit 1 --stdio
+
 .PHONY: clean
 clean:
-	rm -rf tests/*.bin
+	rm -rf tests/*.bin bench/perf.data
 
 .PHONY: clean-corpus
 clean-corpus:
