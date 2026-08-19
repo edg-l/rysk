@@ -26,6 +26,7 @@ pub mod device;
 pub mod dram;
 pub mod elf;
 pub mod fdt;
+pub mod fpu;
 pub mod htif;
 pub mod inst;
 pub mod machine;
