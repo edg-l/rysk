@@ -166,9 +166,10 @@ impl Machine {
     /// it.
     ///
     /// The harts take turns a quantum at a time. One host thread runs all of them, so
-    /// a switch only ever happens between whole instructions and the order they run in
-    /// is the same on every run: an atomic is atomic because nothing can interleave
-    /// with it, rather than because anything makes it so.
+    /// a switch only ever happens between whole instructions: an atomic is atomic
+    /// because nothing can interleave with it, rather than because anything makes it
+    /// so. The schedule itself is fixed, though a run is not yet reproducible, since
+    /// the devices still advance with the wall clock.
     pub fn run(&mut self) -> Halt {
         loop {
             self.bus.poll();
