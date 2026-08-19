@@ -10,6 +10,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # Bump deliberately, the same way the corpus revision is pinned: what the corpus
+  # assembles to should not change because a runner image did.
+  CLANG_VERSION: 21
 
 # A newer push to the same branch makes the run in progress pointless, except on
 # master, where every commit's result is worth keeping.
@@ -39,19 +42,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The corpus is a fetch plus 110 assembles, so it is worth keeping between
-      # runs. Its revision and build recipe both live in the Makefile, so hashing
-      # that covers everything that changes what comes out. No restore-keys: a
-      # partial hit would leave a stale corpus that the stamp file makes look built.
+      # runs. Its revision and build recipe live in the Makefile and the assembler
+      # that reads them is pinned above, so those two are everything that changes
+      # what comes out. No restore-keys: a partial hit would leave a stale corpus
+      # that the stamp file makes look built.
       - name: Cache the riscv-tests corpus
         id: corpus
         uses: actions/cache@v4
         with:
           path: ~/.cache/rysk
-          key: corpus-${{ runner.os }}-${{ hashFiles('Makefile') }}
+          key: corpus-${{ runner.os }}-clang${{ env.CLANG_VERSION }}-${{ hashFiles('Makefile') }}
+
+      # Ubuntu's clang trails the extensions rysk implements: it did not know the
+      # tcontrol csr, and each new extension in the Makefile's -march is another way
+      # for the corpus to build here and not there. Pin a version instead of finding
+      # out one push at a time. Only needed when the corpus is actually being built.
+      - name: Install clang ${{ env.CLANG_VERSION }}
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh ${{ env.CLANG_VERSION }}
 
       - name: Build the riscv-tests corpus
         if: steps.corpus.outputs.cache-hit != 'true'
-        run: make corpus
+        run: |
+          make corpus CLANG=clang-${{ env.CLANG_VERSION }} \
+            LLD=lld-${{ env.CLANG_VERSION }} \
+            LLVM_OBJCOPY=llvm-objcopy-${{ env.CLANG_VERSION }}
 
       - run: cargo build --locked
       - run: cargo test --locked

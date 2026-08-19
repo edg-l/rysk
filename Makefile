@@ -1,17 +1,23 @@
 # riscv64-unknown-elf-gcc if it is installed, otherwise clang, whose integrated
 # assembler and lld target RISC-V without a cross toolchain.
 CROSS := riscv64-unknown-elf
+# The clang to use, for where the one on the path is too old to know an extension rysk
+# implements. CI installs a versioned one and names it here.
+CLANG   ?= clang
+LLD     ?= lld
+LLVM_OBJCOPY ?= llvm-objcopy
+ARCH    := rv64g_zicond_zacas
 
 ifneq ($(shell command -v $(CROSS)-gcc),)
-CC      = $(CROSS)-gcc -march=rv64g_zicond_zacas
+CC      = $(CROSS)-gcc -march=$(ARCH)
 LDFLAGS = -Wl,-Ttext=0x0
 LDLINK  =
 OBJCOPY = $(CROSS)-objcopy
 else
-CC      = clang --target=$(CROSS) -march=rv64g_zicond_zacas -mno-relax
-LDFLAGS = -fuse-ld=lld -Wl,--image-base=0,-Ttext=0x0
-LDLINK  = -fuse-ld=lld
-OBJCOPY = llvm-objcopy
+CC      = $(CLANG) --target=$(CROSS) -march=$(ARCH) -mno-relax
+LDFLAGS = -fuse-ld=$(LLD) -Wl,--image-base=0,-Ttext=0x0
+LDLINK  = -fuse-ld=$(LLD)
+OBJCOPY = $(LLVM_OBJCOPY)
 endif
 
 SRCS = $(wildcard tests/*.s tests/*.c)
