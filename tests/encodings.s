@@ -120,5 +120,9 @@ fwd:
   mret
   sret
   wfi
+  amocas.w t0, t2, (t1)
+  amocas.d t0, t2, (t1)
+  amocas.q a0, a2, (t1)
+
   fence
   fence.i

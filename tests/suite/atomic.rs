@@ -149,3 +149,130 @@ fn word_atomics_leave_the_neighbouring_word_alone() {
         .run();
     assert_eq!(cpu.reg(T4), 0x1111_1111_aaaa_aaaa);
 }
+
+// ------------------------------------------------------------------- zacas
+
+#[test]
+fn a_compare_and_swap_stores_only_when_the_value_matches() {
+    let cpu = prog(&[sd(T1, T0, 0), amocas_d(T2, T3, T0), ld(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 5)
+        .reg(T2, 5) // what it expects to find
+        .reg(T3, 9) // what to put there instead
+        .run();
+    assert_eq!(cpu.reg(T2), 5, "rd takes what was there");
+    assert_eq!(cpu.reg(T4), 9, "and the swap happened");
+
+    let cpu = prog(&[sd(T1, T0, 0), amocas_d(T2, T3, T0), ld(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 5)
+        .reg(T2, 4)
+        .reg(T3, 9)
+        .run();
+    assert_eq!(cpu.reg(T2), 5, "rd still takes what was there");
+    assert_eq!(cpu.reg(T4), 5, "but nothing was written");
+}
+
+#[test]
+fn a_word_compare_and_swap_compares_the_low_half_and_sign_extends_what_it_read() {
+    let cpu = prog(&[sw(T1, T0, 0), amocas_w(T2, T3, T0), lw(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 0xffff_ffff)
+        // the high half differs, and a word compare-and-swap does not look at it
+        .reg(T2, 0x1_ffff_ffff)
+        .reg(T3, 7)
+        .run();
+    assert_eq!(cpu.reg(T2), !0, "the word it read, sign-extended");
+    assert_eq!(cpu.reg(T4), 7, "and it matched, so the swap happened");
+}
+
+#[test]
+fn a_quadword_compare_and_swap_is_a_register_pair_at_each_end() {
+    let cpu = prog(&[
+        sd(T1, T0, 0),
+        sd(T2, T0, 8),
+        amocas_q(A0, A2, T0),
+        ld(T3, T0, 0),
+        ld(T4, T0, 8),
+    ])
+    .reg(T0, SCRATCH)
+    .reg(T1, 0x1111)
+    .reg(T2, 0x2222)
+    .reg(A0, 0x1111)
+    .reg(A1, 0x2222)
+    .reg(A2, 0xaaaa)
+    .reg(A3, 0xbbbb)
+    .run();
+    assert_eq!(
+        (cpu.reg(A0), cpu.reg(A1)),
+        (0x1111, 0x2222),
+        "both halves read"
+    );
+    assert_eq!(
+        (cpu.reg(T3), cpu.reg(T4)),
+        (0xaaaa, 0xbbbb),
+        "and both written"
+    );
+}
+
+#[test]
+fn a_quadword_compare_and_swap_swaps_neither_half_unless_both_match() {
+    let cpu = prog(&[
+        sd(T1, T0, 0),
+        sd(T2, T0, 8),
+        amocas_q(A0, A2, T0),
+        ld(T3, T0, 0),
+        ld(T4, T0, 8),
+    ])
+    .reg(T0, SCRATCH)
+    .reg(T1, 0x1111)
+    .reg(T2, 0x2222)
+    .reg(A0, 0x1111)
+    .reg(A1, 0xdead) // only the high half differs
+    .reg(A2, 0xaaaa)
+    .reg(A3, 0xbbbb)
+    .run();
+    assert_eq!(
+        (cpu.reg(T3), cpu.reg(T4)),
+        (0x1111, 0x2222),
+        "one half matching is not a match"
+    );
+}
+
+#[test]
+fn a_quadword_pair_at_x0_reads_as_zero_and_throws_the_result_away() {
+    // x1 holds something, so reading the pair as x0 and x1 rather than as two zeroes
+    // would compare against it and refuse the swap, and writing the result back would
+    // destroy it.
+    let cpu = prog(&[amocas_q(ZERO, A2, T0), ld(T3, T0, 0), ld(T4, T0, 8)])
+        .reg(T0, SCRATCH)
+        .reg(RA, 0xdead)
+        .reg(A2, 0xaaaa)
+        .reg(A3, 0xbbbb)
+        .run();
+    assert_eq!(
+        (cpu.reg(T3), cpu.reg(T4)),
+        (0xaaaa, 0xbbbb),
+        "zeroed memory matched a comparison of zero, so the swap happened"
+    );
+    assert_eq!(cpu.reg(RA), 0xdead, "and nothing was written back over x1");
+}
+
+#[test]
+fn a_quadword_compare_and_swap_names_even_registers_or_nothing() {
+    for inst in [amocas_q(A1, A2, T0), amocas_q(A0, A3, T0)] {
+        prog(&[inst])
+            .reg(T0, SCRATCH)
+            .expect(rysk::trap::Exception::IllegalInstruction(inst as u64));
+    }
+}
+
+#[test]
+fn a_compare_and_swap_has_to_be_aligned_to_its_own_width() {
+    prog(&[amocas_q(A0, A2, T0)]).reg(T0, SCRATCH + 8).expect(
+        rysk::trap::Exception::StoreAmoAddressMisaligned(SCRATCH + 8),
+    );
+    prog(&[amocas_d(T2, T3, T0)]).reg(T0, SCRATCH + 4).expect(
+        rysk::trap::Exception::StoreAmoAddressMisaligned(SCRATCH + 4),
+    );
+}

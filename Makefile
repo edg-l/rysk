@@ -3,12 +3,12 @@
 CROSS := riscv64-unknown-elf
 
 ifneq ($(shell command -v $(CROSS)-gcc),)
-CC      = $(CROSS)-gcc -march=rv64g_zicond
+CC      = $(CROSS)-gcc -march=rv64g_zicond_zacas
 LDFLAGS = -Wl,-Ttext=0x0
 LDLINK  =
 OBJCOPY = $(CROSS)-objcopy
 else
-CC      = clang --target=$(CROSS) -march=rv64g_zicond -mno-relax
+CC      = clang --target=$(CROSS) -march=rv64g_zicond_zacas -mno-relax
 LDFLAGS = -fuse-ld=lld -Wl,--image-base=0,-Ttext=0x0
 LDLINK  = -fuse-ld=lld
 OBJCOPY = llvm-objcopy

@@ -55,7 +55,9 @@ fn encoder_matches_the_toolchain() {
         beq(T1, T2, -4), bne(T1, T2, 20), blt(T1, T2, -12),
         bge(T1, T2, 12), bltu(T1, T2, -20), bgeu(T1, T2, 4),
         addiw(T0, T1, 1),
-        ecall(), ebreak(), mret(), sret(), wfi(), fence(), fence_i(),
+        ecall(), ebreak(), mret(), sret(), wfi(),
+        amocas_w(T0, T2, T1), amocas_d(T0, T2, T1), amocas_q(A0, A2, T1),
+        fence(), fence_i(),
     ];
 
     let bytes = std::fs::read("tests/encodings.bin").expect("run `make test_files`");
@@ -102,6 +104,7 @@ fn decoding_round_trips_to_readable_assembly() {
         (lr_w(T0, ZERO, T1), "lr.w t0, (t1)"),
         (sc_d(T0, T2, T1), "sc.d t0, t2, (t1)"),
         (amomaxu_w(T0, T2, T1), "amomaxu.w t0, t2, (t1)"),
+        (amocas_q(A0, A2, T1), "amocas.q a0, a2, (t1)"),
         (czero_eqz(A0, A1, A2), "czero.eqz a0, a1, a2"),
     ];
     for &(encoding, text) in cases {

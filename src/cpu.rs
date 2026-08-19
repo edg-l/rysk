@@ -8,7 +8,7 @@ use crate::{
     csr::*,
     dram::{DRAM_SIZE, Dram},
     elf::{Error as ElfError, Image},
-    inst::{AmoOp, Cond, Inst, Op, Width, decode},
+    inst::{AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
     trap::{Exception, Interrupt, Trap},
 };
 
@@ -523,6 +523,59 @@ impl Cpu {
             Op::Fence | Op::FenceI => {}
 
             // ---------------------------------------------------------- atomics
+            // Compare-and-swap: load, compare against what `rd` holds, and store only
+            // if they match. `rd` takes the value that was there either way, so a
+            // caller learns whether it won without a second load.
+            //
+            // The RISC-V Instruction Set Manual Volume I, 15.1.
+            Op::AmoCas { width } => {
+                let bytes = match width {
+                    CasWidth::Word => 4,
+                    CasWidth::Double => 8,
+                    CasWidth::Quad => 16,
+                };
+                if a & (bytes - 1) != 0 {
+                    return Err(Exception::StoreAmoAddressMisaligned(a));
+                }
+                match width {
+                    // A pair beginning at x0 reads as zero at both halves, and one
+                    // named as the destination discards the result entirely rather
+                    // than writing only its odd register.
+                    CasWidth::Quad => {
+                        let (low, high) = (self.bus.load(a, 64)?, self.bus.load(a + 8, 64)?);
+                        let compare = if rd == 0 {
+                            (0, 0)
+                        } else {
+                            (self.regs[rd], self.regs[rd + 1])
+                        };
+                        let swap = if rs2 == 0 {
+                            (0, 0)
+                        } else {
+                            (b, self.regs[rs2 + 1])
+                        };
+                        if (low, high) == compare {
+                            self.bus.store(a, 64, swap.0)?;
+                            self.bus.store(a + 8, 64, swap.1)?;
+                        }
+                        if rd != 0 {
+                            self.regs[rd] = low;
+                            self.regs[rd + 1] = high;
+                        }
+                    }
+                    _ => {
+                        let bits = bytes * 8;
+                        let loaded = self.bus.load(a, bits)?;
+                        // A narrow compare-and-swap looks at the low bits of rd only,
+                        // and stores the low bits of rs2.
+                        let mask = u64::MAX >> (64 - bits);
+                        if loaded == self.regs[rd] & mask {
+                            self.bus.store(a, bits, b)?;
+                        }
+                        self.regs[rd] = Self::sext(loaded, bits);
+                    }
+                }
+            }
+
             Op::Lr { width } | Op::Sc { width } | Op::Amo { width, .. } => {
                 let bits = width.bits();
                 if a & (bits / 8 - 1) != 0 {

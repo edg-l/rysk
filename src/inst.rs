@@ -59,6 +59,28 @@ pub enum AmoOp {
     MaxU,
 }
 
+/// The widths a compare-and-swap comes in. The quadword form is two doublewords and a
+/// register pair at each end, which is why this is not a [`Width`]: nothing else that
+/// reaches the bus is 128 bits wide.
+///
+/// The RISC-V Instruction Set Manual Volume I, 15.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasWidth {
+    Word,
+    Double,
+    Quad,
+}
+
+impl CasWidth {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Word => "w",
+            Self::Double => "d",
+            Self::Quad => "q",
+        }
+    }
+}
+
 /// What an instruction does. The operands live in [`Inst`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -135,6 +157,7 @@ pub enum Op {
     Lr { width: Width },
     Sc { width: Width },
     Amo { op: AmoOp, width: Width },
+    AmoCas { width: CasWidth },
 }
 
 /// A decoded instruction. Which of the operands mean anything depends on `op`: `imm`
@@ -325,13 +348,34 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
             (op, csr)
         }
         0x2f => {
+            // The aq and rl ordering bits, funct7[1:0], constrain nothing on a single
+            // in-order hart.
+            if funct7 >> 2 == 0b00101 {
+                let width = match funct3 {
+                    0x2 => CasWidth::Word,
+                    0x3 => CasWidth::Double,
+                    0x4 => CasWidth::Quad,
+                    _ => return Err(illegal),
+                };
+                // A quadword names a register pair at each end, and a pair starts at an
+                // even register: the odd encodings are reserved.
+                // The RISC-V Instruction Set Manual Volume I, 15.1.
+                if width == CasWidth::Quad && !(rd.is_multiple_of(2) && rs2.is_multiple_of(2)) {
+                    return Err(illegal);
+                }
+                return Ok(Inst {
+                    op: Op::AmoCas { width },
+                    rd,
+                    rs1,
+                    rs2,
+                    imm: 0,
+                });
+            }
             let width = match funct3 {
                 0x2 => Width::Word,
                 0x3 => Width::Double,
                 _ => return Err(illegal),
             };
-            // The aq and rl ordering bits, funct7[1:0], constrain nothing on a single
-            // in-order hart.
             let op = match funct7 >> 2 {
                 0b00010 if rs2 == 0 => Op::Lr { width },
                 0b00011 => Op::Sc { width },
@@ -462,6 +506,9 @@ impl fmt::Display for Inst {
                     AmoOp::MaxU => "amomaxu",
                 };
                 write!(f, "{name}.{} {rd}, {rs2}, ({rs1})", width.suffix())
+            }
+            Op::AmoCas { width } => {
+                write!(f, "amocas.{} {rd}, {rs2}, ({rs1})", width.suffix())
             }
             Op::CzeroEqz => write!(f, "czero.eqz {rd}, {rs1}, {rs2}"),
             Op::CzeroNez => write!(f, "czero.nez {rd}, {rs1}, {rs2}"),
