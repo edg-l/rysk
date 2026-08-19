@@ -226,6 +226,27 @@ fn an_instruction_fetch_translates_too() {
 }
 
 #[test]
+fn an_instruction_that_straddles_two_pages_is_fetched_through_both() {
+    // The instruction begins in the last two bytes of one page and ends in the first
+    // two of the next, and the two pages are mapped to frames that are not next to
+    // each other. Taking the second half from beside the first would find the decoy.
+    let next = FRAME + 0x2000;
+    let decoy = FRAME + 0x1000;
+    let cpu = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
+        .memory(LEAF + 16, pte(next, V | R | X | A))
+        .memory(FRAME + 0xff8, (addi(A0, ZERO, 1) as u64 & 0xffff) << 48)
+        .memory(next, (addi(A0, ZERO, 1) >> 16) as u64)
+        .memory(decoy, (addi(A0, ZERO, 2) >> 16) as u64)
+        .reg(T0, VA + 0xffe)
+        .run();
+    assert_eq!(
+        cpu.reg(A0),
+        1,
+        "the half that is in the page it is mapped to"
+    );
+}
+
+#[test]
 fn a_page_that_may_not_be_executed_faults_on_the_fetch() {
     mapped(&[jalr(ZERO, T0, 0)], V | R | W | A | D)
         .memory(FRAME, addi(A0, ZERO, 1) as u64)

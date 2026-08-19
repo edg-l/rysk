@@ -149,7 +149,8 @@ impl Bus {
     }
 
     /// Whether `size` bits at `addr` fall inside dram.
-    fn in_dram(&self, addr: u64, size: u64) -> bool {
+    #[inline]
+    pub fn in_dram(&self, addr: u64, size: u64) -> bool {
         match addr.checked_add(size / 8) {
             Some(end) => DRAM_BASE <= addr && end <= DRAM_BASE + self.dram.size(),
             None => false,

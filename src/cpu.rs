@@ -450,19 +450,39 @@ impl Cpu {
     #[inline]
     fn fetch(&mut self) -> Result<(Inst, u32), Exception> {
         let pa = self.translate(self.pc, Access::Fetch)?;
+        // The whole word at once, where both halves are certain to be in the same page
+        // and in dram. A page is the granularity of translation and of dram alike, so
+        // reading the wider one there cannot fault where the two narrower ones would
+        // not. A device may answer for one width and refuse another, so an address
+        // that is not dram is read a half at a time, and so is the last halfword of a
+        // page, which is the only place the two halves translate differently.
+        let word = if pa & 0xfff <= 0xffc && self.bus.in_dram(pa, 32) {
+            self.word(pa)?
+        } else {
+            self.halves(pa)?
+        };
+        // A compressed instruction is the low half alone, and the high half of what was
+        // read is not part of it.
+        if inst::length(word as u16) == 2 {
+            return Ok((rvc::decode(word as u16)?, word & 0xffff));
+        }
+        Ok((decode(word)?, word))
+    }
+
+    /// The instruction at `pa`, read a halfword at a time, with the second half
+    /// translated on its own where the first one ends a page. A compressed instruction
+    /// is answered by its own half and the one after it is never read.
+    fn halves(&mut self, pa: u64) -> Result<u32, Exception> {
         let half = self.halfword(pa)?;
         if inst::length(half) == 2 {
-            return Ok((rvc::decode(half)?, half as u32));
+            return Ok(half as u32);
         }
-        // Both halves are in the same page unless the first one ends it, which is the
-        // only place a translation could differ between them.
         let next = if self.pc & 0xfff == 0xffe {
             self.translate(self.pc + 2, Access::Fetch)?
         } else {
             pa + 2
         };
-        let word = half as u32 | (self.halfword(next)? as u32) << 16;
-        Ok((decode(word)?, word))
+        Ok(half as u32 | (self.halfword(next)? as u32) << 16)
     }
 
     #[inline]
@@ -470,6 +490,14 @@ impl Cpu {
         self.bus
             .load(pa, 16)
             .map(|half| half as u16)
+            .map_err(|_| Exception::InstructionAccessFault(self.pc))
+    }
+
+    #[inline]
+    fn word(&mut self, pa: u64) -> Result<u32, Exception> {
+        self.bus
+            .load(pa, 32)
+            .map(|word| word as u32)
             .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 
