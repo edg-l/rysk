@@ -45,6 +45,24 @@ pub enum Cond {
     Geu,
 }
 
+/// The integer a floating-point conversion names, `w` or `l`. A named width rather
+/// than a number of bits because every decoded instruction is kept, and a `u32` in
+/// here is what made an `Inst` forty-eight bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntWidth {
+    W32,
+    W64,
+}
+
+impl IntWidth {
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::W32 => 32,
+            Self::W64 => 64,
+        }
+    }
+}
+
 /// The read-modify-write an atomic memory operation performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmoOp {
@@ -102,11 +120,11 @@ pub enum FpOp {
     /// To the other floating format.
     Convert,
     ToInteger {
-        bits: u32,
+        width: IntWidth,
         signed: bool,
     },
     FromInteger {
-        bits: u32,
+        width: IntWidth,
         signed: bool,
     },
     /// The bits themselves, between register files, uninterpreted.
@@ -536,16 +554,16 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
                 },
                 // rs2 names the integer: its width, and whether it is signed.
                 0b11000 | 0b11010 => {
-                    let (bits, signed) = match rs2 {
-                        0b00000 => (32, true),
-                        0b00001 => (32, false),
-                        0b00010 => (64, true),
-                        0b00011 => (64, false),
+                    let (width, signed) = match rs2 {
+                        0b00000 => (IntWidth::W32, true),
+                        0b00001 => (IntWidth::W32, false),
+                        0b00010 => (IntWidth::W64, true),
+                        0b00011 => (IntWidth::W64, false),
                         _ => return Err(illegal),
                     };
                     match funct7 >> 2 {
-                        0b11000 => FpOp::ToInteger { bits, signed },
-                        _ => FpOp::FromInteger { bits, signed },
+                        0b11000 => FpOp::ToInteger { width, signed },
+                        _ => FpOp::FromInteger { width, signed },
                     }
                 }
                 0b11100 if rs2 == 0 => match funct3 {

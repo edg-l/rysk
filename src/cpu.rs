@@ -853,11 +853,11 @@ impl Cpu {
                         fpu::convert(other, format, self.read_fp(rs1, other), mode),
                         false,
                     ),
-                    FpOp::ToInteger { bits, signed } => {
-                        (fpu::to_integer(format, x, bits, signed, mode), true)
+                    FpOp::ToInteger { width, signed } => {
+                        (fpu::to_integer(format, x, width.bits(), signed, mode), true)
                     }
-                    FpOp::FromInteger { bits, signed } => (
-                        fpu::from_integer(format, self.regs[rs1], bits, signed, mode),
+                    FpOp::FromInteger { width, signed } => (
+                        fpu::from_integer(format, self.regs[rs1], width.bits(), signed, mode),
                         false,
                     ),
                     // Moving the bits does not interpret them, so a single is
