@@ -51,7 +51,7 @@ fn a_csr_read_with_x0_as_the_source_does_not_write() {
 fn misa_reports_the_width_and_the_extensions_that_are_implemented() {
     let cpu = run(&[csrrs(A0, 0x301, ZERO)]);
     assert_eq!(cpu.reg(A0) >> 62, 2, "MXL of two means XLEN is 64");
-    for letter in *b"ima" {
+    for letter in *b"imac" {
         assert_ne!(
             cpu.reg(A0) & misa_extension(letter),
             0,
@@ -59,7 +59,7 @@ fn misa_reports_the_width_and_the_extensions_that_are_implemented() {
             letter as char
         );
     }
-    for letter in *b"fdc" {
+    for letter in *b"fd" {
         assert_eq!(
             cpu.reg(A0) & misa_extension(letter),
             0,

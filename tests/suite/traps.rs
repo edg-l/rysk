@@ -29,11 +29,13 @@ fn running_off_dram_is_an_instruction_access_fault() {
 }
 
 #[test]
-fn a_jump_to_an_unaligned_address_traps() {
-    // jalr clears bit 0 of its target but not bit 1.
-    prog(&[jalr(ZERO, T0, 0)])
-        .reg(T0, DRAM_BASE + 2)
-        .expect(Exception::InstructionAddressMisaligned(DRAM_BASE + 2));
+fn a_two_byte_aligned_jump_is_where_a_compressed_instruction_can_begin() {
+    // With compressed instructions IALIGN is sixteen, so a target that is merely even
+    // is a legal place for an instruction rather than a misaligned fetch.
+    let cpu = prog(&[jalr(ZERO, T0, 0), addi(A0, ZERO, 1)])
+        .reg(T0, DRAM_BASE + 4)
+        .run();
+    assert_eq!(cpu.reg(A0), 1, "it jumped there and carried on");
 }
 
 #[test]

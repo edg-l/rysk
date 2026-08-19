@@ -6,7 +6,7 @@ CROSS := riscv64-unknown-elf
 CLANG   ?= clang
 LLD     ?= lld
 LLVM_OBJCOPY ?= llvm-objcopy
-ARCH    := rv64g_zicond_zacas
+ARCH    := rv64gc_zicond_zacas
 
 ifneq ($(shell command -v $(CROSS)-gcc),)
 CC      = $(CROSS)-gcc -march=$(ARCH)
@@ -46,7 +46,7 @@ CORPUS_URL = https://github.com/riscv-software-src/riscv-tests
 # Pinned so a rebuild is reproducible and CI cannot change what it gates on without
 # the change showing up here.
 CORPUS_REV = 2ebecad997fa58cd9e5724340ba75aa4b59bd1d0
-GROUPS     = rv64ui rv64um rv64ua rv64si rv64mi
+GROUPS     = rv64ui rv64um rv64ua rv64uc rv64si rv64mi
 # The corpus is assembled from a copy of its sources, patched for what clang will not
 # take. Two things: the supervisor and machine groups define a handler riscv_test.h has
 # already declared weak, and clang refuses to rebind a weak symbol to global where gcc

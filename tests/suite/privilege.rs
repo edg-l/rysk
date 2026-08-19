@@ -207,12 +207,12 @@ fn mpp_cannot_be_left_holding_the_mode_that_does_not_exist() {
 
 #[test]
 fn a_fault_below_machine_mode_still_reports_its_value() {
-    let cpu = prog(&[jalr(ZERO, T0, 0), csrrw(ZERO, 0x305, ZERO)])
+    let cpu = prog(&[lw(A0, T0, 0), csrrw(ZERO, 0x305, ZERO)])
         .mode(Mode::Supervisor)
         .reg(T0, 2)
         .csr(MTVEC, DRAM_BASE + 4)
         .expect(Exception::IllegalInstruction(0));
-    assert_eq!(cpu.csrs[MCAUSE], 0, "instruction address misaligned");
-    assert_eq!(cpu.csrs[MTVAL], 2, "the address it tried to jump to");
+    assert_eq!(cpu.csrs[MCAUSE], 5, "load access fault");
+    assert_eq!(cpu.csrs[MTVAL], 2, "the address it tried to read");
     assert_eq!(cpu.csrs[MSTATUS] & MSTATUS_MPP, mpp(Mode::Supervisor));
 }

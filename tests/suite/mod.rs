@@ -1,6 +1,7 @@
 //! The chapters of the instruction set suite.
 
 mod atomic;
+mod compressed;
 mod control;
 mod csr;
 mod device;

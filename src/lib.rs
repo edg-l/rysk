@@ -25,5 +25,6 @@ pub mod htif;
 pub mod inst;
 pub mod machine;
 pub mod plic;
+pub mod rvc;
 pub mod trap;
 pub mod uart;

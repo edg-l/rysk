@@ -1,6 +1,10 @@
 # Ground truth for the assembler in tests/common: every instruction format, with the
 # immediate encodings that are easy to get wrong. tests/isa.rs asserts that the Rust
 # encoder reproduces these bytes exactly.
+#
+# Uncompressed, because these are the 32-bit encodings. The compressed ones have their
+# own fixture in tests/compressed.s.
+  .option norvc
 main:
   addi  t0, zero, 1
   addi  t1, t0, -1

@@ -77,6 +77,46 @@ fn encoder_matches_the_toolchain() {
     }
 }
 
+/// The same for the compressed encoders, whose immediates are scattered across the
+/// halfword in nine arrangements and are the easiest thing here to get wrong.
+#[test]
+fn compressed_encoder_matches_the_toolchain() {
+    #[rustfmt::skip]
+    let expected: Vec<u16> = vec![
+        c_nop(), c_addi(T0, 1), c_addi(T0, -32), c_addiw(T0, 31),
+        c_li(A0, -1), c_lui(A1, 0xfffe0u32 as i32),
+        c_addi16sp(-512), c_addi16sp(496),
+        c_addi4spn(A0, 4), c_addi4spn(A5, 1020),
+        c_slli(T0, 63), c_srli(A0, 1), c_srai(A0, 63), c_andi(A0, -1),
+        c_sub(A0, A1), c_xor(A0, A1), c_or(A0, A1), c_and(A0, A1),
+        c_subw(A0, A1), c_addw(A0, A1),
+        c_lw(A0, A1, 0), c_lw(A0, A1, 124), c_ld(A0, A1, 8), c_ld(A0, A1, 248),
+        c_sw(A0, A1, 4), c_sd(A0, A1, 16),
+        c_lwsp(T0, 4), c_lwsp(T0, 252), c_ldsp(T0, 8), c_ldsp(T0, 504),
+        c_swsp(T0, 8), c_sdsp(T0, 16),
+        c_mv(T0, T1), c_add(T0, T1), c_jr(T0), c_jalr(T0), c_ebreak(),
+        // `back` is the instruction after c.ebreak, and `fwd` the last one
+        c_j(0), c_j(6), c_beqz(A0, -4), c_bnez(A0, 2),
+        c_nop(),
+    ];
+
+    let bytes = std::fs::read("tests/compressed.bin").expect("run `make test_files`");
+    let actual: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|h| u16::from_le_bytes(h.try_into().unwrap()))
+        .collect();
+
+    assert_eq!(actual.len(), expected.len(), "instruction count");
+    for (n, (a, e)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            a,
+            e,
+            "instruction {n} at {:#x}: {a:#06x} != {e:#06x}",
+            n * 2
+        );
+    }
+}
+
 /// The decoder is also the disassembler, and a trace is only useful if it reads like
 /// what the assembler was given.
 #[test]

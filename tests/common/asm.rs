@@ -228,3 +228,228 @@ pub const fn wfi() -> u32 {
 pub const fn nop() -> u32 {
     addi(ZERO, ZERO, 0)
 }
+
+// ------------------------------------------------------------- compressed
+
+/// The three-bit register fields name `x8` to `x15`, so an encoder takes the real
+/// register number and this checks it is one of them.
+const fn short(reg: u32) -> u16 {
+    assert!(
+        reg >= 8 && reg < 16,
+        "not a register the short fields reach"
+    );
+    (reg - 8) as u16
+}
+
+const fn part(imm: i32, high: u32, low: u32, at: u32) -> u16 {
+    (((imm >> low) as u32 & ((1 << (high - low + 1)) - 1)) << at) as u16
+}
+
+/// `funct4 | rd/rs1 | rs2 | op`, the register form.
+const fn cr(funct4: u16, rd: u32, rs2: u32, op: u16) -> u16 {
+    (funct4 << 12) | ((rd as u16) << 7) | ((rs2 as u16) << 2) | op
+}
+
+/// `funct3 | imm[5] | rd/rs1 | imm[4:0] | op`, the immediate form.
+const fn ci(funct3: u16, imm: i32, rd: u32, op: u16) -> u16 {
+    (funct3 << 13) | part(imm, 5, 5, 12) | ((rd as u16) << 7) | part(imm, 4, 0, 2) | op
+}
+
+/// `funct6 | rd'/rs1' | funct2 | rs2' | op`, the arithmetic form.
+const fn ca(funct6: u16, rd: u32, funct2: u16, rs2: u32, op: u16) -> u16 {
+    (funct6 << 10) | (short(rd) << 7) | (funct2 << 5) | (short(rs2) << 2) | op
+}
+
+pub const fn c_nop() -> u16 {
+    ci(0b000, 0, 0, 0b01)
+}
+
+pub const fn c_addi(rd: u32, imm: i32) -> u16 {
+    ci(0b000, imm, rd, 0b01)
+}
+
+pub const fn c_addiw(rd: u32, imm: i32) -> u16 {
+    ci(0b001, imm, rd, 0b01)
+}
+
+pub const fn c_li(rd: u32, imm: i32) -> u16 {
+    ci(0b010, imm, rd, 0b01)
+}
+
+pub const fn c_slli(rd: u32, shamt: u32) -> u16 {
+    ci(0b000, shamt as i32, rd, 0b10)
+}
+
+/// `lui`'s immediate is the value it puts in bits 17:12, so it is given here the way
+/// the assembler takes it: already shifted down.
+pub const fn c_lui(rd: u32, imm: i32) -> u16 {
+    ci(0b011, imm, rd, 0b01)
+}
+
+/// The stack pointer moved in units of sixteen bytes.
+pub const fn c_addi16sp(imm: i32) -> u16 {
+    (0b011 << 13)
+        | part(imm, 9, 9, 12)
+        | (2 << 7)
+        | part(imm, 4, 4, 6)
+        | part(imm, 6, 6, 5)
+        | part(imm, 8, 7, 3)
+        | part(imm, 5, 5, 2)
+        | 0b01
+}
+
+/// The stack pointer plus a scaled unsigned offset, into one of the short registers.
+///
+/// This and the two below are quadrant zero, whose opcode bits are both zero and so go
+/// unwritten, as does this one's funct3.
+pub const fn c_addi4spn(rd: u32, imm: i32) -> u16 {
+    part(imm, 5, 4, 11)
+        | part(imm, 9, 6, 7)
+        | part(imm, 2, 2, 6)
+        | part(imm, 3, 3, 5)
+        | (short(rd) << 2)
+}
+
+pub const fn c_lw(rd: u32, rs1: u32, imm: i32) -> u16 {
+    (0b010 << 13)
+        | part(imm, 5, 3, 10)
+        | (short(rs1) << 7)
+        | part(imm, 2, 2, 6)
+        | part(imm, 6, 6, 5)
+        | (short(rd) << 2)
+}
+
+pub const fn c_ld(rd: u32, rs1: u32, imm: i32) -> u16 {
+    (0b011 << 13) | part(imm, 5, 3, 10) | (short(rs1) << 7) | part(imm, 7, 6, 5) | (short(rd) << 2)
+}
+
+pub const fn c_sw(rs2: u32, rs1: u32, imm: i32) -> u16 {
+    c_lw(rs2, rs1, imm) | (0b100 << 13)
+}
+
+pub const fn c_sd(rs2: u32, rs1: u32, imm: i32) -> u16 {
+    c_ld(rs2, rs1, imm) | (0b100 << 13)
+}
+
+pub const fn c_lwsp(rd: u32, imm: i32) -> u16 {
+    (0b010 << 13)
+        | part(imm, 5, 5, 12)
+        | ((rd as u16) << 7)
+        | part(imm, 4, 2, 4)
+        | part(imm, 7, 6, 2)
+        | 0b10
+}
+
+pub const fn c_ldsp(rd: u32, imm: i32) -> u16 {
+    (0b011 << 13)
+        | part(imm, 5, 5, 12)
+        | ((rd as u16) << 7)
+        | part(imm, 4, 3, 5)
+        | part(imm, 8, 6, 2)
+        | 0b10
+}
+
+pub const fn c_swsp(rs2: u32, imm: i32) -> u16 {
+    (0b110 << 13) | part(imm, 5, 2, 9) | part(imm, 7, 6, 7) | ((rs2 as u16) << 2) | 0b10
+}
+
+pub const fn c_sdsp(rs2: u32, imm: i32) -> u16 {
+    (0b111 << 13) | part(imm, 5, 3, 10) | part(imm, 8, 6, 7) | ((rs2 as u16) << 2) | 0b10
+}
+
+pub const fn c_srli(rd: u32, shamt: u32) -> u16 {
+    (0b100 << 13)
+        | part(shamt as i32, 5, 5, 12)
+        | (short(rd) << 7)
+        | part(shamt as i32, 4, 0, 2)
+        | 0b01
+}
+
+pub const fn c_srai(rd: u32, shamt: u32) -> u16 {
+    c_srli(rd, shamt) | (0b01 << 10)
+}
+
+pub const fn c_andi(rd: u32, imm: i32) -> u16 {
+    (0b100 << 13)
+        | part(imm, 5, 5, 12)
+        | (0b10 << 10)
+        | (short(rd) << 7)
+        | part(imm, 4, 0, 2)
+        | 0b01
+}
+
+pub const fn c_sub(rd: u32, rs2: u32) -> u16 {
+    ca(0b100011, rd, 0b00, rs2, 0b01)
+}
+
+pub const fn c_xor(rd: u32, rs2: u32) -> u16 {
+    ca(0b100011, rd, 0b01, rs2, 0b01)
+}
+
+pub const fn c_or(rd: u32, rs2: u32) -> u16 {
+    ca(0b100011, rd, 0b10, rs2, 0b01)
+}
+
+pub const fn c_and(rd: u32, rs2: u32) -> u16 {
+    ca(0b100011, rd, 0b11, rs2, 0b01)
+}
+
+pub const fn c_subw(rd: u32, rs2: u32) -> u16 {
+    ca(0b100111, rd, 0b00, rs2, 0b01)
+}
+
+pub const fn c_addw(rd: u32, rs2: u32) -> u16 {
+    ca(0b100111, rd, 0b01, rs2, 0b01)
+}
+
+pub const fn c_j(imm: i32) -> u16 {
+    (0b101 << 13)
+        | part(imm, 11, 11, 12)
+        | part(imm, 4, 4, 11)
+        | part(imm, 9, 8, 9)
+        | part(imm, 10, 10, 8)
+        | part(imm, 6, 6, 7)
+        | part(imm, 7, 7, 6)
+        | part(imm, 3, 1, 3)
+        | part(imm, 5, 5, 2)
+        | 0b01
+}
+
+const fn cb(funct3: u16, rs1: u32, imm: i32) -> u16 {
+    (funct3 << 13)
+        | part(imm, 8, 8, 12)
+        | part(imm, 4, 3, 10)
+        | (short(rs1) << 7)
+        | part(imm, 7, 6, 5)
+        | part(imm, 2, 1, 3)
+        | part(imm, 5, 5, 2)
+        | 0b01
+}
+
+pub const fn c_beqz(rs1: u32, imm: i32) -> u16 {
+    cb(0b110, rs1, imm)
+}
+
+pub const fn c_bnez(rs1: u32, imm: i32) -> u16 {
+    cb(0b111, rs1, imm)
+}
+
+pub const fn c_jr(rs1: u32) -> u16 {
+    cr(0b1000, rs1, 0, 0b10)
+}
+
+pub const fn c_mv(rd: u32, rs2: u32) -> u16 {
+    cr(0b1000, rd, rs2, 0b10)
+}
+
+pub const fn c_jalr(rs1: u32) -> u16 {
+    cr(0b1001, rs1, 0, 0b10)
+}
+
+pub const fn c_add(rd: u32, rs2: u32) -> u16 {
+    cr(0b1001, rd, rs2, 0b10)
+}
+
+pub const fn c_ebreak() -> u16 {
+    cr(0b1001, 0, 0, 0b10)
+}

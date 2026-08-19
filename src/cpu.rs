@@ -8,7 +8,8 @@ use crate::{
     csr::*,
     dram::{DRAM_SIZE, Dram},
     elf::{Error as ElfError, Image},
-    inst::{AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
+    inst::{self, AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
+    rvc,
     trap::{Exception, Interrupt, Trap},
 };
 
@@ -46,6 +47,7 @@ impl Cpu {
             | misa_extension(b'i')
             | misa_extension(b'm')
             | misa_extension(b'a')
+            | misa_extension(b'c')
             | misa_extension(b's')
             | misa_extension(b'u');
         cpu.csrs[MSTATUS] = MSTATUS_XL_64;
@@ -138,15 +140,14 @@ impl Cpu {
     /// Fetch, decode and execute one instruction.
     #[inline]
     pub fn step(&mut self) -> Result<(), Exception> {
-        let word = self.fetch()?;
-        let inst = decode(word)?;
+        let (inst, encoding) = self.fetch()?;
         trace_insn!("{:#x}  {inst}", self.pc);
 
-        self.next_pc = self.pc.wrapping_add(4);
+        self.next_pc = self.pc.wrapping_add(inst::length(encoding as u16));
         self.csrs[RDCYCLE] += 1;
         self.csrs[INSTRET] += 1;
 
-        self.execute(inst, word)?;
+        self.execute(inst, encoding)?;
 
         self.regs[0] = 0;
         self.pc = self.next_pc;
@@ -295,6 +296,12 @@ impl Cpu {
             // is read-only zero, and what it does hold is what sie and sip may reach.
             // The RISC-V Instruction Set Manual Volume II, 3.1.8.
             MIDELEG => self.csrs[MIDELEG] = value & S_INTERRUPTS,
+            // The low bit of an exception program counter is read-only zero, since no
+            // instruction begins at an odd address. It is the only way a trap return
+            // could have produced one, compressed instructions having made every other
+            // two-byte target legal.
+            // The RISC-V Instruction Set Manual Volume II, 3.1.14.
+            MEPC | SEPC => self.csrs[addr] = value & !1,
             // The bits a device drives are read-only here: a write cannot argue with a
             // wire. The RISC-V Instruction Set Manual Volume II, 3.1.9.
             MIP => self.csrs[MIP] = (self.csrs[MIP] & MIP_DEVICE) | (value & !MIP_DEVICE),
@@ -313,18 +320,39 @@ impl Cpu {
     /// Without compressed instructions that means a multiple of four.
     #[inline]
     fn jump(&mut self, addr: u64) -> Result<(), Exception> {
-        if addr & 0b11 != 0 {
+        // Compressed instructions make IALIGN sixteen, so only an odd address is
+        // misaligned. Nothing can reach one: `jalr` clears the bit, a `jal` or branch
+        // immediate has none, and an exception program counter cannot hold one either.
+        // The check stands for the rule rather than for a case that arises.
+        if addr & 1 != 0 {
             return Err(Exception::InstructionAddressMisaligned(addr));
         }
         self.next_pc = addr;
         Ok(())
     }
 
+    /// Read the instruction at `pc`, and hand back its encoding along with it: a trap
+    /// this instruction raises owes that encoding to `mtval`, and how long it was is
+    /// read back out of it.
+    ///
+    /// It arrives a halfword at a time because its length is in its first two bytes: a
+    /// compressed instruction can sit in the last two bytes of memory, and reading four
+    /// there would fault on bytes it does not have.
     #[inline]
-    fn fetch(&mut self) -> Result<u32, Exception> {
+    fn fetch(&mut self) -> Result<(Inst, u32), Exception> {
+        let half = self.halfword(self.pc)?;
+        if inst::length(half) == 2 {
+            return Ok((rvc::decode(half)?, half as u32));
+        }
+        let word = half as u32 | (self.halfword(self.pc + 2)? as u32) << 16;
+        Ok((decode(word)?, word))
+    }
+
+    #[inline]
+    fn halfword(&mut self, addr: u64) -> Result<u16, Exception> {
         self.bus
-            .load(self.pc, 32)
-            .map(|word| word as u32)
+            .load(addr, 16)
+            .map(|half| half as u16)
             .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 

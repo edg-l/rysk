@@ -15,7 +15,7 @@ pub const SCRATCH: u64 = DRAM_BASE + 0x1000;
 
 /// A program to run, plus the register state it starts from.
 pub struct Program {
-    code: Vec<u32>,
+    code: Vec<u8>,
     regs: Vec<(u32, u64)>,
     csrs: Vec<(usize, u64)>,
     mode: Mode,
@@ -24,8 +24,18 @@ pub struct Program {
 
 /// Assemble `code` into a program starting from a zeroed register file.
 pub fn prog(code: &[u32]) -> Program {
+    image(code.iter().flat_map(|inst| inst.to_le_bytes()).collect())
+}
+
+/// The same for compressed instructions, which are half as wide. A program that mixes
+/// the two writes the 32-bit ones as their two halves, low first.
+pub fn halves(code: &[u16]) -> Program {
+    image(code.iter().flat_map(|inst| inst.to_le_bytes()).collect())
+}
+
+fn image(code: Vec<u8>) -> Program {
     Program {
-        code: code.to_vec(),
+        code,
         regs: Vec::new(),
         csrs: Vec::new(),
         mode: Mode::Machine,
@@ -79,12 +89,7 @@ impl Program {
     }
 
     fn run_to_trap(self) -> (Cpu, Trap) {
-        let mut bytes = Vec::with_capacity(self.code.len() * 4);
-        for inst in &self.code {
-            bytes.extend_from_slice(&inst.to_le_bytes());
-        }
-
-        let mut cpu = Cpu::new(bytes);
+        let mut cpu = Cpu::new(self.code);
         for (reg, value) in self.regs {
             cpu.regs[reg as usize] = value;
         }

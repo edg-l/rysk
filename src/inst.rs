@@ -202,6 +202,16 @@ const fn j_imm(inst: u32) -> u64 {
         | ((inst >> 20) & 0x7fe) as u64
 }
 
+/// How many bytes the instruction beginning with `half` occupies. Everything with its
+/// low two bits set is 32 bits wide, and everything else is compressed; the encodings
+/// above that are for instructions rysk does not have.
+///
+/// The RISC-V Instruction Set Manual Volume I, 1.5, table 1.
+#[inline]
+pub const fn length(half: u16) -> u64 {
+    if half & 0b11 == 0b11 { 4 } else { 2 }
+}
+
 /// Decode one 32-bit instruction, or reject it as illegal.
 #[inline]
 pub fn decode(inst: u32) -> Result<Inst, Exception> {

@@ -108,6 +108,11 @@ fn rv64ua_atomics() {
 }
 
 #[test]
+fn rv64uc_compressed_instructions() {
+    run_group("rv64uc-p-");
+}
+
+#[test]
 fn rv64si_supervisor_mode() {
     run_group("rv64si-p-");
 }
