@@ -46,12 +46,17 @@ cargo run -- tests/fib.bin
 ```
 
 That prints the register file and the non-zero CSRs at the end of the run. To
-watch it execute, set `RUST_LOG`:
+watch it execute, build the tracing in and set `RUST_LOG`:
 
 ```bash
-RUST_LOG=debug cargo run -- tests/fib.bin   # one line per instruction
-RUST_LOG=trace cargo run -- tests/fib.bin   # every bus load and store as well
+RUST_LOG=debug cargo run --features trace -- tests/fib.bin   # one line per instruction
+RUST_LOG=trace cargo run --features trace -- tests/fib.bin   # bus loads and stores too
 ```
+
+The `trace` feature is off by default because the spans and their fields cost
+about six times what interpreting the instruction does. Without it the tracing
+compiles to nothing, and rysk runs at roughly 120 million instructions per
+second on a tight loop.
 
 ## Testing
 

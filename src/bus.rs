@@ -1,6 +1,7 @@
 use std::ops::Range;
 
-use tracing::{instrument, trace};
+#[cfg(feature = "trace")]
+use tracing::instrument;
 
 use crate::dram::{DRAM_SIZE, Dram};
 
@@ -16,16 +17,16 @@ pub struct Bus {
 }
 
 impl Bus {
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "trace", instrument(skip(self)))]
     pub fn load(&self, addr: u64, size: u64) -> Result<u64, ()> {
-        trace!("load");
+        trace_mem!("load");
         self.check(addr, size)?;
         self.dram.load(addr, size)
     }
 
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "trace", instrument(skip(self)))]
     pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
-        trace!("store");
+        trace_mem!("store");
         self.check(addr, size)?;
         if let Some(reserved) = &self.reservation
             && addr < reserved.end

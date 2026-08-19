@@ -7,8 +7,8 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 fn main() -> Result<(), std::io::Error> {
     tracing::subscriber::set_global_default(
         FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env())
             .with_max_level(Level::DEBUG)
+            .with_env_filter(EnvFilter::from_default_env())
             .pretty()
             .finish(),
     )
