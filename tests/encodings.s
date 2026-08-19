@@ -119,3 +119,5 @@ fwd:
   ebreak
   mret
   wfi
+  fence
+  fence.i

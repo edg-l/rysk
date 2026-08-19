@@ -1,22 +1,61 @@
-name: Rust
+name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [master]
   pull_request:
-    branches: [ "master" ]
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+# A newer push to the same branch makes the run in progress pointless, except on
+# master, where every commit's result is worth keeping.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  build:
-
+  lint:
+    name: format and clippy
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo t
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The corpus is a fetch plus 86 assembles, so it is worth keeping between
+      # runs. Its revision and build recipe both live in the Makefile, so hashing
+      # that covers everything that changes what comes out. No restore-keys: a
+      # partial hit would leave a stale corpus that the stamp file makes look built.
+      - name: Cache the riscv-tests corpus
+        id: corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/rysk
+          key: corpus-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build the riscv-tests corpus
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: make corpus
+
+      - run: cargo build --locked
+      - run: cargo test --locked
+
+      # The tracing is compiled out by default, so it is only ever built here.
+      - name: Check the trace feature still builds
+        run: cargo check --locked --features trace

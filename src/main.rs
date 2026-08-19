@@ -1,10 +1,14 @@
 use std::{env, fs::File, io::Read};
 
-use rysk::cpu::Cpu;
+use rysk::{cpu::Cpu, elf, htif};
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-fn main() -> Result<(), std::io::Error> {
+/// Long enough for any test in the corpus, short enough to notice a program that will
+/// never finish.
+const MAX_STEPS: u64 = 100_000_000;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(
         FmtSubscriber::builder()
             .with_max_level(Level::DEBUG)
@@ -23,11 +27,26 @@ fn main() -> Result<(), std::io::Error> {
     let mut code = Vec::new();
     file.read_to_end(&mut code)?;
 
-    let mut cpu = Cpu::new(code);
-    let stopped = cpu.run();
+    // An image that carries a `tohost` symbol is a test: it signals its result there
+    // and then spins, so watching that address is the only way the run ends.
+    let (mut cpu, tohost) = if elf::is_elf(&code) {
+        let image = elf::parse(&code)?;
+        (Cpu::from_elf(&image)?, htif::tohost(&image))
+    } else {
+        (Cpu::new(code), None)
+    };
+
+    let stopped = match tohost {
+        Some(tohost) => htif::run(&mut cpu, tohost, MAX_STEPS).to_string(),
+        None => {
+            let exception = cpu.run();
+            format!("{exception}, pc {:#x}", cpu.pc)
+        }
+    };
+
     cpu.dump_registers();
     cpu.dump_csr();
-    println!("stopped: {stopped} at pc {:#x}", cpu.pc);
+    println!("stopped: {stopped}");
 
     Ok(())
 }

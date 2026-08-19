@@ -3,6 +3,15 @@
 //!
 //! The RISC-V Instruction Set Manual Volume II, chapter 2 and 3.1.
 
+pub const MISA: usize = 0x301;
+/// `misa` reports the width of the machine in its top two bits and the extensions it
+/// implements in the low twenty-six, one bit per letter of the alphabet.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.1.
+pub const MISA_MXL_64: u64 = 2 << 62;
+pub const fn misa_extension(letter: u8) -> u64 {
+    1 << (letter - b'a')
+}
+
 pub const MSTATUS: usize = 0x300;
 /// Bit positions in `mstatus`: the machine interrupt-enable bit, the value it had
 /// before the current trap, and the two-bit field holding the mode the trap came from.

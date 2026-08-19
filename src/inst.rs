@@ -121,6 +121,10 @@ pub enum Op {
     Csrrw { immediate: bool },
     Csrrs { immediate: bool },
     Csrrc { immediate: bool },
+    // ordering. A single in-order hart with no caches is already ordered, so both
+    // retire without doing anything.
+    Fence,
+    FenceI,
     // privileged
     Ecall,
     Ebreak,
@@ -286,6 +290,11 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
             };
             (Op::Branch { cond }, b_imm(inst))
         }
+        0x0f => match funct3 {
+            0x0 => (Op::Fence, 0),
+            0x1 => (Op::FenceI, 0),
+            _ => return Err(illegal),
+        },
         0x37 => (Op::Lui, u_imm(inst)),
         0x17 => (Op::Auipc, u_imm(inst)),
         0x6f => (Op::Jal, j_imm(inst)),
@@ -416,6 +425,8 @@ impl fmt::Display for Inst {
             }
             Op::Jal => write!(f, "jal {rd}, {imm:+}"),
             Op::Jalr => write!(f, "jalr {rd}, {imm}({rs1})"),
+            Op::Fence => write!(f, "fence"),
+            Op::FenceI => write!(f, "fence.i"),
             Op::Ecall => write!(f, "ecall"),
             Op::Ebreak => write!(f, "ebreak"),
             Op::Mret => write!(f, "mret"),

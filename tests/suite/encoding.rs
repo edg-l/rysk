@@ -55,7 +55,7 @@ fn encoder_matches_the_toolchain() {
         beq(T1, T2, -4), bne(T1, T2, 20), blt(T1, T2, -12),
         bge(T1, T2, 12), bltu(T1, T2, -20), bgeu(T1, T2, 4),
         addiw(T0, T1, 1),
-        ecall(), ebreak(), mret(), wfi(),
+        ecall(), ebreak(), mret(), wfi(), fence(), fence_i(),
     ];
 
     let bytes = std::fs::read("tests/encodings.bin").expect("run `make test_files`");
@@ -95,6 +95,8 @@ fn decoding_round_trips_to_readable_assembly() {
         (csrrw(ZERO, 0x305, T0), "csrrw zero, 0x305, t0"),
         (csrrci(T0, 0x340, 8), "csrrci t0, 0x340, 8"),
         (mret(), "mret"),
+        (fence(), "fence"),
+        (fence_i(), "fence.i"),
         (ecall(), "ecall"),
         (lr_w(T0, ZERO, T1), "lr.w t0, (t1)"),
         (sc_d(T0, T2, T1), "sc.d t0, t2, (t1)"),

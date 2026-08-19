@@ -15,6 +15,24 @@ impl Dram {
         Self { dram }
     }
 
+    /// Place `bytes` at `addr` and zero `zeroes` bytes after them, as loading an image
+    /// does. Returns whether it fit.
+    pub fn write(&mut self, addr: u64, bytes: &[u8], zeroes: u64) -> bool {
+        let Some(start) = addr.checked_sub(DRAM_BASE) else {
+            return false;
+        };
+        let Some(end) = (start as usize).checked_add(bytes.len() + zeroes as usize) else {
+            return false;
+        };
+        if end > self.dram.len() {
+            return false;
+        }
+        let start = start as usize;
+        self.dram[start..start + bytes.len()].copy_from_slice(bytes);
+        self.dram[start + bytes.len()..end].fill(0);
+        true
+    }
+
     #[inline]
     pub fn load(&self, addr: u64, size: u64) -> u64 {
         match size {

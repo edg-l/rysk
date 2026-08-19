@@ -194,6 +194,15 @@ pub const fn csrrci(rd: u32, csr: u32, uimm: u32) -> u32 {
     i(csr as i32, uimm, 0x7, rd, 0x73)
 }
 
+/// `fence iorw, iorw`, the conservative form an assembler emits for a bare `fence`.
+pub const fn fence() -> u32 {
+    i(0x0ff, 0, 0x0, 0, 0x0f)
+}
+
+pub const fn fence_i() -> u32 {
+    i(0x000, 0, 0x1, 0, 0x0f)
+}
+
 pub const fn ecall() -> u32 {
     i(0x000, 0, 0x0, 0, 0x73)
 }

@@ -7,6 +7,7 @@ use crate::{
     bus::{Bus, DRAM_BASE},
     csr::*,
     dram::{DRAM_SIZE, Dram},
+    elf::{Error as ElfError, Image},
     exception::Exception,
     inst::{AmoOp, Cond, Inst, Op, Width, decode},
 };
@@ -41,6 +42,8 @@ impl Cpu {
 
         cpu.regs[0] = 0;
         cpu.regs[2] = DRAM_BASE + DRAM_SIZE;
+        cpu.csrs[MISA] =
+            MISA_MXL_64 | misa_extension(b'i') | misa_extension(b'm') | misa_extension(b'a');
 
         cpu
     }
@@ -48,6 +51,23 @@ impl Cpu {
     /// Run until a trap that nothing is installed to handle, and return it. With no
     /// handler in `mtvec` there is nowhere for a trap to go, so that is where a program
     /// ends: normally by running off its own code into the zeroed dram behind it.
+    /// Place an image in memory and start at its entry point.
+    pub fn from_elf(image: &Image) -> Result<Self, ElfError> {
+        let mut cpu = Self::new(Vec::new());
+        for segment in &image.segments {
+            if !cpu
+                .bus
+                .dram
+                .write(segment.addr, &segment.bytes, segment.zeroes)
+            {
+                return Err(ElfError::SegmentOutsideDram(segment.addr));
+            }
+        }
+        cpu.pc = image.entry;
+        cpu.next_pc = image.entry;
+        Ok(cpu)
+    }
+
     pub fn run(&mut self) -> Exception {
         loop {
             if let Err(exception) = self.step() {
@@ -80,7 +100,7 @@ impl Cpu {
     /// interrupt-enable bit, and jump through `mtvec`.
     ///
     /// The RISC-V Instruction Set Manual Volume II, 3.1.6.1 and 3.1.7.
-    fn take_trap(&mut self, exception: Exception) {
+    pub fn take_trap(&mut self, exception: Exception) {
         self.csrs[MEPC] = self.pc;
         self.csrs[MCAUSE] = exception.cause();
         self.csrs[MTVAL] = exception.value();
@@ -120,6 +140,11 @@ impl Cpu {
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
     fn store_csr(&mut self, addr: usize, value: u64) {
+        // misa is writable in principle, to turn extensions off. rysk cannot, and the
+        // manual allows ignoring a write that names an unsupported configuration.
+        if addr == MISA {
+            return;
+        }
         trace_insn!("storing csr");
         match addr {
             SIE => {
@@ -313,6 +338,9 @@ impl Cpu {
             // Nothing can raise an interrupt yet, so waiting for one would never end.
             // Retiring immediately is permitted.
             Op::Wfi => {}
+            // One in-order hart observes its own accesses in order, and there is no
+            // instruction cache to keep coherent.
+            Op::Fence | Op::FenceI => {}
 
             // ---------------------------------------------------------- atomics
             Op::Lr { width } | Op::Sc { width } | Op::Amo { width, .. } => {

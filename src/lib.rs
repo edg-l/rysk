@@ -18,5 +18,7 @@ pub mod bus;
 pub mod cpu;
 pub mod csr;
 pub mod dram;
+pub mod elf;
 pub mod exception;
+pub mod htif;
 pub mod inst;

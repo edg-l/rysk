@@ -1,4 +1,5 @@
 use crate::common::*;
+use rysk::csr::{MISA, MISA_MXL_64, misa_extension};
 
 // ------------------------------------------------------------------ zicsr
 
@@ -41,4 +42,36 @@ fn a_csr_read_with_x0_as_the_source_does_not_write() {
         .run();
     assert_eq!(cpu.reg(T1), 0xabc);
     assert_eq!(cpu.csrs[MSCRATCH as usize], 0xabc);
+}
+
+#[test]
+fn misa_reports_the_width_and_the_extensions_that_are_implemented() {
+    let cpu = run(&[csrrs(A0, 0x301, ZERO)]);
+    assert_eq!(cpu.reg(A0) >> 62, 2, "MXL of two means XLEN is 64");
+    for letter in *b"ima" {
+        assert_ne!(
+            cpu.reg(A0) & misa_extension(letter),
+            0,
+            "{} should be reported",
+            letter as char
+        );
+    }
+    for letter in *b"fdc" {
+        assert_eq!(
+            cpu.reg(A0) & misa_extension(letter),
+            0,
+            "{} is not implemented",
+            letter as char
+        );
+    }
+}
+
+#[test]
+fn misa_ignores_writes_because_no_extension_can_be_turned_off() {
+    let cpu = prog(&[csrrw(ZERO, 0x301, T0), csrrs(A0, 0x301, ZERO)])
+        .reg(T0, 0)
+        .run();
+    assert_eq!(cpu.reg(A0), cpu.csrs[MISA]);
+    assert_eq!(cpu.reg(A0) >> 62, 2);
+    assert_eq!(cpu.reg(A0) & MISA_MXL_64, MISA_MXL_64);
 }
