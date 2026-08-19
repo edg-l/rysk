@@ -78,12 +78,24 @@ impl Bus {
             .fold(0, |bits, (_, device)| bits | device.interrupts())
     }
 
+    /// Read `size` bits at `addr`.
+    ///
+    /// Dram is inline and the devices are not. Every fetch comes through here and
+    /// almost every access is dram, so the answer for dram is a bounds check and a
+    /// move at the call site, with the width already folded to a constant; a device
+    /// costs a call, which it was going to cost anyway.
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
+    #[inline]
     pub fn load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
         trace_mem!("load");
         if self.in_dram(addr, size) {
             return Ok(self.dram.load(addr, size));
         }
+        self.device_load(addr, size)
+    }
+
+    #[inline(never)]
+    fn device_load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
         match self.device(addr, size) {
             Some((range, device)) => {
                 let offset = addr - range.start;
@@ -93,17 +105,13 @@ impl Bus {
         }
     }
 
+    /// Write the low `size` bits of `value` at `addr`, with the same split.
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
+    #[inline]
     pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
         trace_mem!("store");
         if !self.in_dram(addr, size) {
-            return match self.device(addr, size) {
-                Some((range, device)) => {
-                    let offset = addr - range.start;
-                    device.store(offset, size, value).map_err(|e| e.at(addr))
-                }
-                None => Err(Exception::StoreAmoAccessFault(addr)),
-            };
+            return self.device_store(addr, size, value);
         }
         if let Some(reserved) = &self.reservation
             && addr < reserved.end
@@ -113,6 +121,17 @@ impl Bus {
         }
         self.dram.store(addr, size, value);
         Ok(())
+    }
+
+    #[inline(never)]
+    fn device_store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
+        match self.device(addr, size) {
+            Some((range, device)) => {
+                let offset = addr - range.start;
+                device.store(offset, size, value).map_err(|e| e.at(addr))
+            }
+            None => Err(Exception::StoreAmoAccessFault(addr)),
+        }
     }
 
     /// Reserve the bytes a load-reserved of `size` bits at `addr` reads.

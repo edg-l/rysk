@@ -47,94 +47,45 @@ impl Dram {
         true
     }
 
+    /// Read `size` bits at `addr`.
+    ///
+    /// The width is a constant at almost every call site, so each arm folds to the one
+    /// load it describes: a slice of known length has a single bounds check and turns
+    /// into a single move, where a byte at a time had one of each per byte.
     #[inline]
     pub fn load(&self, addr: u64, size: u64) -> u64 {
+        let index = (addr - DRAM_BASE) as usize;
         match size {
-            8 => self.load8(addr),
-            16 => self.load16(addr),
-            32 => self.load32(addr),
-            64 => self.load64(addr),
+            8 => self.dram[index] as u64,
+            16 => u16::from_le_bytes(self.bytes(index)) as u64,
+            32 => u32::from_le_bytes(self.bytes(index)) as u64,
+            64 => u64::from_le_bytes(self.bytes(index)),
             _ => unreachable!("load of {size} bits"),
         }
     }
 
+    /// Write the low `size` bits of `value` at `addr`.
     #[inline]
     pub fn store(&mut self, addr: u64, size: u64, value: u64) {
+        let index = (addr - DRAM_BASE) as usize;
         match size {
-            8 => self.store8(addr, value),
-            16 => self.store16(addr, value),
-            32 => self.store32(addr, value),
-            64 => self.store64(addr, value),
+            8 => self.dram[index] = value as u8,
+            16 => self.put(index, (value as u16).to_le_bytes()),
+            32 => self.put(index, (value as u32).to_le_bytes()),
+            64 => self.put(index, value.to_le_bytes()),
             _ => unreachable!("store of {size} bits"),
         }
     }
 
+    /// The `N` bytes at `index`.
     #[inline]
-    fn load64(&self, addr: u64) -> u64 {
-        let index = (addr - DRAM_BASE) as usize;
-        (self.dram[index] as u64)
-            | ((self.dram[index + 1] as u64) << 8)
-            | ((self.dram[index + 2] as u64) << 16)
-            | ((self.dram[index + 3] as u64) << 24)
-            | ((self.dram[index + 4] as u64) << 32)
-            | ((self.dram[index + 5] as u64) << 40)
-            | ((self.dram[index + 6] as u64) << 48)
-            | ((self.dram[index + 7] as u64) << 56)
+    fn bytes<const N: usize>(&self, index: usize) -> [u8; N] {
+        self.dram[index..index + N].try_into().expect("N bytes")
     }
 
+    /// Put `bytes` at `index`.
     #[inline]
-    fn store64(&mut self, addr: u64, value: u64) {
-        let index = (addr - DRAM_BASE) as usize;
-        self.dram[index] = (value & 0xff) as u8;
-        self.dram[index + 1] = ((value >> 8) & 0xff) as u8;
-        self.dram[index + 2] = ((value >> 16) & 0xff) as u8;
-        self.dram[index + 3] = ((value >> 24) & 0xff) as u8;
-        self.dram[index + 4] = ((value >> 32) & 0xff) as u8;
-        self.dram[index + 5] = ((value >> 40) & 0xff) as u8;
-        self.dram[index + 6] = ((value >> 48) & 0xff) as u8;
-        self.dram[index + 7] = ((value >> 56) & 0xff) as u8;
-    }
-
-    #[inline]
-    fn load32(&self, addr: u64) -> u64 {
-        let index = (addr - DRAM_BASE) as usize;
-        (self.dram[index] as u64)
-            | ((self.dram[index + 1] as u64) << 8)
-            | ((self.dram[index + 2] as u64) << 16)
-            | ((self.dram[index + 3] as u64) << 24)
-    }
-
-    #[inline]
-    fn store32(&mut self, addr: u64, value: u64) {
-        let index = (addr - DRAM_BASE) as usize;
-        self.dram[index] = (value & 0xff) as u8;
-        self.dram[index + 1] = ((value >> 8) & 0xff) as u8;
-        self.dram[index + 2] = ((value >> 16) & 0xff) as u8;
-        self.dram[index + 3] = ((value >> 24) & 0xff) as u8;
-    }
-
-    #[inline]
-    fn load16(&self, addr: u64) -> u64 {
-        let index = (addr - DRAM_BASE) as usize;
-        (self.dram[index] as u64) | ((self.dram[index + 1] as u64) << 8)
-    }
-
-    #[inline]
-    fn store16(&mut self, addr: u64, value: u64) {
-        let index = (addr - DRAM_BASE) as usize;
-        self.dram[index] = (value & 0xff) as u8;
-        self.dram[index + 1] = ((value >> 8) & 0xff) as u8;
-    }
-
-    #[inline]
-    fn load8(&self, addr: u64) -> u64 {
-        let index = (addr - DRAM_BASE) as usize;
-        self.dram[index] as u64
-    }
-
-    #[inline]
-    fn store8(&mut self, addr: u64, value: u64) {
-        let index = (addr - DRAM_BASE) as usize;
-        self.dram[index] = (value & 0xff) as u8;
+    fn put<const N: usize>(&mut self, index: usize, bytes: [u8; N]) {
+        self.dram[index..index + N].copy_from_slice(&bytes);
     }
 }

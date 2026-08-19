@@ -115,6 +115,10 @@ impl Cpu {
 
     /// Refresh the bits of `mip` that a device drives. They are not storage software
     /// writes: each one is asserted for exactly as long as its device asserts it.
+    ///
+    /// Kept out of line so that asking whether there is an interrupt stays a pair of
+    /// register reads at the call site, whether or not any device drives one.
+    #[inline(never)]
     fn refresh_mip(&mut self) {
         self.csrs[MIP] = (self.csrs[MIP] & !MIP_DEVICE) | self.bus.interrupts();
     }
@@ -128,7 +132,12 @@ impl Cpu {
     /// `xRET` or a write to `mip`, `mie`, `mstatus` or `mideleg`, since every one of
     /// those retires before the next time round.
     ///
+    /// Asked once per instruction and answered no almost every time, so the question
+    /// itself is two register reads and a branch, and everything past the point where
+    /// the answer might be yes is out of line.
+    ///
     /// The RISC-V Instruction Set Manual Volume II, 3.1.9 and 12.1.3.
+    #[inline]
     pub fn interrupt(&mut self) -> Option<Interrupt> {
         // Asking the devices costs a read of the host clock, and it cannot change the
         // answer unless one of the bits they drive is enabled, so when none is the
@@ -141,6 +150,12 @@ impl Cpu {
         if ready == 0 {
             return None;
         }
+        self.highest_priority(ready)
+    }
+
+    /// The one to take out of those that are pending and enabled.
+    #[inline(never)]
+    fn highest_priority(&self, ready: u64) -> Option<Interrupt> {
         Interrupt::PRIORITY.into_iter().find(|interrupt| {
             let bit = 1 << *interrupt as u64;
             if ready & bit == 0 {
