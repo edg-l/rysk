@@ -125,6 +125,8 @@ const PRIORITY: i32 = 4 * UART_IRQ as i32;
 const ENABLE: u64 = 0x2000;
 const THRESHOLD: u64 = 0x20_0000;
 const CLAIM: i32 = 4;
+/// How far apart two contexts' registers are.
+const CONTEXT_STRIDE: u64 = 0x1000;
 
 /// A machine with a serial port wired to source 10 of a controller. `t0` is the port,
 /// `t1` the controller, `t2` its enable word and `t3` its machine context.
@@ -211,6 +213,44 @@ fn claiming_a_source_stops_it_being_offered_until_it_is_completed() {
         machine.reg(A2) & MEIP,
         0,
         "and is offered once more after completing it, since the byte is still there"
+    );
+}
+
+#[test]
+fn a_context_cannot_complete_a_source_it_does_not_have_enabled() {
+    // The source is enabled for the machine context and not for the supervisor one, so
+    // the supervisor's completion names something it could not have claimed and is
+    // ignored. Nothing records which context claimed a source, and without this check a
+    // hart could end another hart's handler by finishing an interrupt it never took.
+    // RISC-V Platform-Level Interrupt Controller Specification, 9.
+    let armed = arm();
+    let machine = wired(
+        &[
+            armed[0],
+            armed[1],
+            armed[2],
+            armed[3],
+            armed[4],
+            lw(A0, T3, CLAIM),
+            sw(A0, A3, CLAIM),
+            csrrs(A1, MIP as u32, ZERO),
+            sw(A0, T3, CLAIM),
+            csrrs(A2, MIP as u32, ZERO),
+        ],
+        Some(b'!'),
+    )
+    .reg(A3, plic::BASE + THRESHOLD + CONTEXT_STRIDE)
+    .run();
+    assert_eq!(machine.reg(A0), UART_IRQ, "the machine context claimed it");
+    assert_eq!(
+        machine.reg(A1) & MEIP,
+        0,
+        "and the supervisor context saying it was finished changed nothing"
+    );
+    assert_ne!(
+        machine.reg(A2) & MEIP,
+        0,
+        "where the context that claimed it saying so put it back"
     );
 }
 

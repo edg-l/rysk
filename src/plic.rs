@@ -97,7 +97,7 @@ impl Plic {
             .iter()
             .map(|(source, _)| *source)
             .filter(|&source| {
-                self.enable[context][source / 32] >> (source % 32) & 1 == 1
+                self.enabled(context, source)
                     && self.priority[source] > self.threshold[context]
                     && self.pending(source)
             })
@@ -116,10 +116,25 @@ impl Plic {
         }
     }
 
-    fn complete(&mut self, source: usize) {
-        if source > 0 && source < SOURCES {
+    /// Let `context` say it has finished with a source, which is what lets the gateway
+    /// offer that source again.
+    ///
+    /// A context may only complete what it may claim. Nothing records which context
+    /// claimed a source, so what is checked is that the source is one this context has
+    /// enabled, and a completion that fails the check is silently ignored rather than
+    /// refused: on a machine with more than one hart the alternative is one hart ending
+    /// another's handler.
+    ///
+    /// RISC-V Platform-Level Interrupt Controller Specification, 9.
+    fn complete(&mut self, context: usize, source: usize) {
+        if source > 0 && source < SOURCES && self.enabled(context, source) {
             self.claimed[source] = false;
         }
+    }
+
+    /// Whether `context` is listening to `source` at all.
+    fn enabled(&self, context: usize, source: usize) -> bool {
+        self.enable[context][source / 32] >> (source % 32) & 1 == 1
     }
 }
 
@@ -178,7 +193,9 @@ impl Device for Plic {
                 let register = (offset - CONTEXT) % CONTEXT_STRIDE;
                 match register {
                     THRESHOLD if context < self.threshold.len() => self.threshold[context] = value,
-                    CLAIM if context < self.threshold.len() => self.complete(value as usize),
+                    CLAIM if context < self.threshold.len() => {
+                        self.complete(context, value as usize)
+                    }
                     _ => return Err(Exception::StoreAmoAccessFault(offset)),
                 }
             }
