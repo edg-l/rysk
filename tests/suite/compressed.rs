@@ -13,16 +13,16 @@ fn wide(inst: u32) -> [u16; 2] {
 fn a_compressed_instruction_is_two_bytes_long() {
     // Three halfwords: if either of the first two were taken as four bytes, the third
     // would never run and a0 would not be three.
-    let cpu = halves(&[c_li(A0, 1), c_addi(A0, 1), c_addi(A0, 1)]).run();
-    assert_eq!(cpu.reg(A0), 3);
+    let machine = halves(&[c_li(A0, 1), c_addi(A0, 1), c_addi(A0, 1)]).run();
+    assert_eq!(machine.reg(A0), 3);
 }
 
 #[test]
 fn the_two_widths_mix_in_one_stream() {
     let [lo, hi] = wide(addi(A1, ZERO, 10));
-    let cpu = halves(&[c_li(A0, 1), lo, hi, c_addi(A0, 1)]).run();
+    let machine = halves(&[c_li(A0, 1), lo, hi, c_addi(A0, 1)]).run();
     assert_eq!(
-        (cpu.reg(A0), cpu.reg(A1)),
+        (machine.reg(A0), machine.reg(A1)),
         (2, 10),
         "all three ran, in order"
     );
@@ -30,13 +30,13 @@ fn the_two_widths_mix_in_one_stream() {
 
 #[test]
 fn the_short_register_fields_name_x8_to_x15() {
-    let cpu = halves(&[c_li(A0, 7), c_li(A1, 3), c_sub(A0, A1)]).run();
-    assert_eq!(cpu.reg(A0), 4, "a0 and a1, not x8 and x11 or x0 and x3");
+    let machine = halves(&[c_li(A0, 7), c_li(A1, 3), c_sub(A0, A1)]).run();
+    assert_eq!(machine.reg(A0), 4, "a0 and a1, not x8 and x11 or x0 and x3");
 }
 
 #[test]
 fn the_stack_pointer_forms_reach_the_stack() {
-    let cpu = halves(&[
+    let machine = halves(&[
         c_li(T0, 21),
         c_sdsp(T0, 8),
         c_ldsp(T1, 8),
@@ -44,10 +44,10 @@ fn the_stack_pointer_forms_reach_the_stack() {
     ])
     .reg(SP, SCRATCH)
     .run();
-    assert_eq!(cpu.reg(T1), 21, "it went to the stack and came back");
-    assert_eq!(cpu.load(SCRATCH + 8, 8), 21, "at the offset it named");
+    assert_eq!(machine.reg(T1), 21, "it went to the stack and came back");
+    assert_eq!(machine.load(SCRATCH + 8, 8), 21, "at the offset it named");
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         SCRATCH + 8,
         "and addi4spn scales its immediate"
     );
@@ -55,16 +55,16 @@ fn the_stack_pointer_forms_reach_the_stack() {
 
 #[test]
 fn the_stack_pointer_moves_in_units_of_sixteen_bytes() {
-    let cpu = halves(&[c_addi16sp(-32), c_addi16sp(16)])
+    let machine = halves(&[c_addi16sp(-32), c_addi16sp(16)])
         .reg(SP, SCRATCH)
         .run();
-    assert_eq!(cpu.reg(SP), SCRATCH - 16);
+    assert_eq!(machine.reg(SP), SCRATCH - 16);
 }
 
 #[test]
 fn a_compressed_branch_and_jump_reach_where_they_say() {
     // c.beqz is not taken, c.j skips the instruction after it.
-    let cpu = halves(&[
+    let machine = halves(&[
         c_li(A0, 1),
         c_beqz(A0, 8),
         c_j(4),
@@ -72,34 +72,38 @@ fn a_compressed_branch_and_jump_reach_where_they_say() {
         c_li(A2, 1),
     ])
     .run();
-    assert_eq!(cpu.reg(A1), 0, "the jump cleared it");
-    assert_eq!(cpu.reg(A2), 1, "and landed here");
+    assert_eq!(machine.reg(A1), 0, "the jump cleared it");
+    assert_eq!(machine.reg(A2), 1, "and landed here");
 
-    let cpu = halves(&[c_li(A0, 0), c_beqz(A0, 4), c_li(A1, 1), c_li(A2, 1)]).run();
-    assert_eq!(cpu.reg(A1), 0, "the branch was taken");
-    assert_eq!(cpu.reg(A2), 1);
+    let machine = halves(&[c_li(A0, 0), c_beqz(A0, 4), c_li(A1, 1), c_li(A2, 1)]).run();
+    assert_eq!(machine.reg(A1), 0, "the branch was taken");
+    assert_eq!(machine.reg(A2), 1);
 }
 
 #[test]
 fn a_compressed_jump_register_links_the_right_return_address() {
     // c.jalr puts the address after itself in ra, which is two bytes on.
-    let cpu = halves(&[c_li(T0, 0), c_jalr(T0)])
+    let machine = halves(&[c_li(T0, 0), c_jalr(T0)])
         .reg(T0, DRAM_BASE + 6)
         .run();
-    assert_eq!(cpu.reg(RA), DRAM_BASE + 4, "past the two-byte call");
+    assert_eq!(machine.reg(RA), DRAM_BASE + 4, "past the two-byte call");
 }
 
 #[test]
 fn c_lui_and_c_li_build_the_constants_they_are_named_for() {
-    let cpu = halves(&[c_li(A0, -1), c_lui(A1, 0xfffe0u32 as i32)]).run();
-    assert_eq!(cpu.reg(A0), u64::MAX, "c.li sign-extends");
-    assert_eq!(cpu.reg(A1), 0xffff_ffff_fffe_0000, "and so does c.lui");
+    let machine = halves(&[c_li(A0, -1), c_lui(A1, 0xfffe0u32 as i32)]).run();
+    assert_eq!(machine.reg(A0), u64::MAX, "c.li sign-extends");
+    assert_eq!(machine.reg(A1), 0xffff_ffff_fffe_0000, "and so does c.lui");
 }
 
 #[test]
 fn the_shifts_take_a_sixth_bit_from_the_top_of_the_halfword() {
-    let cpu = halves(&[c_li(A0, 1), c_slli(A0, 40), c_srli(A0, 39)]).run();
-    assert_eq!(cpu.reg(A0), 2, "a shift of more than 31 is still a shift");
+    let machine = halves(&[c_li(A0, 1), c_slli(A0, 40), c_srli(A0, 39)]).run();
+    assert_eq!(
+        machine.reg(A0),
+        2,
+        "a shift of more than 31 is still a shift"
+    );
 }
 
 #[test]
@@ -121,7 +125,7 @@ fn the_encodings_the_manual_reserves_are_rejected() {
 fn a_hint_retires_and_changes_nothing() {
     // c.add with x0 as its destination is a hint, which is exactly what the base
     // instruction it expands to already does.
-    let cpu = halves(&[c_li(A0, 5), c_add(ZERO, A0), c_addi(A0, 1)]).run();
-    assert_eq!(cpu.reg(A0), 6, "the instruction after it ran");
-    assert_eq!(cpu.reg(ZERO), 0);
+    let machine = halves(&[c_li(A0, 5), c_add(ZERO, A0), c_addi(A0, 1)]).run();
+    assert_eq!(machine.reg(A0), 6, "the instruction after it ran");
+    assert_eq!(machine.reg(ZERO), 0);
 }

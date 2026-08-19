@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 #[cfg(feature = "trace")]
 use tracing::instrument;
 
@@ -7,8 +5,6 @@ use crate::{
     bus::{Bus, DRAM_BASE},
     clint,
     csr::{self, *},
-    dram::Dram,
-    elf::{Error as ElfError, Image},
     fpu::{self, F32, F64, Format, Round},
     icache::{Decoded, Icache},
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
@@ -24,7 +20,6 @@ pub struct Cpu {
     pub pc: u64,
     /// Where control goes when it retires. Jumps and taken branches overwrite it.
     pub next_pc: u64,
-    pub bus: Bus,
     /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
     /// space (csr[11:0]) for up to 4096 CSRs.
     pub csrs: [u64; 4096],
@@ -39,31 +34,38 @@ pub struct Cpu {
     pub tlb: Tlb,
     /// What the last few fetches decoded to, so most of them do not happen either.
     pub icache: Icache,
-    pub start: Instant,
+    /// Which hart this is. It is the index the machine holds it at, the reservation on
+    /// the bus that is its own, the interrupt bits the controllers drive for it, and
+    /// what `mhartid` reads.
+    pub hart: usize,
+    /// Whether a `wfi` has parked it. A parked hart executes nothing until an
+    /// interrupt it has enabled is pending; noticing that is the scheduler's job,
+    /// because on a machine with more than one hart the interrupt that ends the wait
+    /// is usually one another hart has to send.
+    pub waiting: bool,
 }
 
 impl Cpu {
-    pub fn new(code: Vec<u8>) -> Self {
-        Self::with_memory(code, crate::dram::DRAM_SIZE)
-    }
-
-    /// A machine with `memory` bytes of dram, its stack pointer at the top of it.
-    pub fn with_memory(code: Vec<u8>, memory: u64) -> Self {
+    /// Hart `hart` of a machine, out of reset: the register file zeroed, machine mode,
+    /// and `pc` at the bottom of dram, which is where this machine starts.
+    pub fn new(hart: usize) -> Self {
         let mut cpu = Cpu {
             regs: Default::default(),
             pc: DRAM_BASE,
             next_pc: DRAM_BASE,
-            bus: Bus::new(Dram::with_size(code, memory)),
             csrs: [0; 4096],
             fregs: [0; 32],
             mode: Mode::Machine,
             tlb: Tlb::default(),
             icache: Icache::default(),
-            start: Instant::now(),
+            hart,
+            waiting: false,
         };
 
-        cpu.regs[0] = 0;
-        cpu.regs[2] = DRAM_BASE + memory;
+        // Read-only, and the only piece of machine information that says anything. No
+        // two harts may report the same one.
+        // The RISC-V Instruction Set Manual Volume II, 3.1.5.
+        cpu.csrs[MHARTID] = hart as u64;
         cpu.csrs[MISA] = MISA_MXL_64
             | misa_extension(b'i')
             | misa_extension(b'm')
@@ -80,41 +82,16 @@ impl Cpu {
         cpu
     }
 
-    /// Run until a trap that nothing is installed to handle, and return it. With no
-    /// handler in the vector the trap would use there is nowhere for it to go, so that
-    /// is where a program ends: normally by running off its own code into the zeroed
-    /// dram behind it.
-    /// Place an image in memory and start at its entry point.
-    pub fn from_elf(image: &Image) -> Result<Self, ElfError> {
-        let mut cpu = Self::new(Vec::new());
-        for segment in &image.segments {
-            if !cpu
-                .bus
-                .dram
-                .write(segment.addr, &segment.bytes, segment.zeroes)
-            {
-                return Err(ElfError::SegmentOutsideDram(segment.addr));
-            }
-        }
-        cpu.pc = image.entry;
-        cpu.next_pc = image.entry;
-        Ok(cpu)
-    }
-
-    pub fn run(&mut self) -> Trap {
-        loop {
-            if let Some(interrupt) = self.interrupt() {
-                let trap = Trap::Interrupt(interrupt);
-                if !self.take_trap(trap) {
-                    return trap;
-                }
-            }
-            if let Err(exception) = self.step()
-                && !self.take_trap(exception.into())
-            {
-                return exception.into();
-            }
-        }
+    /// Let a parked hart go if anything it has enabled is pending.
+    ///
+    /// `wfi` waits on `mip & mie` alone, whatever `mstatus` says about actually taking
+    /// the interrupt: the hart resumes, and whether it enters a handler is then the
+    /// ordinary question asked before the next instruction.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 3.3.3.
+    pub fn wake(&mut self, bus: &Bus) {
+        self.refresh_mip(bus);
+        self.waiting = self.csrs[MIP] & self.csrs[MIE] == 0;
     }
 
     /// Refresh the bits of `mip` that a device drives. They are not storage software
@@ -123,8 +100,8 @@ impl Cpu {
     /// Kept out of line so that asking whether there is an interrupt stays a pair of
     /// register reads at the call site, whether or not any device drives one.
     #[inline(never)]
-    fn refresh_mip(&mut self) {
-        self.csrs[MIP] = (self.csrs[MIP] & !MIP_DEVICE) | self.bus.interrupts();
+    fn refresh_mip(&mut self, bus: &Bus) {
+        self.csrs[MIP] = (self.csrs[MIP] & !MIP_DEVICE) | bus.interrupts(self.hart);
     }
 
     /// The interrupt to take before the next instruction, if there is one: the highest
@@ -142,13 +119,13 @@ impl Cpu {
     ///
     /// The RISC-V Instruction Set Manual Volume II, 3.1.9 and 12.1.3.
     #[inline]
-    pub fn interrupt(&mut self) -> Option<Interrupt> {
+    pub fn interrupt(&mut self, bus: &Bus) -> Option<Interrupt> {
         // Asking the devices costs a read of the host clock, and it cannot change the
         // answer unless one of the bits they drive is enabled, so when none is the
         // question is answered out of `mip` alone. Software still sees the true value:
         // reading the register is what refreshes it.
         if self.csrs[MIE] & MIP_DEVICE != 0 {
-            self.refresh_mip();
+            self.refresh_mip(bus);
         }
         let ready = self.csrs[MIP] & self.csrs[MIE];
         if ready == 0 {
@@ -179,12 +156,12 @@ impl Cpu {
 
     /// Fetch, decode and execute one instruction.
     #[inline]
-    pub fn step(&mut self) -> Result<(), Exception> {
+    pub fn step(&mut self, bus: &mut Bus) -> Result<(), Exception> {
         let Decoded {
             inst,
             encoding,
             length,
-        } = self.fetch()?;
+        } = self.fetch(bus)?;
         trace_insn!("{:#x}  {inst}", self.pc);
 
         self.next_pc = self.pc.wrapping_add(length as u64);
@@ -201,7 +178,7 @@ impl Cpu {
             Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
         ) && matches!(inst.imm as usize, MINSTRET | MINSTRETH);
 
-        self.execute(inst, encoding)?;
+        self.execute(bus, inst, encoding)?;
 
         // Counted here rather than before executing, because this is where it retires:
         // one that trapped did not, and `ecall` and `ebreak` are specified as never
@@ -339,13 +316,13 @@ impl Cpu {
         self.mode < Mode::Machine && (self.csrs[MSTATUS] >> bit) & 1 == 1
     }
 
-    #[cfg_attr(feature = "trace", instrument(skip(self)))]
-    fn load_csr(&mut self, addr: usize) -> u64 {
+    #[cfg_attr(feature = "trace", instrument(skip(self, bus)))]
+    fn load_csr(&mut self, bus: &mut Bus, addr: usize) -> u64 {
         trace_insn!("loading csr");
         // The device-driven bits of mip are wires, so reading them is reading the
         // devices rather than anything software last wrote.
         if addr == MIP || addr == SIP {
-            self.refresh_mip();
+            self.refresh_mip(bus);
         }
         if let Some((base, mask, readable)) = alias(addr, self.csrs[MIDELEG]) {
             return self.csrs[base] & (mask | readable);
@@ -364,7 +341,7 @@ impl Cpu {
             MINSTRETH => self.csrs[MINSTRET] >> 32,
             // `time` is defined to be the same counter the timer compares against, and
             // on this machine that counter lives in the clint.
-            TIME => self.bus.load(clint::BASE + clint::MTIME, 64).unwrap_or(0),
+            TIME => bus.load(clint::BASE + clint::MTIME, 64).unwrap_or(0),
             _ => self.csrs[addr],
         }
     }
@@ -456,8 +433,8 @@ impl Cpu {
     /// compressed instruction can sit in the last two bytes of memory, and reading four
     /// there would fault on bytes it does not have.
     #[inline]
-    fn fetch(&mut self) -> Result<Decoded, Exception> {
-        let pa = self.translate(self.pc, Access::Fetch)?;
+    fn fetch(&mut self, bus: &mut Bus) -> Result<Decoded, Exception> {
+        let pa = self.translate(bus, self.pc, Access::Fetch)?;
         if let Some(decoded) = self.icache.get(pa) {
             return Ok(decoded);
         }
@@ -467,10 +444,10 @@ impl Cpu {
         // not. A device may answer for one width and refuse another, so an address
         // that is not dram is read a half at a time, and so is the last halfword of a
         // page, which is the only place the two halves translate differently.
-        let word = if pa & 0xfff <= 0xffc && self.bus.in_dram(pa, 32) {
-            self.word(pa)?
+        let word = if pa & 0xfff <= 0xffc && bus.in_dram(pa, 32) {
+            self.word(bus, pa)?
         } else {
-            self.halves(pa)?
+            self.halves(bus, pa)?
         };
         // A compressed instruction is the low half alone, and the high half of what was
         // read is not part of it.
@@ -493,31 +470,29 @@ impl Cpu {
     /// The instruction at `pa`, read a halfword at a time, with the second half
     /// translated on its own where the first one ends a page. A compressed instruction
     /// is answered by its own half and the one after it is never read.
-    fn halves(&mut self, pa: u64) -> Result<u32, Exception> {
-        let half = self.halfword(pa)?;
+    fn halves(&mut self, bus: &mut Bus, pa: u64) -> Result<u32, Exception> {
+        let half = self.halfword(bus, pa)?;
         if inst::length(half) == 2 {
             return Ok(half as u32);
         }
         let next = if self.pc & 0xfff == 0xffe {
-            self.translate(self.pc + 2, Access::Fetch)?
+            self.translate(bus, self.pc + 2, Access::Fetch)?
         } else {
             pa + 2
         };
-        Ok(half as u32 | (self.halfword(next)? as u32) << 16)
+        Ok(half as u32 | (self.halfword(bus, next)? as u32) << 16)
     }
 
     #[inline]
-    fn halfword(&mut self, pa: u64) -> Result<u16, Exception> {
-        self.bus
-            .load(pa, 16)
+    fn halfword(&mut self, bus: &mut Bus, pa: u64) -> Result<u16, Exception> {
+        bus.load(pa, 16)
             .map(|half| half as u16)
             .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 
     #[inline]
-    fn word(&mut self, pa: u64) -> Result<u32, Exception> {
-        self.bus
-            .load(pa, 32)
+    fn word(&mut self, bus: &mut Bus, pa: u64) -> Result<u32, Exception> {
+        bus.load(pa, 32)
             .map(|word| word as u32)
             .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
@@ -537,42 +512,53 @@ impl Cpu {
     /// Out of line because there are four of it: letting all four into the run loop
     /// costs more in what it does to the scheduling there than the folded width saves.
     #[inline(never)]
-    fn read<const BITS: u64>(&mut self, va: u64) -> Result<u64, Exception> {
+    fn read<const BITS: u64>(&mut self, bus: &mut Bus, va: u64) -> Result<u64, Exception> {
         if Self::straddles(va, BITS) && self.translating(Access::Load) {
             let mut value = 0;
             for byte in 0..BITS / 8 {
-                let pa = self.translate(va + byte, Access::Load)?;
-                value |= self.bus.load(pa, 8)? << (byte * 8);
+                let pa = self.translate(bus, va + byte, Access::Load)?;
+                value |= bus.load(pa, 8)? << (byte * 8);
             }
             return Ok(value);
         }
-        let pa = self.translate(va, Access::Load)?;
-        self.bus.load(pa, BITS)
+        let pa = self.translate(bus, va, Access::Load)?;
+        bus.load(pa, BITS)
     }
 
     /// Write `BITS` at a virtual address, with the same care about page boundaries and
     /// for the same reasons out of line.
     #[inline(never)]
-    fn write<const BITS: u64>(&mut self, va: u64, value: u64) -> Result<(), Exception> {
+    fn write<const BITS: u64>(
+        &mut self,
+        bus: &mut Bus,
+        va: u64,
+        value: u64,
+    ) -> Result<(), Exception> {
         if Self::straddles(va, BITS) && self.translating(Access::Store) {
             // Both halves are translated before either is written, so an access that
             // faults part way through has not half happened.
             for byte in 0..BITS / 8 {
-                self.translate(va + byte, Access::Store)?;
+                self.translate(bus, va + byte, Access::Store)?;
             }
             for byte in 0..BITS / 8 {
-                let pa = self.translate(va + byte, Access::Store)?;
-                self.bus.store(pa, 8, value >> (byte * 8))?;
+                let pa = self.translate(bus, va + byte, Access::Store)?;
+                bus.store(pa, 8, value >> (byte * 8))?;
             }
             return Ok(());
         }
-        let pa = self.translate(va, Access::Store)?;
-        self.bus.store(pa, BITS, value)
+        let pa = self.translate(bus, va, Access::Store)?;
+        bus.store(pa, BITS, value)
     }
 
     /// A load of `width` bits, widened the way the instruction asked for.
     #[inline]
-    fn load_width(&mut self, va: u64, width: Width, signed: bool) -> Result<u64, Exception> {
+    fn load_width(
+        &mut self,
+        bus: &mut Bus,
+        va: u64,
+        width: Width,
+        signed: bool,
+    ) -> Result<u64, Exception> {
         let widen = |value, bits| {
             if signed {
                 Self::sext(value, bits)
@@ -581,21 +567,27 @@ impl Cpu {
             }
         };
         Ok(match width {
-            Width::Byte => widen(self.read::<8>(va)?, 8),
-            Width::Half => widen(self.read::<16>(va)?, 16),
-            Width::Word => widen(self.read::<32>(va)?, 32),
-            Width::Double => widen(self.read::<64>(va)?, 64),
+            Width::Byte => widen(self.read::<8>(bus, va)?, 8),
+            Width::Half => widen(self.read::<16>(bus, va)?, 16),
+            Width::Word => widen(self.read::<32>(bus, va)?, 32),
+            Width::Double => widen(self.read::<64>(bus, va)?, 64),
         })
     }
 
     /// A store of `width` bits.
     #[inline]
-    fn store_width(&mut self, va: u64, width: Width, value: u64) -> Result<(), Exception> {
+    fn store_width(
+        &mut self,
+        bus: &mut Bus,
+        va: u64,
+        width: Width,
+        value: u64,
+    ) -> Result<(), Exception> {
         match width {
-            Width::Byte => self.write::<8>(va, value),
-            Width::Half => self.write::<16>(va, value),
-            Width::Word => self.write::<32>(va, value),
-            Width::Double => self.write::<64>(va, value),
+            Width::Byte => self.write::<8>(bus, va, value),
+            Width::Half => self.write::<16>(bus, va, value),
+            Width::Word => self.write::<32>(bus, va, value),
+            Width::Double => self.write::<64>(bus, va, value),
         }
     }
 
@@ -606,7 +598,7 @@ impl Cpu {
     }
 
     /// Carry out one decoded instruction.
-    fn execute(&mut self, inst: Inst, encoding: u32) -> Result<(), Exception> {
+    fn execute(&mut self, bus: &mut Bus, inst: Inst, encoding: u32) -> Result<(), Exception> {
         let Inst {
             op,
             rd,
@@ -694,9 +686,9 @@ impl Cpu {
 
             // ---------------------------------------------------------- memory
             Op::Load { width, signed } => {
-                self.regs[rd] = self.load_width(a.wrapping_add(imm), width, signed)?;
+                self.regs[rd] = self.load_width(bus, a.wrapping_add(imm), width, signed)?;
             }
-            Op::Store { width } => self.store_width(a.wrapping_add(imm), width, b)?,
+            Op::Store { width } => self.store_width(bus, a.wrapping_add(imm), width, b)?,
 
             // ---------------------------------------------------------- control
             Op::Lui => self.regs[rd] = imm,
@@ -736,7 +728,7 @@ impl Cpu {
                 self.check_csr(imm as usize, encoding, true)?;
                 // With nowhere to put the result there is no read at all.
                 if rd != 0 {
-                    self.regs[rd] = self.load_csr(imm as usize);
+                    self.regs[rd] = self.load_csr(bus, imm as usize);
                 }
                 self.store_csr(imm as usize, source);
             }
@@ -745,7 +737,7 @@ impl Cpu {
                 // Naming no bits to change is not a write, so a read-only csr is still
                 // readable this way.
                 self.check_csr(imm as usize, encoding, rs1 != 0)?;
-                let csr = self.load_csr(imm as usize);
+                let csr = self.load_csr(bus, imm as usize);
                 // A source of x0, or of zero for the immediate forms, names no bits to
                 // change, and then the csr is not written at all.
                 if rs1 != 0 {
@@ -774,28 +766,18 @@ impl Cpu {
                 }
                 self.trap_return(mode);
             }
-            // Stall until something is pending and enabled, whatever `mstatus` says
-            // about taking it: the hart waits, it does not enter a handler. The wait is
-            // inside the instruction rather than a re-execution of it, because `wfi`
-            // retires either way and the trap is taken on the instruction after it, so
-            // that returning from the handler resumes past the wait. A hart waiting on
-            // an interrupt nothing can deliver waits forever, which is what the
-            // hardware does too.
+            // Ordering the walk against the stores that changed the table is what
+            // this owes, and a hart that executes its own accesses one at a time does
+            // that by itself. What is left is the cache of walks, which is emptied
+            // whole. It still has to be a supervisor asking, and a machine that set
+            // `TVM` wants to hear about it first.
             //
-            // The devices advance with the wall clock rather than with retired
-            // instructions, so there is something to wait for.
+            // An `sfence.vma` speaks for the hart that executes it and for no other.
+            // Software that has changed a table another hart is using sends that hart
+            // an interrupt and has it execute its own, which is what the supervisor
+            // binary interface calls a remote fence.
             //
-            // The RISC-V Instruction Set Manual Volume II, 3.3.3.
-            // A reservation can only be broken by a store, and the only thing on this
-            // machine that stores is the hart that is waiting. Waiting for a store
-            // that cannot arrive is waiting forever, so the stall ends at once, which
-            // the manual permits for any reason. Devices that master the bus would
-            // make this a real wait.
-            // The RISC-V Instruction Set Manual Volume I, 14.1.
-            // There is no address-translation cache to invalidate yet, so ordering
-            // the walk against the stores that changed the table is all this has to
-            // do, and one in-order hart does that by itself. It still has to be a
-            // supervisor asking. The RISC-V Instruction Set Manual Volume II, 12.2.1.
+            // The RISC-V Instruction Set Manual Volume II, 12.2.1.
             Op::SfenceVma => {
                 if self.mode < Mode::Supervisor || self.trapped(MSTATUS_TVM) {
                     return Err(Exception::IllegalInstruction(encoding as u64));
@@ -803,26 +785,42 @@ impl Cpu {
                 self.tlb.flush();
             }
 
+            // A reservation is broken by a store, so the wait is for another hart, and
+            // the manual permits ending it for any reason at any time. Ending it at
+            // once is a correct implementation of both `wrs.nto` and `wrs.sto`: the
+            // loop around it is what actually waits.
+            // The RISC-V Instruction Set Manual Volume I, 14.1.
             Op::Wrs { .. } => {}
 
+            // Park until something is pending and enabled, whatever `mstatus` says
+            // about taking it: the hart waits, it does not enter a handler. `wfi`
+            // retires either way, so the trap is taken on the instruction after it and
+            // returning from the handler resumes past the wait.
+            //
+            // The waiting happens outside the instruction because the interrupt that
+            // ends it usually comes from somewhere this hart cannot reach while it is
+            // executing: another hart's software interrupt, or a device that advances
+            // with the wall clock. A hart waiting on an interrupt nothing can deliver
+            // waits forever, which is what the hardware does too.
+            //
+            // The RISC-V Instruction Set Manual Volume II, 3.3.3.
             Op::Wfi => {
                 // With TW set, a wait below machine mode has to end within a bounded
                 // time or trap, and rysk's bound is no time at all.
                 if self.trapped(MSTATUS_TW) {
                     return Err(Exception::IllegalInstruction(encoding as u64));
                 }
-                self.refresh_mip();
-                while self.csrs[MIP] & self.csrs[MIE] == 0 {
-                    std::hint::spin_loop();
-                    self.refresh_mip();
-                }
+                self.waiting = true;
             }
-            // One in-order hart observes its own accesses in order, and there is no
-            // instruction cache to keep coherent.
-            // A fence orders memory that is already ordered, since there is one hart
-            // and nothing between it and dram. `fence.i` orders the stores this hart
-            // has made against its own instruction fetch, which is exactly the
-            // question the decoded instructions answer.
+
+            // A hart executes its own accesses in order and every other hart sees them
+            // in that order, since the harts share one memory and take turns at whole
+            // instructions, so a fence has nothing left to order.
+            //
+            // `fence.i` orders the stores this hart has made against its own
+            // instruction fetch, which is exactly the question the decoded
+            // instructions answer, and it speaks for this hart alone: a store meant to
+            // be fetched by another needs that hart to execute its own.
             // The RISC-V Instruction Set Manual Volume I, 5.
             Op::Fence => {}
             Op::FenceI => self.icache.flush(),
@@ -838,9 +836,9 @@ impl Cpu {
                 let format = if double { F64 } else { F32 };
                 let va = a.wrapping_add(imm);
                 let value = if double {
-                    self.read::<64>(va)?
+                    self.read::<64>(bus, va)?
                 } else {
-                    self.read::<32>(va)?
+                    self.read::<32>(bus, va)?
                 };
                 self.write_fp(rd, format, value);
             }
@@ -849,9 +847,9 @@ impl Cpu {
                 let value = self.read_fp_raw(rs2, format);
                 let va = a.wrapping_add(imm);
                 if double {
-                    self.write::<64>(va, value)?;
+                    self.write::<64>(bus, va, value)?;
                 } else {
-                    self.write::<32>(va, value)?;
+                    self.write::<32>(bus, va, value)?;
                 }
             }
 
@@ -939,13 +937,13 @@ impl Cpu {
                 }
                 // A compare-and-swap writes, so it needs a page it may write, and a
                 // quadword's second half is inside the page its first half is in.
-                let a = self.translate(a, Access::Store)?;
+                let a = self.translate(bus, a, Access::Store)?;
                 match width {
                     // A pair beginning at x0 reads as zero at both halves, and one
                     // named as the destination discards the result entirely rather
                     // than writing only its odd register.
                     CasWidth::Quad => {
-                        let (low, high) = (self.bus.load(a, 64)?, self.bus.load(a + 8, 64)?);
+                        let (low, high) = (bus.load(a, 64)?, bus.load(a + 8, 64)?);
                         let compare = if rd == 0 {
                             (0, 0)
                         } else {
@@ -957,8 +955,8 @@ impl Cpu {
                             (b, self.regs[rs2 + 1])
                         };
                         if (low, high) == compare {
-                            self.bus.store(a, 64, swap.0)?;
-                            self.bus.store(a + 8, 64, swap.1)?;
+                            bus.store(a, 64, swap.0)?;
+                            bus.store(a + 8, 64, swap.1)?;
                         }
                         if rd != 0 {
                             self.regs[rd] = low;
@@ -967,13 +965,13 @@ impl Cpu {
                     }
                     CasWidth::Narrow(width) => {
                         let bits = width.bits();
-                        let loaded = self.bus.load(a, bits)?;
+                        let loaded = bus.load(a, bits)?;
                         // Anything narrower looks at the low bits of rd only, and
                         // stores the low bits of rs2: what is above the width is not
                         // part of either operand.
                         let mask = u64::MAX >> (64 - bits);
                         if loaded == self.regs[rd] & mask {
-                            self.bus.store(a, bits, b)?;
+                            bus.store(a, bits, b)?;
                         }
                         self.regs[rd] = Self::sext(loaded, bits);
                     }
@@ -992,26 +990,26 @@ impl Cpu {
                     Op::Lr { .. } => Access::Load,
                     _ => Access::Store,
                 };
-                let a = self.translate(a, access)?;
+                let a = self.translate(bus, a, access)?;
                 match op {
                     Op::Lr { .. } => {
-                        self.regs[rd] = Self::sext(self.bus.load(a, bits)?, bits);
-                        self.bus.reserve(a, bits);
+                        self.regs[rd] = Self::sext(bus.load(a, bits)?, bits);
+                        bus.reserve(self.hart, a, bits);
                     }
                     Op::Sc { .. } => {
                         // The store happens only if the reservation still covers these
                         // bytes, and rd reports zero for success, nonzero for failure.
-                        self.regs[rd] = if self.bus.take_reservation(a, bits) {
-                            self.bus.store(a, bits, b)?;
+                        self.regs[rd] = if bus.take_reservation(self.hart, a, bits) {
+                            bus.store(a, bits, b)?;
                             0
                         } else {
                             1
                         };
                     }
                     Op::Amo { op, .. } => {
-                        let data = self.bus.load(a, bits)?;
+                        let data = bus.load(a, bits)?;
                         let value = Self::amo(op, width, data, b);
-                        self.bus.store(a, bits, value)?;
+                        bus.store(a, bits, value)?;
                         self.regs[rd] = Self::sext(data, bits);
                     }
                     _ => unreachable!(),

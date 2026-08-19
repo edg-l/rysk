@@ -54,12 +54,16 @@ fn mapped(code: &[u32], flags: u64) -> Program {
 
 #[test]
 fn a_mapped_page_is_reached_through_its_translation() {
-    let cpu = mapped(&[sd(T1, T0, 0), ld(A0, T0, 0)], V | R | W | A | D)
+    let machine = mapped(&[sd(T1, T0, 0), ld(A0, T0, 0)], V | R | W | A | D)
         .reg(T1, 0xabcd)
         .run();
-    assert_eq!(cpu.reg(A0), 0xabcd, "it round-tripped through the mapping");
     assert_eq!(
-        cpu.load(FRAME, 8),
+        machine.reg(A0),
+        0xabcd,
+        "it round-tripped through the mapping"
+    );
+    assert_eq!(
+        machine.load(FRAME, 8),
         0xabcd,
         "and landed in the physical page the table named, not at the virtual address"
     );
@@ -67,12 +71,12 @@ fn a_mapped_page_is_reached_through_its_translation() {
 
 #[test]
 fn the_page_offset_survives_translation() {
-    let cpu = mapped(&[sd(T1, T0, 0x18), ld(A0, T0, 0x18)], V | R | W | A | D)
+    let machine = mapped(&[sd(T1, T0, 0x18), ld(A0, T0, 0x18)], V | R | W | A | D)
         .reg(T1, 7)
         .run();
-    assert_eq!(cpu.reg(A0), 7);
+    assert_eq!(machine.reg(A0), 7);
     assert_eq!(
-        cpu.load(FRAME + 0x18, 8),
+        machine.load(FRAME + 0x18, 8),
         7,
         "at the same offset in the frame"
     );
@@ -97,11 +101,11 @@ fn a_page_without_the_permission_being_asked_for_faults() {
 #[test]
 fn an_executable_page_is_readable_only_when_mxr_says_so() {
     mapped(&[ld(A0, T0, 0)], V | X | A).expect(Exception::LoadPageFault(VA));
-    let cpu = mapped(&[ld(A0, T0, 0)], V | X | A)
+    let machine = mapped(&[ld(A0, T0, 0)], V | X | A)
         .csr(MSTATUS, 1 << MSTATUS_MXR)
         .run();
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         0,
         "it read the zeroed frame rather than faulting"
     );
@@ -110,10 +114,10 @@ fn an_executable_page_is_readable_only_when_mxr_says_so() {
 #[test]
 fn a_supervisor_reaches_a_user_page_only_when_sum_says_so() {
     mapped(&[ld(A0, T0, 0)], V | R | U | A).expect(Exception::LoadPageFault(VA));
-    let cpu = mapped(&[ld(A0, T0, 0)], V | R | U | A)
+    let machine = mapped(&[ld(A0, T0, 0)], V | R | U | A)
         .csr(MSTATUS, 1 << MSTATUS_SUM)
         .run();
-    assert_eq!(cpu.reg(A0), 0, "sum let it through");
+    assert_eq!(machine.reg(A0), 0, "sum let it through");
 }
 
 #[test]
@@ -163,7 +167,7 @@ fn a_superpage_maps_its_whole_range_from_one_entry() {
     // A leaf at the middle level covers two megabytes, so the address supplies the
     // bits the entry does not.
     let two_meg = DRAM_BASE + 0x20_0000;
-    let cpu = identity(prog(&[sd(T1, T0, 0), ld(A0, T0, 0)]))
+    let machine = identity(prog(&[sd(T1, T0, 0), ld(A0, T0, 0)]))
         .mode(Mode::Supervisor)
         .csr(SATP, sv39(ROOT))
         .memory(ROOT, pte(MID, V))
@@ -171,9 +175,9 @@ fn a_superpage_maps_its_whole_range_from_one_entry() {
         .reg(T0, 0x20_1000)
         .reg(T1, 0x1234)
         .run();
-    assert_eq!(cpu.reg(A0), 0x1234);
+    assert_eq!(machine.reg(A0), 0x1234);
     assert_eq!(
-        cpu.load(two_meg + 0x1000, 8),
+        machine.load(two_meg + 0x1000, 8),
         0x1234,
         "at the offset within it"
     );
@@ -195,13 +199,13 @@ fn a_superpage_that_is_not_aligned_to_its_own_size_faults() {
 fn machine_mode_does_not_translate_unless_mprv_says_to() {
     // The same table, but the hart is in machine mode, so the address is physical and
     // reaches dram directly.
-    let cpu = prog(&[sd(T1, T0, 0)])
+    let machine = prog(&[sd(T1, T0, 0)])
         .csr(SATP, sv39(ROOT))
         .memory(ROOT, pte(MID, V))
         .reg(T0, SCRATCH)
         .reg(T1, 9)
         .run();
-    assert_eq!(cpu.load(SCRATCH, 8), 9, "untranslated");
+    assert_eq!(machine.load(SCRATCH, 8), 9, "untranslated");
 
     // With MPRV set and MPP naming supervisor mode, the same store translates.
     prog(&[sd(T1, T0, 0)])
@@ -219,10 +223,10 @@ fn machine_mode_does_not_translate_unless_mprv_says_to() {
 fn an_instruction_fetch_translates_too() {
     // The frame holds a single instruction, and the program counter reaches it through
     // the mapping rather than by its address.
-    let cpu = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
+    let machine = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
         .memory(FRAME, addi(A0, ZERO, 1) as u64)
         .run();
-    assert_eq!(cpu.reg(A0), 1, "it fetched through the mapping");
+    assert_eq!(machine.reg(A0), 1, "it fetched through the mapping");
 }
 
 #[test]
@@ -232,7 +236,7 @@ fn an_instruction_that_straddles_two_pages_is_fetched_through_both() {
     // each other. Taking the second half from beside the first would find the decoy.
     let next = FRAME + 0x2000;
     let decoy = FRAME + 0x1000;
-    let cpu = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
+    let machine = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
         .memory(LEAF + 16, pte(next, V | R | X | A))
         .memory(FRAME + 0xff8, (addi(A0, ZERO, 1) as u64 & 0xffff) << 48)
         .memory(next, (addi(A0, ZERO, 1) >> 16) as u64)
@@ -240,7 +244,7 @@ fn an_instruction_that_straddles_two_pages_is_fetched_through_both() {
         .reg(T0, VA + 0xffe)
         .run();
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         1,
         "the half that is in the page it is mapped to"
     );
@@ -255,7 +259,7 @@ fn a_page_that_may_not_be_executed_faults_on_the_fetch() {
 
 #[test]
 fn satp_holds_only_the_translation_schemes_the_machine_has() {
-    let cpu = prog(&[
+    let machine = prog(&[
         csrrw(ZERO, 0x180, T0),
         csrrs(A0, 0x180, ZERO),
         csrrw(ZERO, 0x180, T1),
@@ -265,11 +269,11 @@ fn satp_holds_only_the_translation_schemes_the_machine_has() {
     .reg(T1, sv39(ROOT))
     .run();
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         0,
         "the write of an unsupported mode was refused"
     );
-    assert_eq!(cpu.reg(A1), sv39(ROOT), "and a supported one was taken");
+    assert_eq!(machine.reg(A1), sv39(ROOT), "and a supported one was taken");
 }
 
 #[test]
@@ -288,7 +292,7 @@ fn a_change_to_the_table_takes_effect_after_sfence_vma() {
     // translation; the load after that has to see the new frame rather than whatever
     // the last walk found.
     let other = FRAME + 0x1000;
-    let cpu = mapped(
+    let machine = mapped(
         &[
             ld(A0, T0, 0),
             sd(T2, T1, 0),
@@ -302,6 +306,6 @@ fn a_change_to_the_table_takes_effect_after_sfence_vma() {
     .memory(FRAME, 1)
     .memory(other, 2)
     .run();
-    assert_eq!(cpu.reg(A0), 1, "the frame it was mapped to");
-    assert_eq!(cpu.reg(A1), 2, "and the one it was remapped to");
+    assert_eq!(machine.reg(A0), 1, "the frame it was mapped to");
+    assert_eq!(machine.reg(A1), 2, "and the one it was remapped to");
 }

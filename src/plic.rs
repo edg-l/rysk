@@ -184,7 +184,7 @@ impl Device for Plic {
 
     /// The external-interrupt bit of each privilege level is one wire out of this
     /// controller, asserted for as long as that level has something to claim.
-    fn interrupts(&self) -> u64 {
+    fn interrupts(&self, _hart: usize) -> u64 {
         let mut bits = 0;
         if self.best(MACHINE).is_some() {
             bits |= MEIP;

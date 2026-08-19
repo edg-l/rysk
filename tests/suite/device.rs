@@ -36,23 +36,23 @@ fn fake() -> Box<dyn Device> {
 
 #[test]
 fn a_device_is_read_at_an_offset_from_its_own_base() {
-    let cpu = prog(&[lw(A0, T0, 0), lw(A1, T0, 8)])
+    let machine = prog(&[lw(A0, T0, 0), lw(A1, T0, 8)])
         .reg(T0, BASE + 0x40)
         .device(BASE, 0x1000, fake())
         .run();
-    assert_eq!(cpu.reg(A0), 0x40 << 8 | 32, "offset 0x40, 32 bits");
-    assert_eq!(cpu.reg(A1), 0x48 << 8 | 32, "and the next word along");
+    assert_eq!(machine.reg(A0), 0x40 << 8 | 32, "offset 0x40, 32 bits");
+    assert_eq!(machine.reg(A1), 0x48 << 8 | 32, "and the next word along");
 }
 
 #[test]
 fn a_store_reaches_the_device() {
-    let cpu = prog(&[sw(T1, T0, 4), lw(A0, T0, WITNESS)])
+    let machine = prog(&[sw(T1, T0, 4), lw(A0, T0, WITNESS)])
         .reg(T0, BASE)
         .reg(T1, 0xabcd)
         .device(BASE, 0x1000, fake())
         .run();
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         0xabcd,
         "the device kept what was written to it"
     );
@@ -77,16 +77,16 @@ fn an_access_running_off_the_end_of_a_device_is_not_its_to_answer() {
         .reg(T0, BASE + 0x1000 - 4)
         .device(BASE, 0x1000, fake())
         .expect(Exception::LoadAccessFault(BASE + 0x1000 - 4));
-    let cpu = prog(&[lw(A0, T0, 0)])
+    let machine = prog(&[lw(A0, T0, 0)])
         .reg(T0, BASE + 0x1000 - 4)
         .device(BASE, 0x1000, fake())
         .run();
-    assert_eq!(cpu.reg(A0), 0xffc << 8 | 32, "but a word is");
+    assert_eq!(machine.reg(A0), 0xffc << 8 | 32, "but a word is");
 }
 
 #[test]
 fn several_devices_decode_to_the_right_one() {
-    let cpu = prog(&[lw(A0, T0, 0), lw(A1, T1, 0), lw(A2, T2, 0)])
+    let machine = prog(&[lw(A0, T0, 0), lw(A1, T1, 0), lw(A2, T2, 0)])
         .reg(T0, 0x0200_0000)
         .reg(T1, 0x0c00_0000)
         .reg(T2, BASE)
@@ -94,7 +94,7 @@ fn several_devices_decode_to_the_right_one() {
         .device(0x0200_0000, 0x10000, fake())
         .device(0x0c00_0000, 0x400000, fake())
         .run();
-    for value in [cpu.reg(A0), cpu.reg(A1), cpu.reg(A2)] {
+    for value in [machine.reg(A0), machine.reg(A1), machine.reg(A2)] {
         assert_eq!(value, 32, "each decoded to offset zero of its own device");
     }
 }

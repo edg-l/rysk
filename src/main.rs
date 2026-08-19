@@ -1,6 +1,6 @@
 use std::{env, fs::File, io::Read};
 
-use rysk::{cpu::Cpu, dram::DRAM_SIZE, elf, htif, machine};
+use rysk::{dram::DRAM_SIZE, elf, htif, machine, machine::Machine};
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -15,7 +15,7 @@ const MAX_STEPS: u64 = 100_000_000;
 /// reads it out of `a2`. Saying so here is what keeps the device tree where this
 /// machine put it, rather than being relocated into the middle of a kernel that
 /// firmware does not know is there.
-fn handoff(cpu: &mut Cpu) {
+fn handoff(machine: &mut Machine) {
     /// "OSBI", and the layout version that carries a boot hart.
     const MAGIC: u64 = 0x4942_534f;
     const VERSION: u64 = 2;
@@ -24,14 +24,16 @@ fn handoff(cpu: &mut Cpu) {
     /// Where OpenSBI's own next stage begins, by its convention.
     const NEXT: u64 = 0x8020_0000;
 
-    let at = machine::fdt_base(cpu.bus.dram.size()) - 0x1000;
+    let at = machine::fdt_base(machine.bus.dram.size()) - 0x1000;
     for (n, word) in [MAGIC, VERSION, NEXT, NEXT_MODE, 0, 0]
         .into_iter()
         .enumerate()
     {
-        cpu.bus.dram.store(at + n as u64 * 8, 64, word);
+        machine.bus.dram.store(at + n as u64 * 8, 64, word);
     }
-    cpu.regs[12] = at;
+    for hart in &mut machine.harts {
+        hart.regs[12] = at;
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to are both in memory at once: `rysk fw_jump.bin vmlinux@0x80200000`.
     let args: Vec<String> = env::args().skip(1).collect();
     let mut memory = DRAM_SIZE;
+    let harts = 1;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
     let mut at = 0;
@@ -74,11 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // An image that carries a `tohost` symbol is a test: it signals its result there
     // and then spins, so watching that address is the only way the run ends.
-    let (mut cpu, tohost) = if elf::is_elf(&code) {
+    let (mut machine, tohost) = if elf::is_elf(&code) {
         let image = elf::parse(&code)?;
-        (Cpu::from_elf(&image)?, htif::tohost(&image))
+        (
+            Machine::from_elf(&image, memory, harts)?,
+            htif::tohost(&image),
+        )
     } else {
-        (Cpu::with_memory(code, memory), None)
+        (Machine::new(code, memory, harts), None)
     };
 
     for arg in &images[1..] {
@@ -90,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         File::open(path)?.read_to_end(&mut bytes)?;
         let end = at + bytes.len() as u64;
         assert!(
-            cpu.bus.dram.write(at, &bytes, 0),
+            machine.bus.dram.write(at, &bytes, 0),
             "{path} does not fit: it wants up to {end:#x}"
         );
         println!("loaded {path} at {at:#x}, {} KiB", bytes.len() / 1024);
@@ -104,15 +110,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let end = machine::fdt_base(memory) - 0x10_0000;
         let at = (end - bytes.len() as u64) & !0xfff;
         assert!(
-            cpu.bus.dram.write(at, &bytes, 0),
+            machine.bus.dram.write(at, &bytes, 0),
             "{path} does not fit in memory"
         );
         println!("loaded {path} at {at:#x}, {} KiB", bytes.len() / 1024);
         options.initrd = Some((at, at + bytes.len() as u64));
     }
 
-    let keyboard = machine::boot(&mut cpu, rysk::ISA, &options);
-    handoff(&mut cpu);
+    let keyboard = machine::boot(&mut machine, rysk::ISA, &options);
+    handoff(&mut machine);
 
     // Whatever is typed reaches the port from its own thread, since the hart is busy
     // being a hart. The terminal is still in its usual line-buffered mode, so a line
@@ -126,15 +132,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let stopped = match tohost {
-        Some(tohost) => htif::run(&mut cpu, tohost, MAX_STEPS).to_string(),
+        Some(tohost) => htif::run(&mut machine, tohost, MAX_STEPS).to_string(),
         None => {
-            let trap = cpu.run();
-            format!("{trap}, pc {:#x}", cpu.pc)
+            let halt = machine.run();
+            format!("{halt}, pc {:#x}", machine.harts[halt.hart].pc)
         }
     };
 
-    cpu.dump_registers();
-    cpu.dump_csr();
+    for hart in &machine.harts {
+        hart.dump_registers();
+        hart.dump_csr();
+    }
     println!("stopped: {stopped}");
 
     Ok(())

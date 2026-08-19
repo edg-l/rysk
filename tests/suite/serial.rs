@@ -68,9 +68,9 @@ fn a_byte_written_to_the_port_reaches_the_other_end() {
 #[test]
 fn the_port_says_it_is_ready_to_send_and_has_nothing_to_read() {
     let (program, _) = serial(&[lbu(A0, T0, 5)], None);
-    let cpu = program.run();
-    assert_eq!(cpu.reg(A0) & 1, 0, "nothing has been typed");
-    assert_ne!(cpu.reg(A0) & (1 << 5), 0, "and it is ready to send");
+    let machine = program.run();
+    assert_eq!(machine.reg(A0) & 1, 0, "nothing has been typed");
+    assert_ne!(machine.reg(A0) & (1 << 5), 0, "and it is ready to send");
 }
 
 #[test]
@@ -79,10 +79,14 @@ fn a_byte_that_arrives_is_read_once() {
         &[lbu(A0, T0, 5), lbu(A1, T0, 0), lbu(A2, T0, 5)],
         Some(b'x'),
     );
-    let cpu = program.run();
-    assert_ne!(cpu.reg(A0) & 1, 0, "the port says a byte is waiting");
-    assert_eq!(cpu.reg(A1), b'x' as u64, "which is the byte that was typed");
-    assert_eq!(cpu.reg(A2) & 1, 0, "and reading it took it");
+    let machine = program.run();
+    assert_ne!(machine.reg(A0) & 1, 0, "the port says a byte is waiting");
+    assert_eq!(
+        machine.reg(A1),
+        b'x' as u64,
+        "which is the byte that was typed"
+    );
+    assert_eq!(machine.reg(A2) & 1, 0, "and reading it took it");
 }
 
 #[test]
@@ -99,15 +103,15 @@ fn the_divisor_latch_puts_the_baud_rate_where_the_data_registers_were() {
         ],
         None,
     );
-    let cpu = program.run();
+    let machine = program.run();
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         0x0d,
         "the divisor reads back with the latch open"
     );
     assert_eq!(printed.text(), "", "and nothing was sent");
     assert_eq!(
-        cpu.reg(A1),
+        machine.reg(A1),
         0,
         "with it closed the register is the port again"
     );
@@ -157,7 +161,7 @@ fn arm() -> [u32; 5] {
 #[test]
 fn a_source_below_the_threshold_is_not_offered() {
     let armed = arm();
-    let cpu = wired(
+    let machine = wired(
         &[
             armed[0],
             armed[1],
@@ -175,14 +179,14 @@ fn a_source_below_the_threshold_is_not_offered() {
         Some(b'!'),
     )
     .run();
-    assert_eq!(cpu.reg(A0) & MEIP, 0, "masked by the threshold");
-    assert_ne!(cpu.reg(A1) & MEIP, 0, "and offered once it is lowered");
+    assert_eq!(machine.reg(A0) & MEIP, 0, "masked by the threshold");
+    assert_ne!(machine.reg(A1) & MEIP, 0, "and offered once it is lowered");
 }
 
 #[test]
 fn claiming_a_source_stops_it_being_offered_until_it_is_completed() {
     let armed = arm();
-    let cpu = wired(
+    let machine = wired(
         &[
             armed[0],
             armed[1],
@@ -197,14 +201,14 @@ fn claiming_a_source_stops_it_being_offered_until_it_is_completed() {
         Some(b'!'),
     )
     .run();
-    assert_eq!(cpu.reg(A0), UART_IRQ, "the claim named the serial port");
+    assert_eq!(machine.reg(A0), UART_IRQ, "the claim named the serial port");
     assert_eq!(
-        cpu.reg(A1) & MEIP,
+        machine.reg(A1) & MEIP,
         0,
         "which is not offered again while claimed"
     );
     assert_ne!(
-        cpu.reg(A2) & MEIP,
+        machine.reg(A2) & MEIP,
         0,
         "and is offered once more after completing it, since the byte is still there"
     );
@@ -213,7 +217,7 @@ fn claiming_a_source_stops_it_being_offered_until_it_is_completed() {
 #[test]
 fn a_typed_byte_becomes_an_external_interrupt() {
     let armed = arm();
-    let cpu = wired(
+    let machine = wired(
         &[
             armed[0],
             armed[1],
@@ -236,18 +240,22 @@ fn a_typed_byte_becomes_an_external_interrupt() {
     .csr(MTVEC, DRAM_BASE + 6 * 4)
     .expect(Exception::IllegalInstruction(0));
     assert_eq!(
-        cpu.reg(A1),
+        machine.reg(A1),
         0,
         "taken as soon as the port was told to interrupt"
     );
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         UART_IRQ,
         "the controller named the serial port"
     );
-    assert_eq!(cpu.reg(A2), b'!' as u64, "and the byte was there to read");
     assert_eq!(
-        cpu.csrs[rysk::csr::MCAUSE],
+        machine.reg(A2),
+        b'!' as u64,
+        "and the byte was there to read"
+    );
+    assert_eq!(
+        machine.csr(rysk::csr::MCAUSE),
         INTERRUPT | Interrupt::MachineExternal as u64
     );
 }

@@ -19,17 +19,28 @@ pub struct Bus {
     /// Every device, sorted by base address and never overlapping, so an address
     /// decodes by binary search.
     devices: Vec<(Range<u64>, Box<dyn Device>)>,
-    /// The bytes reserved by the last load-reserved, invalidated by any store that
-    /// overlaps them. One hart, so at most one reservation.
-    pub reservation: Option<Range<u64>>,
+    /// The bytes each hart reserved with its last load-reserved, invalidated by any
+    /// store that overlaps them. A hart has at most one reservation, and the set of
+    /// them belongs to the memory system rather than to any hart: a store has to
+    /// break every reservation it overlaps, whichever hart made it, and only the thing
+    /// the stores go through can see them all.
+    ///
+    /// The RISC-V Instruction Set Manual Volume I, 14.2.
+    reservations: Vec<Option<Range<u64>>>,
+    /// How many of them are live, so that a store which cannot break one does not look
+    /// at them at all. Almost no store can: only the window between a load-reserved
+    /// and its store-conditional has anything reserved.
+    reserved: usize,
 }
 
 impl Bus {
-    pub fn new(dram: Dram) -> Self {
+    /// A bus with memory and room for `harts` reservations.
+    pub fn new(dram: Dram, harts: usize) -> Self {
         Self {
             dram,
             devices: Vec::new(),
-            reservation: None,
+            reservations: vec![None; harts],
+            reserved: 0,
         }
     }
 
@@ -71,11 +82,11 @@ impl Bus {
         (end <= self.devices[at].0.end).then(|| &mut self.devices[at])
     }
 
-    /// The bits the devices are asserting in `mip`, together.
-    pub fn interrupts(&self) -> u64 {
+    /// The bits the devices are asserting in `hart`'s `mip`, together.
+    pub fn interrupts(&self, hart: usize) -> u64 {
         self.devices
             .iter()
-            .fold(0, |bits, (_, device)| bits | device.interrupts())
+            .fold(0, |bits, (_, device)| bits | device.interrupts(hart))
     }
 
     /// Read `size` bits at `addr`.
@@ -113,11 +124,8 @@ impl Bus {
         if !self.in_dram(addr, size) {
             return self.device_store(addr, size, value);
         }
-        if let Some(reserved) = &self.reservation
-            && addr < reserved.end
-            && reserved.start < addr + size / 8
-        {
-            self.reservation = None;
+        if self.reserved != 0 {
+            self.break_reservations(addr, size);
         }
         self.dram.store(addr, size, value);
         Ok(())
@@ -134,18 +142,42 @@ impl Bus {
         }
     }
 
-    /// Reserve the bytes a load-reserved of `size` bits at `addr` reads.
-    pub fn reserve(&mut self, addr: u64, size: u64) {
-        self.reservation = Some(addr..addr + size / 8);
+    /// Release every reservation the bytes written by a store overlap, whichever hart
+    /// holds it, which is what makes a store-conditional fail after another hart wrote
+    /// what was reserved.
+    #[inline(never)]
+    fn break_reservations(&mut self, addr: u64, size: u64) {
+        let written = addr..addr + size / 8;
+        for reservation in &mut self.reservations {
+            if reservation
+                .as_ref()
+                .is_some_and(|r| written.start < r.end && r.start < written.end)
+            {
+                *reservation = None;
+                self.reserved -= 1;
+            }
+        }
     }
 
-    /// Whether a store-conditional of `size` bits at `addr` may write. The
-    /// reservation is released either way.
-    pub fn take_reservation(&mut self, addr: u64, size: u64) -> bool {
+    /// Reserve, for `hart`, the bytes a load-reserved of `size` bits at `addr` reads.
+    pub fn reserve(&mut self, hart: usize, addr: u64, size: u64) {
+        if self.reservations[hart]
+            .replace(addr..addr + size / 8)
+            .is_none()
+        {
+            self.reserved += 1;
+        }
+    }
+
+    /// Whether a store-conditional by `hart` of `size` bits at `addr` may write. That
+    /// hart's reservation is released either way.
+    pub fn take_reservation(&mut self, hart: usize, addr: u64, size: u64) -> bool {
         let written = addr..addr + size / 8;
-        self.reservation
-            .take()
-            .is_some_and(|r| r.start <= written.start && written.end <= r.end)
+        let Some(reserved) = self.reservations[hart].take() else {
+            return false;
+        };
+        self.reserved -= 1;
+        reserved.start <= written.start && written.end <= reserved.end
     }
 
     /// Whether `size` bits at `addr` fall inside dram.

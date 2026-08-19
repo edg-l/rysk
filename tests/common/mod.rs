@@ -6,7 +6,9 @@ mod asm;
 
 pub use asm::*;
 
-use rysk::{bus::DRAM_BASE, cpu::Cpu, csr::Mode, device::Device, dram::DRAM_SIZE, trap::Trap};
+use rysk::{
+    bus::DRAM_BASE, csr::Mode, device::Device, dram::DRAM_SIZE, machine::Machine, trap::Trap,
+};
 
 /// An address in dram that no test program occupies, for tests that need memory.
 pub const SCRATCH: u64 = DRAM_BASE + 0x1000;
@@ -81,24 +83,25 @@ impl Program {
     }
 
     /// Run until a trap nothing handles, and check it was the expected one.
-    pub fn expect(self, expected: impl Into<Trap>) -> Cpu {
-        let (cpu, stopped) = self.run_to_trap();
+    pub fn expect(self, expected: impl Into<Trap>) -> Machine {
+        let (machine, stopped) = self.run_to_trap();
         assert_eq!(
             stopped,
             expected.into(),
             "the machine stopped for the wrong reason"
         );
-        cpu
+        machine
     }
 
     /// Run to completion. Execution ends on the zeroed word past the last instruction,
     /// which decodes as an illegal instruction with nothing installed to take it.
-    pub fn run(self) -> Cpu {
+    pub fn run(self) -> Machine {
         self.run_to_trap().0
     }
 
-    fn run_to_trap(self) -> (Cpu, Trap) {
-        let mut cpu = Cpu::new(self.code);
+    fn run_to_trap(self) -> (Machine, Trap) {
+        let mut machine = Machine::new(self.code, DRAM_SIZE, 1);
+        let cpu = &mut machine.harts[0];
         for (reg, value) in self.regs {
             cpu.regs[reg as usize] = value;
         }
@@ -107,29 +110,46 @@ impl Program {
         }
         cpu.mode = self.mode;
         for (addr, value) in self.memory {
-            cpu.bus.dram.store(addr, 64, value);
+            machine.bus.dram.store(addr, 64, value);
         }
         for (base, size, device) in self.devices {
-            cpu.bus.attach(base, size, device);
+            machine.bus.attach(base, size, device);
         }
-        let stopped = cpu.run();
-        (cpu, stopped)
+        let halt = machine.run();
+        (machine, halt.trap)
     }
 }
 
 /// Run `code` and return the resulting machine.
-pub fn run(code: &[u32]) -> Cpu {
+pub fn run(code: &[u32]) -> Machine {
     prog(code).run()
 }
 
+/// What a test looks at after a run. A harness machine has one hart, so everything
+/// about a hart here means that one.
 pub trait Inspect {
     fn reg(&self, reg: u32) -> u64;
+    fn csr(&self, csr: usize) -> u64;
+    fn mode(&self) -> Mode;
+    fn pc(&self) -> u64;
     fn load(&self, addr: u64, bytes: u64) -> u64;
 }
 
-impl Inspect for Cpu {
+impl Inspect for Machine {
     fn reg(&self, reg: u32) -> u64 {
-        self.regs[reg as usize]
+        self.harts[0].regs[reg as usize]
+    }
+
+    fn csr(&self, csr: usize) -> u64 {
+        self.harts[0].csrs[csr]
+    }
+
+    fn mode(&self) -> Mode {
+        self.harts[0].mode
+    }
+
+    fn pc(&self) -> u64 {
+        self.harts[0].pc
     }
 
     fn load(&self, addr: u64, bytes: u64) -> u64 {

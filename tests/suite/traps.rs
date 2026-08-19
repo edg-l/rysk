@@ -32,10 +32,10 @@ fn running_off_dram_is_an_instruction_access_fault() {
 fn a_two_byte_aligned_jump_is_where_a_compressed_instruction_can_begin() {
     // With compressed instructions IALIGN is sixteen, so a target that is merely even
     // is a legal place for an instruction rather than a misaligned fetch.
-    let cpu = prog(&[jalr(ZERO, T0, 0), addi(A0, ZERO, 1)])
+    let machine = prog(&[jalr(ZERO, T0, 0), addi(A0, ZERO, 1)])
         .reg(T0, DRAM_BASE + 4)
         .run();
-    assert_eq!(cpu.reg(A0), 1, "it jumped there and carried on");
+    assert_eq!(machine.reg(A0), 1, "it jumped there and carried on");
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn a_misaligned_atomic_traps() {
 #[test]
 fn a_trap_records_where_and_why_it_happened() {
     const HANDLER: u64 = DRAM_BASE + 3 * 4;
-    let cpu = prog(&[
+    let machine = prog(&[
         csrrw(ZERO, MTVEC, T0),
         0xffff_ffff,
         nop(),
@@ -61,14 +61,15 @@ fn a_trap_records_where_and_why_it_happened() {
     .reg(T0, HANDLER)
     .expect(Exception::IllegalInstruction(0));
 
-    assert_eq!(cpu.csrs[MCAUSE as usize], 2, "illegal instruction");
+    assert_eq!(machine.csr(MCAUSE as usize), 2, "illegal instruction");
     assert_eq!(
-        cpu.csrs[MEPC as usize],
+        machine.csr(MEPC as usize),
         DRAM_BASE + 4,
         "the faulting address"
     );
     assert_eq!(
-        cpu.csrs[MTVAL as usize], 0xffff_ffff,
+        machine.csr(MTVAL as usize),
+        0xffff_ffff,
         "the faulting encoding"
     );
 }
@@ -76,7 +77,7 @@ fn a_trap_records_where_and_why_it_happened() {
 #[test]
 fn a_trap_enters_the_handler_and_mret_resumes_after_the_ecall() {
     const HANDLER: u64 = DRAM_BASE + 5 * 4;
-    let cpu = prog(&[
+    let machine = prog(&[
         csrrw(ZERO, MTVEC, T0),
         ecall(),
         addi(A0, ZERO, 42),
@@ -92,9 +93,9 @@ fn a_trap_enters_the_handler_and_mret_resumes_after_the_ecall() {
     .reg(T0, HANDLER)
     .expect(Exception::IllegalInstruction(0));
 
-    assert_eq!(cpu.reg(A1), 7, "the handler ran");
+    assert_eq!(machine.reg(A1), 7, "the handler ran");
     assert_eq!(
-        cpu.reg(A0),
+        machine.reg(A0),
         42,
         "and mret resumed at the instruction after the ecall"
     );
@@ -103,7 +104,7 @@ fn a_trap_enters_the_handler_and_mret_resumes_after_the_ecall() {
 #[test]
 fn a_trap_stacks_the_interrupt_enable_bit_and_mret_unstacks_it() {
     const HANDLER: u64 = DRAM_BASE + 4 * 4;
-    let cpu = prog(&[
+    let machine = prog(&[
         csrrw(ZERO, MTVEC, T0),
         csrrs(ZERO, MSTATUS, T1), // set MIE
         ecall(),
@@ -120,15 +121,19 @@ fn a_trap_stacks_the_interrupt_enable_bit_and_mret_unstacks_it() {
     .reg(T1, 1 << 3)
     .expect(Exception::IllegalInstruction(0));
 
-    assert_eq!((cpu.reg(A0) >> 3) & 1, 0, "MIE is cleared on entry");
-    assert_eq!((cpu.reg(A0) >> 7) & 1, 1, "its old value moved into MPIE");
+    assert_eq!((machine.reg(A0) >> 3) & 1, 0, "MIE is cleared on entry");
     assert_eq!(
-        (cpu.reg(A0) >> 11) & 3,
+        (machine.reg(A0) >> 7) & 1,
+        1,
+        "its old value moved into MPIE"
+    );
+    assert_eq!(
+        (machine.reg(A0) >> 11) & 3,
         3,
         "MPP records the mode it trapped from"
     );
     assert_eq!(
-        (cpu.csrs[MSTATUS as usize] >> 3) & 1,
+        (machine.csr(MSTATUS as usize) >> 3) & 1,
         1,
         "mret restored MIE"
     );
@@ -137,7 +142,7 @@ fn a_trap_stacks_the_interrupt_enable_bit_and_mret_unstacks_it() {
 #[test]
 fn an_exception_enters_at_the_base_even_when_mtvec_is_vectored() {
     const HANDLER: u64 = DRAM_BASE + 3 * 4;
-    let cpu = prog(&[
+    let machine = prog(&[
         csrrw(ZERO, MTVEC, T0),
         ecall(),
         nop(),
@@ -147,17 +152,19 @@ fn an_exception_enters_at_the_base_even_when_mtvec_is_vectored() {
     ])
     .reg(T0, HANDLER | 1) // vectored mode
     .expect(Exception::IllegalInstruction(0));
-    assert_eq!(cpu.reg(A0), 9);
+    assert_eq!(machine.reg(A0), 9);
 }
 
 #[test]
 fn a_trap_with_no_handler_installed_ends_the_run() {
     // mtvec is zero, so there is nowhere to deliver to and run() hands the trap back
     // rather than looping on a handler that does not exist.
-    let cpu = prog(&[ecall(), addi(A0, ZERO, 1)]).expect(Exception::EnvironmentCall(Mode::Machine));
-    assert_eq!(cpu.reg(A0), 0, "nothing after the trap ran");
+    let machine =
+        prog(&[ecall(), addi(A0, ZERO, 1)]).expect(Exception::EnvironmentCall(Mode::Machine));
+    assert_eq!(machine.reg(A0), 0, "nothing after the trap ran");
     assert_eq!(
-        cpu.pc, DRAM_BASE,
+        machine.pc(),
+        DRAM_BASE,
         "and pc still points at the faulting instruction"
     );
 }

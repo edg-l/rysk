@@ -3,6 +3,11 @@
 //!
 //! The RISC-V Instruction Set Manual Volume II, chapter 2 and 3.1.
 
+/// The integer id of the hart running the code that reads it. Read-only, and no two
+/// harts on a machine may report the same one.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.5.
+pub const MHARTID: usize = 0xf14;
+
 pub const MISA: usize = 0x301;
 /// `misa` reports the width of the machine in its top two bits and the extensions it
 /// implements in the low twenty-six, one bit per letter of the alphabet.
@@ -148,8 +153,9 @@ pub const SENVCFG: usize = 0x10A;
 /// which would have had it hand the timer to a `stimecmp` that does nothing.
 pub fn exists(addr: usize) -> bool {
     match addr {
-        // Machine information, all read-only and all zero here: no vendor, no
-        // architecture, no implementation, one hart, and no configuration structure.
+        // Machine information, all read-only: no vendor, no architecture, no
+        // implementation and no configuration structure, and `mhartid`, which is the
+        // one of them that says something.
         0xf11..=0xf15 => true,
         MSTATUS | MISA | MEDELEG | MIDELEG | MIE | MTVEC | MCOUNTEREN | MENVCFG => true,
         MSCRATCH | MEPC | MCAUSE | MTVAL | MIP => true,

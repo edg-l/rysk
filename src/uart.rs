@@ -159,7 +159,7 @@ impl Device for Uart {
     /// is what drives one. What it does here is notice that a byte has arrived while
     /// nothing was reading it, since the hart is otherwise only told at an access and
     /// may be waiting rather than making one.
-    fn interrupts(&self) -> u64 {
+    fn interrupts(&self, _hart: usize) -> u64 {
         self.update();
         0
     }

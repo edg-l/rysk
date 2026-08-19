@@ -42,9 +42,14 @@ pub trait Device: std::fmt::Debug {
     /// Write `size` bits at `offset` from the device's base.
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception>;
 
-    /// The bits this device is asserting in `mip`. Only an interrupt controller drives
-    /// `mip` directly; everything else raises a line into one and answers zero here.
-    fn interrupts(&self) -> u64 {
+    /// The bits this device is asserting in `mip` for `hart`. Only an interrupt
+    /// controller drives `mip` directly; everything else raises a line into one and
+    /// answers zero here.
+    ///
+    /// It is asked per hart because the two controllers that answer it are per hart:
+    /// a clint has a timer and a software interrupt for each, and a plic a context for
+    /// each privilege level of each. Nothing else can tell them apart.
+    fn interrupts(&self, _hart: usize) -> u64 {
         0
     }
 }

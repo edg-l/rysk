@@ -7,6 +7,7 @@
 //! The RISC-V Instruction Set Manual Volume II, 12.3.2 and 12.4.
 
 use crate::{
+    bus::Bus,
     cpu::Cpu,
     csr::{
         MSTATUS, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_MPRV, MSTATUS_MXR, MSTATUS_SUM, Mode, SATP,
@@ -142,17 +143,17 @@ impl Cpu {
     /// this is called for every fetch and every load and store, so the question is
     /// asked far more often than a page table is walked.
     #[inline]
-    pub fn translate(&mut self, va: u64, access: Access) -> Result<u64, Exception> {
+    pub fn translate(&mut self, bus: &mut Bus, va: u64, access: Access) -> Result<u64, Exception> {
         if !self.translating(access) {
             return Ok(va);
         }
         match self.tlb.get(va >> PAGE_BITS) {
             Some(entry) => self.finish(va, entry, access),
-            None => self.walk(va, access),
+            None => self.walk(bus, va, access),
         }
     }
 
-    fn walk(&mut self, va: u64, access: Access) -> Result<u64, Exception> {
+    fn walk(&mut self, bus: &mut Bus, va: u64, access: Access) -> Result<u64, Exception> {
         if self.csrs[SATP] & MODE != SV39 {
             return Err(access.fault(va));
         }
@@ -168,7 +169,7 @@ impl Cpu {
             let vpn = (va >> (PAGE_BITS + 9 * level)) & 0x1ff;
             // A fault reading the table is an access fault about the table, not a page
             // fault about the address that led there.
-            let pte = self.bus.load(a + vpn * 8, 64)?;
+            let pte = bus.load(a + vpn * 8, 64)?;
 
             if pte & PTE_V == 0
                 || (pte & PTE_R == 0 && pte & PTE_W != 0)

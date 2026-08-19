@@ -85,7 +85,7 @@ impl Device for Clint {
     /// move the deadline.
     ///
     /// The RISC-V Instruction Set Manual Volume II, 3.1.9.
-    fn interrupts(&self) -> u64 {
+    fn interrupts(&self, _hart: usize) -> u64 {
         let mut bits = 0;
         if self.msip {
             bits |= MSIP;

@@ -12,8 +12,11 @@ use crate::{
     clint::{self, Clint},
     cpu::Cpu,
     device::Line,
+    dram::Dram,
+    elf::{Error as ElfError, Image},
     fdt::Fdt,
     plic::{self, Plic},
+    trap::Trap,
     uart::{self, Keyboard, Uart},
 };
 
@@ -34,9 +37,6 @@ pub fn fdt_base(memory: u64) -> u64 {
     DRAM_BASE + memory - 0x10_0000
 }
 
-/// Attach the machine's devices, describe them, and leave the description where the
-/// guest is told to look: `a0` is the hart that is booting and `a1` is the tree, which
-/// is the handover every RISC-V kernel expects from whatever ran before it.
 /// What a guest is told that is not a device: the command line it was started with,
 /// and where its initial ramdisk was left.
 #[derive(Debug, Default)]
@@ -45,18 +45,182 @@ pub struct Boot {
     pub initrd: Option<(u64, u64)>,
 }
 
-pub fn boot(cpu: &mut Cpu, isa: &str, options: &Boot) -> Keyboard {
-    let keyboard = virt(&mut cpu.bus);
-    let memory = cpu.bus.dram.size();
+/// Attach the machine's devices, describe them, and leave the description where the
+/// guest is told to look: `a0` is the hart reading it and `a1` is the tree, which is
+/// the handover every RISC-V kernel expects from whatever ran before it.
+///
+/// Every hart is handed the same tree and its own id, because every hart comes out of
+/// reset at the same address: firmware is what picks one to boot and parks the others.
+pub fn boot(machine: &mut Machine, isa: &str, options: &Boot) -> Keyboard {
+    let keyboard = virt(&mut machine.bus);
+    let memory = machine.bus.dram.size();
     let at = fdt_base(memory);
     let tree = describe(isa, memory, options);
     assert!(
-        cpu.bus.dram.write(at, &tree, 0),
+        machine.bus.dram.write(at, &tree, 0),
         "the device tree does not fit in dram"
     );
-    cpu.regs[10] = 0;
-    cpu.regs[11] = at;
+    for hart in &mut machine.harts {
+        hart.regs[10] = hart.hart as u64;
+        hart.regs[11] = at;
+    }
     keyboard
+}
+
+/// How a run ended: a trap that nothing was installed to take, and the hart it
+/// happened on. With no handler in the vector the trap would use there is nowhere for
+/// it to go, so that is where a program ends, normally by running off its own code
+/// into the zeroed dram behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Halt {
+    pub hart: usize,
+    pub trap: Trap,
+}
+
+impl std::fmt::Display for Halt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "hart {}: {}", self.hart, self.trap)
+    }
+}
+
+/// The harts, and the memory and devices they share.
+///
+/// A hart does not own the machine it is part of: the address space arrives at every
+/// instruction as an argument, which is what lets several harts have the same one and,
+/// later, what will let a device reach it without holding the bus that holds the
+/// device.
+#[derive(Debug)]
+pub struct Machine {
+    pub harts: Vec<Cpu>,
+    pub bus: Bus,
+    /// Instructions a hart runs before the next one gets a turn.
+    ///
+    /// Long enough that switching costs nothing measurable, short enough that a hart
+    /// spinning on a word only another hart can write does not hold the machine for
+    /// long. It is a property of the machine rather than of the loop so that a
+    /// frontend which needs one run to repeat another can fix it.
+    pub quantum: u64,
+}
+
+/// The default for `Machine::quantum`.
+const QUANTUM: u64 = 4096;
+
+impl Machine {
+    /// A machine with `memory` bytes of dram and `harts` harts, running `code` placed
+    /// at the bottom of memory.
+    ///
+    /// Every hart starts at the reset address with its stack pointer at the top of
+    /// memory, which is a convenience for a flat binary and nothing a real machine
+    /// does: firmware gives each hart a stack of its own before any of them needs one.
+    pub fn new(code: Vec<u8>, memory: u64, harts: usize) -> Self {
+        assert!(harts > 0, "a machine needs at least one hart");
+        let mut machine = Self {
+            harts: (0..harts).map(Cpu::new).collect(),
+            bus: Bus::new(Dram::with_size(code, memory), harts),
+            quantum: QUANTUM,
+        };
+        for hart in &mut machine.harts {
+            hart.regs[2] = DRAM_BASE + memory;
+        }
+        machine
+    }
+
+    /// Place an image in memory and start every hart at its entry point.
+    pub fn from_elf(image: &Image, memory: u64, harts: usize) -> Result<Self, ElfError> {
+        let mut machine = Self::new(Vec::new(), memory, harts);
+        for segment in &image.segments {
+            if !machine
+                .bus
+                .dram
+                .write(segment.addr, &segment.bytes, segment.zeroes)
+            {
+                return Err(ElfError::SegmentOutsideDram(segment.addr));
+            }
+        }
+        for hart in &mut machine.harts {
+            hart.pc = image.entry;
+            hart.next_pc = image.entry;
+        }
+        Ok(machine)
+    }
+
+    /// Run until a trap that nothing is installed to handle, and say which hart raised
+    /// it.
+    ///
+    /// The harts take turns a quantum at a time. One host thread runs all of them, so
+    /// a switch only ever happens between whole instructions and the order they run in
+    /// is the same on every run: an atomic is atomic because nothing can interleave
+    /// with it, rather than because anything makes it so.
+    pub fn run(&mut self) -> Halt {
+        loop {
+            let mut ran = false;
+            for hart in 0..self.harts.len() {
+                match self.run_hart(hart, self.quantum) {
+                    Some(halt) => return halt,
+                    None => ran |= !self.harts[hart].waiting,
+                }
+            }
+            // Every hart is parked, so the only thing that can change is a device, and
+            // the devices advance with the wall clock.
+            if !ran {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Run one hart for up to `steps` instructions, stopping early if it parks on a
+    /// `wfi`. Answers the trap that nothing handled, if that is how it stopped.
+    fn run_hart(&mut self, hart: usize, steps: u64) -> Option<Halt> {
+        let cpu = &mut self.harts[hart];
+        let bus = &mut self.bus;
+        if cpu.waiting {
+            cpu.wake(bus);
+            if cpu.waiting {
+                return None;
+            }
+        }
+        for _ in 0..steps {
+            if let Some(trap) = tick(cpu, bus) {
+                return Some(Halt { hart, trap });
+            }
+            if cpu.waiting {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Run a single instruction on one hart, for a caller that needs to look at the
+    /// machine between instructions rather than leave it running.
+    pub fn step(&mut self, hart: usize) -> Option<Trap> {
+        let cpu = &mut self.harts[hart];
+        let bus = &mut self.bus;
+        if cpu.waiting {
+            cpu.wake(bus);
+            if cpu.waiting {
+                return None;
+            }
+        }
+        tick(cpu, bus)
+    }
+}
+
+/// One instruction on one hart: offer it an interrupt, then execute. Answers the trap
+/// that nothing was installed to take, which is where a run ends.
+#[inline]
+fn tick(cpu: &mut Cpu, bus: &mut Bus) -> Option<Trap> {
+    if let Some(interrupt) = cpu.interrupt(bus) {
+        let trap = Trap::Interrupt(interrupt);
+        if !cpu.take_trap(trap) {
+            return Some(trap);
+        }
+    }
+    if let Err(exception) = cpu.step(bus)
+        && !cpu.take_trap(exception.into())
+    {
+        return Some(exception.into());
+    }
+    None
 }
 
 /// Attach what a `virt` machine has, and hand back the end of the serial port that

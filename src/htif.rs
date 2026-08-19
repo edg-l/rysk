@@ -5,8 +5,8 @@
 //! about the protocol is needed to run the corpus.
 
 use crate::{
-    cpu::Cpu,
     elf::Image,
+    machine::Machine,
     trap::{Exception, Trap},
 };
 
@@ -45,34 +45,29 @@ pub fn tohost(image: &Image) -> Option<u64> {
 
 /// Run until the image writes to `tohost`, traps with nothing to handle it, or runs
 /// longer than `max_steps`.
-pub fn run(cpu: &mut Cpu, tohost: u64, max_steps: u64) -> Outcome {
+///
+/// One instruction at a time rather than through the machine's own loop, because the
+/// address has to be read back between any two of them. The corpus is single-hart, so
+/// the hart it runs is hart zero.
+pub fn run(machine: &mut Machine, tohost: u64, max_steps: u64) -> Outcome {
     for _ in 0..max_steps {
-        if let Some(interrupt) = cpu.interrupt() {
-            let trap = Trap::Interrupt(interrupt);
-            if !cpu.take_trap(trap) {
-                return Outcome::Trapped { trap, pc: cpu.pc };
-            }
-        }
-
-        if let Err(exception) = cpu.step()
-            && !cpu.take_trap(exception.into())
-        {
+        if let Some(trap) = machine.step(0) {
             return Outcome::Trapped {
-                trap: exception.into(),
-                pc: cpu.pc,
+                trap,
+                pc: machine.harts[0].pc,
             };
         }
 
         // The store lands through the bus like any other, so reading it back is how
         // the write is noticed.
-        match cpu.bus.load(tohost, 64) {
+        match machine.bus.load(tohost, 64) {
             Ok(0) => {}
             Ok(1) => return Outcome::Passed,
             Ok(status) => return Outcome::Failed(status >> 1),
             Err(_) => {
                 return Outcome::Trapped {
                     trap: Exception::LoadAccessFault(tohost).into(),
-                    pc: cpu.pc,
+                    pc: machine.harts[0].pc,
                 };
             }
         }
