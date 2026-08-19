@@ -539,6 +539,14 @@ impl Cpu {
             // instructions, so there is something to wait for.
             //
             // The RISC-V Instruction Set Manual Volume II, 3.3.3.
+            // A reservation can only be broken by a store, and the only thing on this
+            // machine that stores is the hart that is waiting. Waiting for a store
+            // that cannot arrive is waiting forever, so the stall ends at once, which
+            // the manual permits for any reason. Devices that master the bus would
+            // make this a real wait.
+            // The RISC-V Instruction Set Manual Volume I, 14.1.
+            Op::Wrs { .. } => {}
+
             Op::Wfi => {
                 self.refresh_mip();
                 while self.csrs[MIP] & self.csrs[MIE] == 0 {
@@ -558,8 +566,7 @@ impl Cpu {
             // The RISC-V Instruction Set Manual Volume I, 15.1.
             Op::AmoCas { width } => {
                 let bytes = match width {
-                    CasWidth::Word => 4,
-                    CasWidth::Double => 8,
+                    CasWidth::Narrow(width) => width.bits() / 8,
                     CasWidth::Quad => 16,
                 };
                 if a & (bytes - 1) != 0 {
@@ -590,11 +597,12 @@ impl Cpu {
                             self.regs[rd + 1] = high;
                         }
                     }
-                    _ => {
-                        let bits = bytes * 8;
+                    CasWidth::Narrow(width) => {
+                        let bits = width.bits();
                         let loaded = self.bus.load(a, bits)?;
-                        // A narrow compare-and-swap looks at the low bits of rd only,
-                        // and stores the low bits of rs2.
+                        // Anything narrower looks at the low bits of rd only, and
+                        // stores the low bits of rs2: what is above the width is not
+                        // part of either operand.
                         let mask = u64::MAX >> (64 - bits);
                         if loaded == self.regs[rd] & mask {
                             self.bus.store(a, bits, b)?;
@@ -671,31 +679,27 @@ impl Cpu {
     }
 
     /// The read-modify-write an atomic performs, at the width it performs it.
+    ///
+    /// Everything narrower than a doubleword has to be done at its own width and not
+    /// at sixty-four bits: the sum wraps there, the signed comparisons read the sign
+    /// there, and the bits of the source above it are not part of the operand at all.
+    ///
+    /// The RISC-V Instruction Set Manual Volume I, 13.4 and 16.1.
     fn amo(op: AmoOp, width: Width, data: u64, src: u64) -> u64 {
-        if width == Width::Word {
-            let (d, s) = (data as u32, src as u32);
-            return match op {
-                AmoOp::Swap => s,
-                AmoOp::Add => d.wrapping_add(s),
-                AmoOp::Xor => d ^ s,
-                AmoOp::And => d & s,
-                AmoOp::Or => d | s,
-                AmoOp::Min => (d as i32).min(s as i32) as u32,
-                AmoOp::Max => (d as i32).max(s as i32) as u32,
-                AmoOp::MinU => d.min(s),
-                AmoOp::MaxU => d.max(s),
-            } as u64;
-        }
-        match op {
-            AmoOp::Swap => src,
-            AmoOp::Add => data.wrapping_add(src),
-            AmoOp::Xor => data ^ src,
-            AmoOp::And => data & src,
-            AmoOp::Or => data | src,
-            AmoOp::Min => (data as i64).min(src as i64) as u64,
-            AmoOp::Max => (data as i64).max(src as i64) as u64,
-            AmoOp::MinU => data.min(src),
-            AmoOp::MaxU => data.max(src),
+        let bits = width.bits();
+        let mask = u64::MAX >> (64 - bits);
+        let (d, s) = (data & mask, src & mask);
+        let (signed_d, signed_s) = (Self::sext(d, bits) as i64, Self::sext(s, bits) as i64);
+        mask & match op {
+            AmoOp::Swap => s,
+            AmoOp::Add => d.wrapping_add(s),
+            AmoOp::Xor => d ^ s,
+            AmoOp::And => d & s,
+            AmoOp::Or => d | s,
+            AmoOp::Min => signed_d.min(signed_s) as u64,
+            AmoOp::Max => signed_d.max(signed_s) as u64,
+            AmoOp::MinU => d.min(s),
+            AmoOp::MaxU => d.max(s),
         }
     }
 

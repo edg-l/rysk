@@ -124,6 +124,15 @@ fwd:
   mret
   sret
   wfi
+  amoadd.b  t0, t2, (t1)
+  amomin.h  t0, t2, (t1)
+  amomaxu.b t0, t2, (t1)
+  amoswap.h t0, t2, (t1)
+  amocas.b t0, t2, (t1)
+  amocas.h t0, t2, (t1)
+  wrs.nto
+  wrs.sto
+
   amocas.w t0, t2, (t1)
   amocas.d t0, t2, (t1)
   amocas.q a0, a2, (t1)

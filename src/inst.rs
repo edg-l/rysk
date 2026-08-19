@@ -59,23 +59,21 @@ pub enum AmoOp {
     MaxU,
 }
 
-/// The widths a compare-and-swap comes in. The quadword form is two doublewords and a
-/// register pair at each end, which is why this is not a [`Width`]: nothing else that
+/// The widths a compare-and-swap comes in: the ones the bus has, and the quadword,
+/// which is two doublewords and a register pair at each end because nothing that
 /// reaches the bus is 128 bits wide.
 ///
-/// The RISC-V Instruction Set Manual Volume I, 15.1.
+/// The RISC-V Instruction Set Manual Volume I, 15.1 and 16.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CasWidth {
-    Word,
-    Double,
+    Narrow(Width),
     Quad,
 }
 
 impl CasWidth {
     const fn suffix(self) -> &'static str {
         match self {
-            Self::Word => "w",
-            Self::Double => "d",
+            Self::Narrow(width) => width.suffix(),
             Self::Quad => "q",
         }
     }
@@ -152,6 +150,7 @@ pub enum Op {
     Ebreak,
     Mret,
     Sret,
+    Wrs { timeout: bool },
     Wfi,
     // atomics
     Lr { width: Width },
@@ -200,6 +199,19 @@ const fn j_imm(inst: u32) -> u64 {
         | (inst & 0xff000) as u64
         | ((inst >> 9) & 0x800) as u64
         | ((inst >> 20) & 0x7fe) as u64
+}
+
+/// The width an atomic's `funct3` names. Byte and halfword are the Zabha extension;
+/// the A extension on its own has only the two wider ones.
+/// The RISC-V Instruction Set Manual Volume I, 16.1.
+const fn amo_width(funct3: u32) -> Option<Width> {
+    match funct3 {
+        0x0 => Some(Width::Byte),
+        0x1 => Some(Width::Half),
+        0x2 => Some(Width::Word),
+        0x3 => Some(Width::Double),
+        _ => None,
+    }
 }
 
 /// How many bytes the instruction beginning with `half` occupies. Everything with its
@@ -345,6 +357,8 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
                     0x302 => Op::Mret,
                     0x102 => Op::Sret,
                     0x105 => Op::Wfi,
+                    0x00d => Op::Wrs { timeout: false },
+                    0x01d => Op::Wrs { timeout: true },
                     _ => return Err(illegal),
                 },
                 0x1 => Op::Csrrw { immediate: false },
@@ -362,10 +376,8 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
             // in-order hart.
             if funct7 >> 2 == 0b00101 {
                 let width = match funct3 {
-                    0x2 => CasWidth::Word,
-                    0x3 => CasWidth::Double,
                     0x4 => CasWidth::Quad,
-                    _ => return Err(illegal),
+                    _ => CasWidth::Narrow(amo_width(funct3).ok_or(illegal)?),
                 };
                 // A quadword names a register pair at each end, and a pair starts at an
                 // even register: the odd encodings are reserved.
@@ -381,14 +393,13 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
                     imm: 0,
                 });
             }
-            let width = match funct3 {
-                0x2 => Width::Word,
-                0x3 => Width::Double,
-                _ => return Err(illegal),
-            };
+            let width = amo_width(funct3).ok_or(illegal)?;
             let op = match funct7 >> 2 {
-                0b00010 if rs2 == 0 => Op::Lr { width },
-                0b00011 => Op::Sc { width },
+                // Zabha leaves the reserved pair alone: a byte or halfword
+                // load-reserved has too little use to be worth the encoding.
+                // The RISC-V Instruction Set Manual Volume I, 16.1.
+                0b00010 if rs2 == 0 && width.bits() >= 32 => Op::Lr { width },
+                0b00011 if width.bits() >= 32 => Op::Sc { width },
                 0b00001 => Op::Amo {
                     op: AmoOp::Swap,
                     width,
@@ -488,6 +499,9 @@ impl fmt::Display for Inst {
             Op::Mret => write!(f, "mret"),
             Op::Sret => write!(f, "sret"),
             Op::Wfi => write!(f, "wfi"),
+            Op::Wrs { timeout } => {
+                write!(f, "wrs.{}", if timeout { "sto" } else { "nto" })
+            }
             Op::Csrrw { immediate } | Op::Csrrs { immediate } | Op::Csrrc { immediate } => {
                 let name = match self.op {
                     Op::Csrrw { .. } => "csrrw",

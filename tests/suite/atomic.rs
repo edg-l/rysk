@@ -276,3 +276,107 @@ fn a_compare_and_swap_has_to_be_aligned_to_its_own_width() {
         rysk::trap::Exception::StoreAmoAddressMisaligned(SCRATCH + 4),
     );
 }
+
+// ------------------------------------------------------------------- zabha
+
+#[test]
+fn a_narrow_atomic_wraps_at_its_own_width_and_leaves_its_neighbours_alone() {
+    let cpu = prog(&[sd(T1, T0, 0), amoadd_b(T2, T3, T0), ld(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 0x1122_3344_5566_77ff)
+        .reg(T3, 2)
+        .run();
+    assert_eq!(cpu.reg(T2), -1i64 as u64, "the byte it read, sign-extended");
+    assert_eq!(
+        cpu.reg(T4),
+        0x1122_3344_5566_7701,
+        "0xff plus two wrapped inside the byte, and nothing above it moved"
+    );
+}
+
+#[test]
+fn a_narrow_atomic_compares_at_its_own_width() {
+    // As a doubleword, 0x80 is far below 0x7f; as a signed byte it is far above.
+    let cpu = prog(&[sb(T1, T0, 0), amomin_h(T2, T3, T0), lh(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 0)
+        .reg(T3, 0x8000)
+        .run();
+    assert_eq!(
+        cpu.reg(T4) as i64,
+        i16::MIN as i64,
+        "the halfword compared as a signed halfword"
+    );
+    assert_eq!(cpu.reg(T2), 0, "and rd took what was there");
+}
+
+#[test]
+fn the_bits_above_a_narrow_atomics_width_are_not_part_of_its_source() {
+    let cpu = prog(&[sb(T1, T0, 0), amoswap_b(T2, T3, T0), ld(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 0x11)
+        .reg(T3, 0xdead_beef_0000_0022)
+        .run();
+    assert_eq!(cpu.reg(T2), 0x11, "what was there");
+    assert_eq!(
+        cpu.reg(T4),
+        0x22,
+        "and only the low byte of the source landed"
+    );
+
+    // The source's low byte is the smaller of the two, so a comparison that looked at
+    // the whole register would pick the source and store nothing but its zeroes.
+    let cpu = prog(&[sb(T1, T0, 0), amomaxu_b(T2, T3, T0), lbu(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 0x0f)
+        .reg(T3, 0x100)
+        .run();
+    assert_eq!(
+        cpu.reg(T4),
+        0x0f,
+        "the byte already there was the larger one"
+    );
+}
+
+#[test]
+fn a_narrow_compare_and_swap_ignores_what_is_above_its_width() {
+    let cpu = prog(&[sh(T1, T0, 0), amocas_h(T2, T3, T0), lhu(T4, T0, 0)])
+        .reg(T0, SCRATCH)
+        .reg(T1, 0xabcd)
+        .reg(T2, 0xffff_0000_0000_abcd)
+        .reg(T3, 0x1234)
+        .run();
+    assert_eq!(cpu.reg(T2) as i64, 0xabcdu16 as i16 as i64, "sign-extended");
+    assert_eq!(cpu.reg(T4), 0x1234, "and it matched, so the swap happened");
+}
+
+#[test]
+fn a_narrow_atomic_has_to_be_aligned_to_its_own_width() {
+    prog(&[amoadd_h(T2, T3, T0)]).reg(T0, SCRATCH + 1).expect(
+        rysk::trap::Exception::StoreAmoAddressMisaligned(SCRATCH + 1),
+    );
+    // A byte is aligned wherever it is.
+    prog(&[amoadd_b(T2, T3, T0)]).reg(T0, SCRATCH + 1).run();
+}
+
+#[test]
+fn there_is_no_narrow_load_reserved() {
+    for inst in [
+        lr_w(T0, ZERO, T1) & !(0b11 << 12),
+        sc_d(T0, T2, T1) & !(0b10 << 12),
+    ] {
+        prog(&[inst])
+            .reg(T1, SCRATCH)
+            .expect(rysk::trap::Exception::IllegalInstruction(inst as u64));
+    }
+}
+
+// ------------------------------------------------------------------- zawrs
+
+#[test]
+fn waiting_on_a_reservation_set_ends_at_once() {
+    // Nothing but this hart can store, so a wait for a store is a wait for something
+    // that cannot happen; the manual lets the stall end for any reason.
+    let cpu = prog(&[wrs_nto(), wrs_sto(), addi(A0, ZERO, 1)]).run();
+    assert_eq!(cpu.reg(A0), 1);
+}

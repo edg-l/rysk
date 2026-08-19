@@ -6,7 +6,7 @@ CROSS := riscv64-unknown-elf
 CLANG   ?= clang
 LLD     ?= lld
 LLVM_OBJCOPY ?= llvm-objcopy
-ARCH    := rv64gc_zicond_zacas
+ARCH    := rv64gc_zicond_zacas_zabha_zawrs
 
 ifneq ($(shell command -v $(CROSS)-gcc),)
 CC      = $(CROSS)-gcc -march=$(ARCH)
