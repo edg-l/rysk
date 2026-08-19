@@ -156,12 +156,11 @@ impl Device for Uart {
     }
 
     /// Nothing in `mip` is the port's to drive: its line runs to a controller, which
-    /// is what drives one. What it does here is notice that a byte has arrived while
-    /// nothing was reading it, since the hart is otherwise only told at an access and
-    /// may be waiting rather than making one.
-    fn interrupts(&self, _hart: usize) -> u64 {
+    /// is what drives one. What it needs told is that time has passed, because a byte
+    /// can arrive from the other end while the hart is doing something else, or
+    /// nothing at all.
+    fn poll(&mut self) {
         self.update();
-        0
     }
 
     fn store(&mut self, offset: u64, _size: u64, value: u64) -> Result<(), Exception> {

@@ -82,6 +82,13 @@ impl Bus {
         (end <= self.devices[at].0.end).then(|| &mut self.devices[at])
     }
 
+    /// Let every device notice whatever arrived without an access to notice it at.
+    pub fn poll(&mut self) {
+        for (_, device) in &mut self.devices {
+            device.poll();
+        }
+    }
+
     /// The bits the devices are asserting in `hart`'s `mip`, together.
     pub fn interrupts(&self, hart: usize) -> u64 {
         self.devices

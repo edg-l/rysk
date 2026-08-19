@@ -59,7 +59,7 @@ fn run_group(group: &str) {
             .unwrap_or_else(|| panic!("{name} has no tohost symbol, so it cannot report"));
         let mut hart =
             Machine::from_elf(&image, DRAM_SIZE, 1).unwrap_or_else(|e| panic!("{name}: {e}"));
-        machine::virt(&mut hart.bus);
+        machine::virt(&mut hart.bus, 1);
 
         let waiting = WAITING
             .iter()

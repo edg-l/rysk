@@ -29,8 +29,10 @@ fn pte(pa: u64, flags: u64) -> u64 {
 const ROOT: u64 = DRAM_BASE + 0x2000;
 const MID: u64 = DRAM_BASE + 0x3000;
 const LEAF: u64 = DRAM_BASE + 0x4000;
-/// The page the tests map, and the virtual address it is mapped at.
+/// The page the tests map, and the virtual address it is mapped at. The second frame
+/// is somewhere else to remap it to.
 const FRAME: u64 = DRAM_BASE + 0x5000;
+const FRAME2: u64 = DRAM_BASE + 0x6000;
 const VA: u64 = 0x1000;
 
 /// Map the gigabyte that holds dram as itself, from one entry at the root. The
@@ -308,4 +310,65 @@ fn a_change_to_the_table_takes_effect_after_sfence_vma() {
     .run();
     assert_eq!(machine.reg(A0), 1, "the frame it was mapped to");
     assert_eq!(machine.reg(A1), 2, "and the one it was remapped to");
+}
+
+#[test]
+fn an_sfence_vma_on_one_hart_says_nothing_about_anothers_translations() {
+    // `sfence.vma` orders the hart that executes it against its own address
+    // translation and against no other's. Software that has changed a table another
+    // hart is using has to make that hart execute one too, which is what the
+    // supervisor binary interface calls a remote fence; a machine that quietly did it
+    // for them would hide the bug in software that forgot.
+    //
+    // Which hart is which comes from a register rather than from `mhartid`, since a
+    // supervisor cannot read that one and learns what it is from whatever started it.
+    const OLD: u64 = 0x01d;
+    const NEW: u64 = 0x0e7;
+
+    let machine = mapped(
+        &[
+            bne(T6, ZERO, 8 * 4),
+            // hart 0: read through the mapping, which remembers the walk, then read
+            // again after the other hart has changed the table under it, then once
+            // more after saying so itself.
+            ld(A0, T0, 0),
+            nop(),
+            nop(),
+            ld(A1, T0, 0),
+            sfence_vma(ZERO, ZERO),
+            ld(A2, T0, 0),
+            wfi(),
+            // hart 1: point the leaf somewhere else and fence its own translations.
+            nop(),
+            sd(T2, T1, 0),
+            sfence_vma(ZERO, ZERO),
+            wfi(),
+        ],
+        V | R | W | A | D,
+    )
+    .harts(2)
+    .hart_reg(1, T6, 1)
+    .reg(T1, LEAF + 8)
+    .reg(T2, pte(FRAME2, V | R | W | A | D))
+    .memory(FRAME, OLD)
+    .memory(FRAME2, NEW)
+    .parked();
+
+    assert_eq!(
+        machine.harts[0].regs[A0 as usize], OLD,
+        "the frame it mapped"
+    );
+    assert_eq!(
+        machine.harts[0].regs[A1 as usize], OLD,
+        "still the frame it mapped, because the other hart's fence was not about it"
+    );
+    assert_eq!(
+        machine.harts[0].regs[A2 as usize], NEW,
+        "and the new one once it fenced its own"
+    );
+    assert_eq!(
+        machine.load(LEAF + 8, 8),
+        pte(FRAME2, V | R | W | A | D),
+        "the table really had been changed the whole time"
+    );
 }

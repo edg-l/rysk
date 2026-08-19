@@ -130,7 +130,7 @@ const CLAIM: i32 = 4;
 /// `t1` the controller, `t2` its enable word and `t3` its machine context.
 fn wired(code: &[u32], typed: Option<u8>) -> Program {
     let line = Line::default();
-    let mut controller = Plic::new();
+    let mut controller = Plic::new(1);
     controller.connect(UART_IRQ as usize, line.clone());
     let keyboard = Keyboard::default();
     if let Some(byte) = typed {

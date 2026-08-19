@@ -73,7 +73,7 @@ fn text(value: &[u8]) -> String {
 
 #[test]
 fn the_tree_describes_the_machine_the_bus_decodes() {
-    let blob = machine::describe("rv64imac", DRAM_SIZE, &machine::Boot::default());
+    let blob = machine::describe("rv64imac", DRAM_SIZE, 1, &machine::Boot::default());
     let tree = parse(&blob);
 
     let reg = |path: &str| cells(&tree[path]);
@@ -124,6 +124,7 @@ fn a_device_names_the_controller_its_line_runs_to() {
     let tree = parse(&machine::describe(
         "rv64imac",
         DRAM_SIZE,
+        1,
         &machine::Boot::default(),
     ));
     let intc = cells(&tree["/cpus/cpu@0/interrupt-controller/phandle"])[0];
@@ -157,7 +158,7 @@ fn what_a_loader_hands_over_reaches_the_tree() {
         bootargs: Some("console=ttyS0 rdinit=/bin/sh".into()),
         initrd: Some((0x8700_0000, 0x8710_0000)),
     };
-    let tree = parse(&machine::describe("rv64imac", DRAM_SIZE, &options));
+    let tree = parse(&machine::describe("rv64imac", DRAM_SIZE, 1, &options));
     assert_eq!(
         text(&tree["/chosen/bootargs"]),
         "console=ttyS0 rdinit=/bin/sh"
@@ -169,8 +170,56 @@ fn what_a_loader_hands_over_reaches_the_tree() {
     let bare = parse(&machine::describe(
         "rv64imac",
         DRAM_SIZE,
+        1,
         &machine::Boot::default(),
     ));
     assert!(!bare.contains_key("/chosen/bootargs"));
     assert!(!bare.contains_key("/chosen/linux,initrd-start"));
+}
+
+#[test]
+fn every_hart_is_described_and_named_by_the_number_it_reports() {
+    let tree = parse(&machine::describe(
+        "rv64imac",
+        DRAM_SIZE,
+        4,
+        &machine::Boot::default(),
+    ));
+
+    let intc: Vec<u32> = (0..4)
+        .map(|hart| cells(&tree[&format!("/cpus/cpu@{hart}/interrupt-controller/phandle")])[0])
+        .collect();
+    for hart in 0..4u32 {
+        assert_eq!(
+            cells(&tree[&format!("/cpus/cpu@{hart}/reg")]),
+            [hart],
+            "the node is named by the mhartid it reports"
+        );
+    }
+    let plic = cells(&tree["/soc/plic@c000000/phandle"])[0];
+    let mut phandles = intc.clone();
+    phandles.push(plic);
+    phandles.sort_unstable();
+    phandles.dedup();
+    assert_eq!(
+        phandles.len(),
+        5,
+        "every controller has a name of its own, and none of them is zero"
+    );
+    assert!(phandles[0] > 0);
+
+    // Both controllers reach every hart, and the order they are listed in is what
+    // numbers the plic's contexts, so it is not free to vary.
+    assert_eq!(
+        cells(&tree["/soc/plic@c000000/interrupts-extended"]),
+        intc.iter()
+            .flat_map(|&hart| [hart, 11, hart, 9])
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        cells(&tree["/soc/clint@2000000/interrupts-extended"]),
+        intc.iter()
+            .flat_map(|&hart| [hart, 3, hart, 7])
+            .collect::<Vec<_>>(),
+    );
 }

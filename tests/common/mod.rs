@@ -23,6 +23,8 @@ pub struct Program {
     memory: Vec<(u64, u64)>,
     mode: Mode,
     devices: Vec<(u64, u64, Box<dyn Device>)>,
+    harts: usize,
+    hart_regs: Vec<(usize, u32, u64)>,
 }
 
 /// Assemble `code` into a program starting from a zeroed register file.
@@ -44,6 +46,8 @@ fn image(code: Vec<u8>) -> Program {
         memory: Vec::new(),
         mode: Mode::Machine,
         devices: Vec::new(),
+        harts: 1,
+        hart_regs: Vec::new(),
     }
 }
 
@@ -51,6 +55,24 @@ impl Program {
     /// Preload a register, so a test does not have to build its inputs in assembly.
     pub fn reg(mut self, reg: u32, value: u64) -> Self {
         self.regs.push((reg, value));
+        self
+    }
+
+    /// Run the same program on `harts` harts.
+    ///
+    /// They all start at the reset address with the same registers, which is what a
+    /// real machine does: `mhartid` is the only thing that tells one from another, and
+    /// what each does about that is the program's to decide.
+    pub fn harts(mut self, harts: usize) -> Self {
+        self.harts = harts;
+        self
+    }
+
+    /// Preload a register on one hart alone, for a program that has to tell the harts
+    /// apart somewhere `mhartid` cannot be read: it is a machine-mode register, and a
+    /// supervisor learns which hart it is from whatever started it.
+    pub fn hart_reg(mut self, hart: usize, reg: u32, value: u64) -> Self {
+        self.hart_regs.push((hart, reg, value));
         self
     }
 
@@ -99,24 +121,61 @@ impl Program {
         self.run_to_trap().0
     }
 
+    /// Run every hart, one instruction each in turn, until they have all parked on a
+    /// `wfi`.
+    ///
+    /// That is how a program with more than one hart says it is finished: a hart with
+    /// no work left waits rather than running off the end into a trap, which would
+    /// stop the machine before the others had finished. A step each rather than a
+    /// quantum each, because a test wants the harts interleaved as finely as the
+    /// machine can interleave them.
+    pub fn parked(self) -> Machine {
+        let mut machine = self.build();
+        loop {
+            let mut parked = true;
+            for hart in 0..machine.harts.len() {
+                if let Some(trap) = machine.step(hart) {
+                    panic!(
+                        "hart {hart} stopped on {trap} at {:#x} instead of parking",
+                        machine.harts[hart].pc
+                    );
+                }
+                parked &= machine.harts[hart].waiting;
+            }
+            if parked {
+                return machine;
+            }
+        }
+    }
+
     fn run_to_trap(self) -> (Machine, Trap) {
-        let mut machine = Machine::new(self.code, DRAM_SIZE, 1);
-        let cpu = &mut machine.harts[0];
-        for (reg, value) in self.regs {
-            cpu.regs[reg as usize] = value;
+        let mut machine = self.build();
+        let halt = machine.run();
+        (machine, halt.trap)
+    }
+
+    /// The machine this program describes, before it has run.
+    fn build(self) -> Machine {
+        let mut machine = Machine::new(self.code, DRAM_SIZE, self.harts);
+        for cpu in &mut machine.harts {
+            for (reg, value) in &self.regs {
+                cpu.regs[*reg as usize] = *value;
+            }
+            for (csr, value) in &self.csrs {
+                cpu.csrs[*csr] = *value;
+            }
+            cpu.mode = self.mode;
         }
-        for (csr, value) in self.csrs {
-            cpu.csrs[csr] = value;
+        for (hart, reg, value) in self.hart_regs {
+            machine.harts[hart].regs[reg as usize] = value;
         }
-        cpu.mode = self.mode;
         for (addr, value) in self.memory {
             machine.bus.dram.store(addr, 64, value);
         }
         for (base, size, device) in self.devices {
             machine.bus.attach(base, size, device);
         }
-        let halt = machine.run();
-        (machine, halt.trap)
+        machine
     }
 }
 

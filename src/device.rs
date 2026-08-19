@@ -52,4 +52,10 @@ pub trait Device: std::fmt::Debug {
     fn interrupts(&self, _hart: usize) -> u64 {
         0
     }
+
+    /// Notice anything that has changed without an access to notice it at: a byte
+    /// typed at a serial port whose backend is not the hart, a timer that a frontend
+    /// advances. Asked once every time round the harts rather than per hart, because
+    /// it is not a question about a hart and there is no reason to ask it many times.
+    fn poll(&mut self) {}
 }

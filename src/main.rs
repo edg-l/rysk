@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to are both in memory at once: `rysk fw_jump.bin vmlinux@0x80200000`.
     let args: Vec<String> = env::args().skip(1).collect();
     let mut memory = DRAM_SIZE;
-    let harts = 1;
+    let mut harts = 1;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
     let mut at = 0;
@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let value = args[at + 1].clone();
         match args[at].as_str() {
             "-m" => memory = value.parse::<u64>().expect("a size in mebibytes") * 1024 * 1024,
+            "-smp" => harts = value.parse::<usize>().expect("a number of harts"),
             "--initrd" => ramdisk = Some(value),
             "--append" => options.bootargs = Some(value),
             _ => break,
@@ -68,8 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let images = &args[at..];
     let Some(first) = images.first() else {
         panic!(
-            "Usage: rysk [-m <mebibytes>] [--initrd <file>] [--append <args>] \
-             <image> [image@address ...]"
+            "Usage: rysk [-m <mebibytes>] [-smp <harts>] [--initrd <file>] \
+             [--append <args>] <image> [image@address ...]"
         );
     };
     let mut code = Vec::new();

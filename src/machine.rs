@@ -26,10 +26,27 @@ const UART_IRQ: usize = 10;
 /// machine wires.
 const SOURCES: u32 = UART_IRQ as u32;
 
-/// The phandles the tree refers to its two interrupt controllers by. A device says
-/// which controller its line runs to, so the controllers need names.
-const HART_INTC: u32 = 1;
-const PLIC: u32 = 2;
+/// The phandles the tree refers to its interrupt controllers by. A device says which
+/// controller its line runs to, so the controllers need names, and each hart has a
+/// controller of its own. Zero is not a phandle, so they start at one and the platform
+/// controller takes the number after the last hart's.
+fn hart_intc(hart: usize) -> u32 {
+    1 + hart as u32
+}
+
+fn plic_phandle(harts: usize) -> u32 {
+    hart_intc(harts)
+}
+
+/// A controller's `interrupts-extended`: which cause it drives on which hart, as a
+/// phandle and a cause number per entry, for every hart in turn. The order is what
+/// numbers the controller's contexts, so it is not free to vary.
+fn contexts(harts: usize, causes: [u32; 2]) -> Vec<u32> {
+    (0..harts)
+        .flat_map(|hart| causes.map(|cause| [hart_intc(hart), cause]))
+        .flatten()
+        .collect()
+}
 
 /// Where the tree is left for the guest to find: high in dram, out of the way of an
 /// image loaded at the bottom of it, and page aligned because a guest will map it.
@@ -52,10 +69,11 @@ pub struct Boot {
 /// Every hart is handed the same tree and its own id, because every hart comes out of
 /// reset at the same address: firmware is what picks one to boot and parks the others.
 pub fn boot(machine: &mut Machine, isa: &str, options: &Boot) -> Keyboard {
-    let keyboard = virt(&mut machine.bus);
+    let harts = machine.harts.len();
+    let keyboard = virt(&mut machine.bus, harts);
     let memory = machine.bus.dram.size();
     let at = fdt_base(memory);
-    let tree = describe(isa, memory, options);
+    let tree = describe(isa, memory, harts, options);
     assert!(
         machine.bus.dram.write(at, &tree, 0),
         "the device tree does not fit in dram"
@@ -153,6 +171,7 @@ impl Machine {
     /// with it, rather than because anything makes it so.
     pub fn run(&mut self) -> Halt {
         loop {
+            self.bus.poll();
             let mut ran = false;
             for hart in 0..self.harts.len() {
                 match self.run_hart(hart, self.quantum) {
@@ -193,6 +212,7 @@ impl Machine {
     /// Run a single instruction on one hart, for a caller that needs to look at the
     /// machine between instructions rather than leave it running.
     pub fn step(&mut self, hart: usize) -> Option<Trap> {
+        self.bus.poll();
         let cpu = &mut self.harts[hart];
         let bus = &mut self.bus;
         if cpu.waiting {
@@ -225,13 +245,13 @@ fn tick(cpu: &mut Cpu, bus: &mut Bus) -> Option<Trap> {
 
 /// Attach what a `virt` machine has, and hand back the end of the serial port that
 /// faces the world, so whatever is doing the typing can reach it.
-pub fn virt(bus: &mut Bus) -> Keyboard {
+pub fn virt(bus: &mut Bus, harts: usize) -> Keyboard {
     let serial = Line::default();
     let keyboard = Keyboard::default();
-    let mut plic = Plic::new();
+    let mut plic = Plic::new(harts);
     plic.connect(UART_IRQ, serial.clone());
 
-    bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::default()));
+    bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::new(harts)));
     bus.attach(plic::BASE, plic::SIZE, Box::new(plic));
     bus.attach(
         uart::BASE,
@@ -243,7 +263,7 @@ pub fn virt(bus: &mut Bus) -> Keyboard {
 
 /// The same machine, described. Firmware and a kernel read this to find what `virt`
 /// attached above, so the two are written next to each other on purpose.
-pub fn describe(isa: &str, memory: u64, options: &Boot) -> Vec<u8> {
+pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8> {
     let mut fdt = Fdt::new();
     fdt.begin_node("");
     fdt.cells("#address-cells", &[2]);
@@ -269,22 +289,26 @@ pub fn describe(isa: &str, memory: u64, options: &Boot) -> Vec<u8> {
     fdt.cells("#size-cells", &[0]);
     // What `mtime` counts in, which is every timeout a guest will ever compute.
     fdt.cells("timebase-frequency", &[clint::FREQUENCY as u32]);
-    fdt.begin_node("cpu@0");
-    fdt.string("device_type", "cpu");
-    fdt.cells("reg", &[0]);
-    fdt.string("status", "okay");
-    fdt.strings("compatible", &["riscv"]);
-    fdt.string("riscv,isa", isa);
-    fdt.string("mmu-type", "riscv,sv39");
-    // The hart's own interrupt controller is the three bits of `mip` that reach it
-    // directly, and it is what every other controller ultimately reports to.
-    fdt.begin_node("interrupt-controller");
-    fdt.cells("#interrupt-cells", &[1]);
-    fdt.flag("interrupt-controller");
-    fdt.strings("compatible", &["riscv,cpu-intc"]);
-    fdt.cells("phandle", &[HART_INTC]);
-    fdt.end_node();
-    fdt.end_node();
+    // One node per hart, named and numbered by the `mhartid` it reports, which is how
+    // everything else in the tree refers to a hart.
+    for hart in 0..harts {
+        fdt.begin_node(&format!("cpu@{hart}"));
+        fdt.string("device_type", "cpu");
+        fdt.cells("reg", &[hart as u32]);
+        fdt.string("status", "okay");
+        fdt.strings("compatible", &["riscv"]);
+        fdt.string("riscv,isa", isa);
+        fdt.string("mmu-type", "riscv,sv39");
+        // The hart's own interrupt controller is the three bits of `mip` that reach it
+        // directly, and it is what every other controller ultimately reports to.
+        fdt.begin_node("interrupt-controller");
+        fdt.cells("#interrupt-cells", &[1]);
+        fdt.flag("interrupt-controller");
+        fdt.strings("compatible", &["riscv,cpu-intc"]);
+        fdt.cells("phandle", &[hart_intc(hart)]);
+        fdt.end_node();
+        fdt.end_node();
+    }
     fdt.end_node();
 
     fdt.begin_node(&format!("memory@{DRAM_BASE:x}"));
@@ -302,7 +326,7 @@ pub fn describe(isa: &str, memory: u64, options: &Boot) -> Vec<u8> {
     fdt.begin_node(&format!("serial@{:x}", uart::BASE));
     fdt.strings("compatible", &["ns16550a"]);
     fdt.reg(uart::BASE, uart::SIZE);
-    fdt.cells("interrupt-parent", &[PLIC]);
+    fdt.cells("interrupt-parent", &[plic_phandle(harts)]);
     fdt.cells("interrupts", &[UART_IRQ as u32]);
     // The rate a real part would divide down from. Nothing here measures time, but a
     // driver will not configure a port whose clock it does not know.
@@ -315,19 +339,21 @@ pub fn describe(isa: &str, memory: u64, options: &Boot) -> Vec<u8> {
     fdt.flag("interrupt-controller");
     fdt.cells("#interrupt-cells", &[1]);
     fdt.cells("#address-cells", &[0]);
-    // The two contexts it drives: this hart's external interrupt at machine level and
-    // at supervisor level, causes eleven and nine.
-    fdt.cells("interrupts-extended", &[HART_INTC, 11, HART_INTC, 9]);
+    // The contexts it drives, in the order the specification numbers them: every
+    // hart's external interrupt at machine level and at supervisor level, causes
+    // eleven and nine.
+    fdt.cells("interrupts-extended", &contexts(harts, [11, 9]));
     // How many sources it has, which is the highest one anything is wired to.
     fdt.cells("riscv,ndev", &[SOURCES]);
-    fdt.cells("phandle", &[PLIC]);
+    fdt.cells("phandle", &[plic_phandle(harts)]);
     fdt.end_node();
 
     fdt.begin_node(&format!("clint@{:x}", clint::BASE));
     fdt.strings("compatible", &["riscv,clint0", "sifive,clint0"]);
     fdt.reg(clint::BASE, clint::SIZE);
-    // Its two: the machine software and machine timer interrupts, three and seven.
-    fdt.cells("interrupts-extended", &[HART_INTC, 3, HART_INTC, 7]);
+    // Its two per hart: the machine software and machine timer interrupts, three and
+    // seven.
+    fdt.cells("interrupts-extended", &contexts(harts, [3, 7]));
     fdt.end_node();
 
     fdt.end_node();

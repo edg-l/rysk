@@ -14,4 +14,5 @@ mod paging;
 mod privilege;
 mod program;
 mod serial;
+mod smp;
 mod traps;

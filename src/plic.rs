@@ -22,12 +22,12 @@ pub const SIZE: u64 = 0x400_0000;
 /// which is what a claim returns when there is nothing to claim.
 pub const SOURCES: usize = 1024;
 
-/// One context per privilege level that can take an external interrupt. A machine with
-/// more harts has more, in the same order.
+/// One context per privilege level of each hart that can take an external interrupt,
+/// in the order the specification fixes: machine then supervisor, hart by hart.
 /// RISC-V Platform-Level Interrupt Controller Specification, 1.1.
-const CONTEXTS: usize = 2;
-const MACHINE: usize = 0;
-const SUPERVISOR: usize = 1;
+const fn context(hart: usize, supervisor: bool) -> usize {
+    2 * hart + supervisor as usize
+}
 
 const PRIORITY: u64 = 0x0000_0000;
 const PENDING: u64 = 0x0000_1000;
@@ -38,13 +38,15 @@ const CONTEXT_STRIDE: u64 = 0x1000;
 const THRESHOLD: u64 = 0x0;
 const CLAIM: u64 = 0x4;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Plic {
     /// The line each source drives, if anything drives it.
     lines: Vec<(usize, Line)>,
     priority: Vec<u32>,
-    enable: [Vec<u32>; CONTEXTS],
-    threshold: [u32; CONTEXTS],
+    /// One enable bitmap and one threshold per context, so there are twice as many of
+    /// each as the machine has harts.
+    enable: Vec<Vec<u32>>,
+    threshold: Vec<u32>,
     /// Sources a context has claimed and not yet completed. The gateway stops offering
     /// one while it is being serviced, whatever its line is doing.
     /// RISC-V Platform-Level Interrupt Controller Specification, 1.2 and 9.
@@ -52,12 +54,14 @@ pub struct Plic {
 }
 
 impl Plic {
-    pub fn new() -> Self {
+    /// A controller with a machine and a supervisor context for each of `harts` harts.
+    pub fn new(harts: usize) -> Self {
+        let contexts = context(harts, false);
         Self {
             lines: Vec::new(),
             priority: vec![0; SOURCES],
-            enable: [vec![0; SOURCES / 32], vec![0; SOURCES / 32]],
-            threshold: [0; CONTEXTS],
+            enable: vec![vec![0; SOURCES / 32]; contexts],
+            threshold: vec![0; contexts],
             claimed: vec![false; SOURCES],
         }
     }
@@ -173,8 +177,8 @@ impl Device for Plic {
                 let context = ((offset - CONTEXT) / CONTEXT_STRIDE) as usize;
                 let register = (offset - CONTEXT) % CONTEXT_STRIDE;
                 match register {
-                    THRESHOLD if context < CONTEXTS => self.threshold[context] = value,
-                    CLAIM if context < CONTEXTS => self.complete(value as usize),
+                    THRESHOLD if context < self.threshold.len() => self.threshold[context] = value,
+                    CLAIM if context < self.threshold.len() => self.complete(value as usize),
                     _ => return Err(Exception::StoreAmoAccessFault(offset)),
                 }
             }
@@ -182,14 +186,15 @@ impl Device for Plic {
         Ok(())
     }
 
-    /// The external-interrupt bit of each privilege level is one wire out of this
-    /// controller, asserted for as long as that level has something to claim.
-    fn interrupts(&self, _hart: usize) -> u64 {
+    /// The external-interrupt bit of each privilege level of each hart is one wire out
+    /// of this controller, asserted for as long as that hart's context at that level
+    /// has something to claim.
+    fn interrupts(&self, hart: usize) -> u64 {
         let mut bits = 0;
-        if self.best(MACHINE).is_some() {
+        if self.best(context(hart, false)).is_some() {
             bits |= MEIP;
         }
-        if self.best(SUPERVISOR).is_some() {
+        if self.best(context(hart, true)).is_some() {
             bits |= SEIP;
         }
         bits
