@@ -91,7 +91,9 @@ impl Cpu {
     /// The RISC-V Instruction Set Manual Volume II, 3.3.3.
     pub fn wake(&mut self, bus: &Bus) {
         self.refresh_mip(bus);
-        self.waiting = self.csrs[MIP] & self.csrs[MIE] == 0;
+        if self.csrs[MIP] & self.csrs[MIE] != 0 {
+            self.waiting = false;
+        }
     }
 
     /// Refresh the bits of `mip` that a device drives. They are not storage software
