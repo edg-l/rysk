@@ -7,7 +7,13 @@ mod asm;
 pub use asm::*;
 
 use rysk::{
-    bus::DRAM_BASE, csr::Mode, device::Device, dram::DRAM_SIZE, machine::Machine, trap::Trap,
+    bus::DRAM_BASE,
+    csr::Mode,
+    device::{Device, Level},
+    dram::DRAM_SIZE,
+    imsic::Imsic,
+    machine::Machine,
+    trap::Trap,
 };
 
 /// An address in dram that no test program occupies, for tests that need memory.
@@ -25,6 +31,7 @@ pub struct Program {
     devices: Vec<(u64, u64, Box<dyn Device>)>,
     harts: usize,
     hart_regs: Vec<(usize, u32, u64)>,
+    imsic: Option<Imsic>,
 }
 
 /// Assemble `code` into a program starting from a zeroed register file.
@@ -48,6 +55,7 @@ fn image(code: Vec<u8>) -> Program {
         devices: Vec::new(),
         harts: 1,
         hart_regs: Vec::new(),
+        imsic: None,
     }
 }
 
@@ -80,6 +88,14 @@ impl Program {
     /// installed should not have to write one in assembly first.
     pub fn csr(mut self, csr: usize, value: u64) -> Self {
         self.csrs.push((csr, value));
+        self
+    }
+
+    /// Give every hart an interrupt file at each level, which is what makes the
+    /// registers Smaia and Ssaia add exist. The pages messages arrive at go on the bus
+    /// at the same time, since they are the same registers from the other side.
+    pub fn imsic(mut self, imsic: Imsic) -> Self {
+        self.imsic = Some(imsic);
         self
     }
 
@@ -171,6 +187,18 @@ impl Program {
         }
         for (addr, value) in self.memory {
             machine.bus.dram.store(addr, 64, value);
+        }
+        if let Some(imsic) = &self.imsic {
+            for cpu in &mut machine.harts {
+                cpu.imsic = Some(imsic.clone());
+            }
+            for level in [Level::Machine, Level::Supervisor] {
+                machine.bus.attach(
+                    Imsic::base(level),
+                    Imsic::size(self.harts),
+                    Box::new(imsic.files(level)),
+                );
+            }
         }
         for (base, size, device) in self.devices {
             machine.bus.attach(base, size, device);

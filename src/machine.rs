@@ -8,18 +8,65 @@
 use std::io;
 
 use crate::{
+    aplic::{self, Aplic},
     bus::{Bus, DRAM_BASE},
     clint::{self, Clint},
     cpu::Cpu,
-    device::Line,
+    device::{Level, Line, Msi},
     dram::Dram,
     elf::{Error as ElfError, Image},
     fdt::Fdt,
+    imsic::{self, Imsic},
     pci::{self, HostBridge, Ports, Root},
     plic::{self, Plic},
     trap::Trap,
     uart::{self, Keyboard, Uart},
 };
+
+/// Which interrupt architecture a machine is built with, in the spelling QEMU's `virt`
+/// machine uses for the same choice, so that the same words describe the same machine
+/// whichever of the two is running the image.
+///
+/// It is one choice rather than several because the parts only go together one way: a
+/// hart is interrupted by a wire or by a message and not by both, and what converts
+/// device wires into whichever it is follows from that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Aia {
+    /// Wires all the way to the hart, through the controller the architecture had
+    /// before this one.
+    #[default]
+    None,
+    /// An APLIC delivering interrupts itself, still by wire, but with a domain per
+    /// privilege level and sources that say what their wire means.
+    Aplic,
+    /// An APLIC that forwards to an interrupt file per hart, so what arrives at a hart
+    /// is a message. This is the whole architecture.
+    AplicImsic,
+}
+
+impl std::str::FromStr for Aia {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "none" => Ok(Self::None),
+            "aplic" => Ok(Self::Aplic),
+            "aplic-imsic" => Ok(Self::AplicImsic),
+            _ => Err(format!("{name}: not none, aplic or aplic-imsic")),
+        }
+    }
+}
+
+impl Aia {
+    /// What the harts of such a machine implement beyond the base, which a guest reads
+    /// out of `riscv,isa` rather than out of `misa`: neither extension has a letter.
+    pub fn isa(self) -> &'static str {
+        match self {
+            Self::AplicImsic => "_smaia_ssaia",
+            _ => "",
+        }
+    }
+}
 
 /// The interrupt source the first serial port drives, as the `virt` machine wires it.
 const UART_IRQ: usize = 10;
@@ -35,23 +82,74 @@ const HOST_BRIDGE: usize = 0;
 /// The phandles the tree refers to its interrupt controllers by. A device says which
 /// controller its line runs to, so the controllers need names, and each hart has a
 /// controller of its own. Zero is not a phandle, so they start at one and the platform
-/// controller takes the number after the last hart's.
+/// controllers take the numbers after the last hart's.
 fn hart_intc(hart: usize) -> u32 {
     1 + hart as u32
 }
 
-fn plic_phandle(harts: usize) -> u32 {
-    hart_intc(harts)
+/// The platform controllers, each with a number of its own whether or not the machine
+/// has one, so that a node and everything pointing at it cannot disagree.
+#[derive(Debug, Clone, Copy)]
+enum Controller {
+    Plic,
+    Imsic(Level),
+    Aplic(Level),
+}
+
+fn phandle(harts: usize, controller: Controller) -> u32 {
+    let which = match controller {
+        Controller::Plic => 0,
+        Controller::Imsic(Level::Machine) => 1,
+        Controller::Imsic(Level::Supervisor) => 2,
+        Controller::Aplic(Level::Machine) => 3,
+        Controller::Aplic(Level::Supervisor) => 4,
+    };
+    hart_intc(harts) + which
+}
+
+/// The cause each level's external interrupt is, which is what a controller says it
+/// drives on a hart. The RISC-V Instruction Set Manual Volume II, table 14.
+fn external(level: Level) -> u32 {
+    match level {
+        Level::Machine => 11,
+        Level::Supervisor => 9,
+    }
 }
 
 /// A controller's `interrupts-extended`: which cause it drives on which hart, as a
 /// phandle and a cause number per entry, for every hart in turn. The order is what
 /// numbers the controller's contexts, so it is not free to vary.
-fn contexts(harts: usize, causes: [u32; 2]) -> Vec<u32> {
+fn contexts(harts: usize, causes: &[u32]) -> Vec<u32> {
     (0..harts)
-        .flat_map(|hart| causes.map(|cause| [hart_intc(hart), cause]))
-        .flatten()
+        .flat_map(|hart| {
+            causes
+                .iter()
+                .flat_map(move |cause| [hart_intc(hart), *cause])
+        })
         .collect()
+}
+
+/// What a device names as its interrupt parent, which is the controller the level a
+/// guest runs at can reach: an APLIC has a domain per level and a PLIC a context per
+/// level, so the two answers are different nodes and not different numbers.
+fn parent(harts: usize, aia: Aia) -> u32 {
+    match aia {
+        Aia::None => phandle(harts, Controller::Plic),
+        _ => phandle(harts, Controller::Aplic(Level::Supervisor)),
+    }
+}
+
+/// How a device names one of that controller's sources. A PLIC takes a number; an
+/// APLIC takes a number and what the wire under it means, since a source there is not
+/// level-sensitive until it is told to be.
+fn interrupt(aia: Aia, source: usize) -> Vec<u32> {
+    /// The encoding a devicetree uses for a wire that means "interrupt while high",
+    /// which is what everything on this machine drives.
+    const LEVEL_HIGH: u32 = 4;
+    match aia {
+        Aia::None => vec![source as u32],
+        _ => vec![source as u32, LEVEL_HIGH],
+    }
 }
 
 /// Where the tree is left for the guest to find: high in dram, out of the way of an
@@ -74,12 +172,12 @@ pub struct Boot {
 ///
 /// Every hart is handed the same tree and its own id, because every hart comes out of
 /// reset at the same address: firmware is what picks one to boot and parks the others.
-pub fn boot(machine: &mut Machine, isa: &str, options: &Boot) -> Keyboard {
+pub fn boot(machine: &mut Machine, isa: &str, options: &Boot, aia: Aia) -> Keyboard {
     let harts = machine.harts.len();
-    let keyboard = virt(&mut machine.bus, harts);
+    let keyboard = virt(machine, aia);
     let memory = machine.bus.dram.size();
     let at = fdt_base(memory);
-    let tree = describe(isa, memory, harts, options);
+    let tree = describe(isa, memory, harts, options, aia);
     assert!(
         machine.bus.dram.write(at, &tree, 0),
         "the device tree does not fit in dram"
@@ -256,23 +354,83 @@ fn tick(cpu: &mut Cpu, bus: &mut Bus) -> Option<Trap> {
 
 /// Attach what a `virt` machine has, and hand back the end of the serial port that
 /// faces the world, so whatever is doing the typing can reach it.
-pub fn virt(bus: &mut Bus, harts: usize) -> Keyboard {
+///
+/// This takes the whole machine rather than its bus because one of the things it
+/// attaches is not only on the bus: an interrupt file is a hart's own, reached by that
+/// hart's CSRs, and the page a message arrives at is the same registers seen from the
+/// other side.
+pub fn virt(machine: &mut Machine, aia: Aia) -> Keyboard {
+    let harts = machine.harts.len();
+    let bus = &mut machine.bus;
     let serial = Line::default();
     let keyboard = Keyboard::default();
-    let mut plic = Plic::new(harts);
-    plic.connect(UART_IRQ, serial.clone());
 
     // The four wires the root complex swizzles its functions onto, in the order the
     // tree's `interrupt-map` lists them.
     let pins: [Line; pci::PINS] = std::array::from_fn(|_| Line::default());
-    for (pin, line) in pins.iter().enumerate() {
-        plic.connect(PCI_IRQ + pin, line.clone());
+    let wires = || {
+        std::iter::once((UART_IRQ, serial.clone())).chain(
+            pins.iter()
+                .enumerate()
+                .map(|(pin, line)| (PCI_IRQ + pin, line.clone())),
+        )
+    };
+
+    // Where a message goes, if this machine has anywhere to put one: the interrupt
+    // files decode the address, since they are the only thing here that answers to one.
+    let msi = match aia {
+        Aia::AplicImsic => {
+            let imsic = Imsic::new(harts);
+            for hart in &mut machine.harts {
+                hart.imsic = Some(imsic.clone());
+            }
+            for level in [Level::Machine, Level::Supervisor] {
+                bus.attach(
+                    Imsic::base(level),
+                    Imsic::size(harts),
+                    Box::new(imsic.files(level)),
+                );
+            }
+            Msi::new(move |addr, identity| {
+                for level in [Level::Machine, Level::Supervisor] {
+                    let files = Imsic::base(level)..Imsic::base(level) + Imsic::size(harts);
+                    if files.contains(&addr) {
+                        let hart = ((addr - files.start) / imsic::PAGE) as usize;
+                        imsic.deliver(hart, level, identity);
+                    }
+                }
+            })
+        }
+        _ => Msi::default(),
+    };
+
+    match aia {
+        Aia::None => {
+            let mut plic = Plic::new(harts);
+            for (source, line) in wires() {
+                plic.connect(source, line);
+            }
+            bus.attach(plic::BASE, plic::SIZE, Box::new(plic));
+        }
+        _ => {
+            let aplic = Aplic::new(harts, msi.clone());
+            for (source, line) in wires() {
+                aplic.connect(source, line);
+            }
+            for level in [Level::Machine, Level::Supervisor] {
+                bus.attach(
+                    Aplic::base(level),
+                    aplic::SIZE,
+                    Box::new(aplic.domain(level)),
+                );
+            }
+        }
     }
-    let root = Root::new(pins);
+
+    let root = Root::new(pins, msi);
     root.plug(HOST_BRIDGE, Box::new(HostBridge));
 
     bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::new(harts)));
-    bus.attach(plic::BASE, plic::SIZE, Box::new(plic));
     bus.attach(
         uart::BASE,
         uart::SIZE,
@@ -293,29 +451,80 @@ pub fn virt(bus: &mut Bus, harts: usize) -> Keyboard {
 /// mask below keeps, and each of the four pins, which controller and which of its
 /// sources that combination reaches.
 ///
-/// Six cells an entry: three for the child address, of which only the device number
-/// matters, one for the pin, one for the controller and one for its source. It has to
-/// say exactly what `pci::swizzle` computes, or an interrupt arrives as another one.
-fn interrupt_map(harts: usize) -> Vec<u32> {
+/// Three cells for the child address, of which only the device number matters, one
+/// for the pin, one for the controller, and however many that controller takes to name
+/// a source. It has to say exactly what `pci::swizzle` computes, or an interrupt
+/// arrives as another one.
+fn interrupt_map(harts: usize, aia: Aia) -> Vec<u32> {
     (0..pci::PINS)
         .flat_map(|device| {
             (1..=pci::PINS as u32).flat_map(move |pin| {
-                [
-                    (device << 11) as u32,
-                    0,
-                    0,
-                    pin,
-                    plic_phandle(harts),
-                    (PCI_IRQ + pci::swizzle(device, pin as u8)) as u32,
-                ]
+                let source = PCI_IRQ + pci::swizzle(device, pin as u8);
+                [(device << 11) as u32, 0, 0, pin, parent(harts, aia)]
+                    .into_iter()
+                    .chain(interrupt(aia, source))
             })
         })
         .collect()
 }
 
+/// One interrupt controller node. The two levels of an APLIC are the same node twice,
+/// and so are the two levels of an IMSIC, since a domain and an interrupt file differ
+/// only in what they say they drive and in what points at them.
+fn describe_aia(fdt: &mut Fdt, harts: usize, aia: Aia) {
+    for level in [Level::Machine, Level::Supervisor] {
+        if aia == Aia::AplicImsic {
+            fdt.begin_node(&format!("interrupt-controller@{:x}", Imsic::base(level)));
+            fdt.strings("compatible", &["riscv,imsics"]);
+            fdt.reg(Imsic::base(level), Imsic::size(harts));
+            fdt.flag("interrupt-controller");
+            fdt.flag("msi-controller");
+            // Nothing names one of these by number: a message carries its own
+            // identity, so a device says which controller and nothing else.
+            fdt.cells("#interrupt-cells", &[0]);
+            // Which cause each hart sees a message from this level as.
+            fdt.cells("interrupts-extended", &contexts(harts, &[external(level)]));
+            fdt.cells("riscv,num-ids", &[imsic::IDENTITIES]);
+            fdt.cells("phandle", &[phandle(harts, Controller::Imsic(level))]);
+            fdt.end_node();
+        }
+
+        fdt.begin_node(&format!("interrupt-controller@{:x}", Aplic::base(level)));
+        fdt.strings("compatible", &["riscv,aplic"]);
+        fdt.reg(Aplic::base(level), aplic::SIZE);
+        fdt.flag("interrupt-controller");
+        // A source and what its wire means, which is what an APLIC needs told and a
+        // PLIC decides for itself.
+        fdt.cells("#interrupt-cells", &[2]);
+        fdt.cells("#address-cells", &[0]);
+        fdt.cells("riscv,num-sources", &[SOURCES]);
+        match aia {
+            // Forwarding, so it says where it sends rather than what it drives.
+            Aia::AplicImsic => {
+                fdt.cells("msi-parent", &[phandle(harts, Controller::Imsic(level))]);
+            }
+            _ => {
+                fdt.cells("interrupts-extended", &contexts(harts, &[external(level)]));
+            }
+        }
+        // The machine-level domain owns every source and hands all of them to its
+        // child, which is what leaves a supervisor able to configure them. The
+        // property has two spellings and a consumer reads one or the other.
+        if level == Level::Machine {
+            let child = phandle(harts, Controller::Aplic(Level::Supervisor));
+            let delegation = [child, 1, SOURCES];
+            fdt.cells("riscv,children", &[child]);
+            fdt.cells("riscv,delegate", &delegation);
+            fdt.cells("riscv,delegation", &delegation);
+        }
+        fdt.cells("phandle", &[phandle(harts, Controller::Aplic(level))]);
+        fdt.end_node();
+    }
+}
+
 /// The same machine, described. Firmware and a kernel read this to find what `virt`
 /// attached above, so the two are written next to each other on purpose.
-pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8> {
+pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot, aia: Aia) -> Vec<u8> {
     let mut fdt = Fdt::new();
     fdt.begin_node("");
     fdt.cells("#address-cells", &[2]);
@@ -378,27 +587,37 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8>
     fdt.begin_node(&format!("serial@{:x}", uart::BASE));
     fdt.strings("compatible", &["ns16550a"]);
     fdt.reg(uart::BASE, uart::SIZE);
-    fdt.cells("interrupt-parent", &[plic_phandle(harts)]);
-    fdt.cells("interrupts", &[UART_IRQ as u32]);
+    fdt.cells("interrupt-parent", &[parent(harts, aia)]);
+    fdt.cells("interrupts", &interrupt(aia, UART_IRQ));
     // The rate a real part would divide down from. Nothing here measures time, but a
     // driver will not configure a port whose clock it does not know.
     fdt.cells("clock-frequency", &[3_686_400]);
     fdt.end_node();
 
-    fdt.begin_node(&format!("plic@{:x}", plic::BASE));
-    fdt.strings("compatible", &["riscv,plic0", "sifive,plic-1.0.0"]);
-    fdt.reg(plic::BASE, plic::SIZE);
-    fdt.flag("interrupt-controller");
-    fdt.cells("#interrupt-cells", &[1]);
-    fdt.cells("#address-cells", &[0]);
-    // The contexts it drives, in the order the specification numbers them: every
-    // hart's external interrupt at machine level and at supervisor level, causes
-    // eleven and nine.
-    fdt.cells("interrupts-extended", &contexts(harts, [11, 9]));
-    // How many sources it has, which is the highest one anything is wired to.
-    fdt.cells("riscv,ndev", &[SOURCES]);
-    fdt.cells("phandle", &[plic_phandle(harts)]);
-    fdt.end_node();
+    if aia == Aia::None {
+        fdt.begin_node(&format!("plic@{:x}", plic::BASE));
+        fdt.strings("compatible", &["riscv,plic0", "sifive,plic-1.0.0"]);
+        fdt.reg(plic::BASE, plic::SIZE);
+        fdt.flag("interrupt-controller");
+        fdt.cells("#interrupt-cells", &[1]);
+        fdt.cells("#address-cells", &[0]);
+        // The contexts it drives, in the order the specification numbers them: every
+        // hart's external interrupt at machine level and at supervisor level, causes
+        // eleven and nine.
+        fdt.cells(
+            "interrupts-extended",
+            &contexts(
+                harts,
+                &[external(Level::Machine), external(Level::Supervisor)],
+            ),
+        );
+        // How many sources it has, which is the highest one anything is wired to.
+        fdt.cells("riscv,ndev", &[SOURCES]);
+        fdt.cells("phandle", &[phandle(harts, Controller::Plic)]);
+        fdt.end_node();
+    } else {
+        describe_aia(&mut fdt, harts, aia);
+    }
 
     // What the guest enumerates rather than what it is told: the tree says where
     // config space is and which addresses the windows hand out, and everything below
@@ -450,7 +669,15 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8>
     // interrupt lands on, which is what makes sixteen entries enough for a bus of
     // thirty-two devices.
     fdt.cells("interrupt-map-mask", &[0x1800, 0, 0, 7]);
-    fdt.cells("interrupt-map", &interrupt_map(harts));
+    fdt.cells("interrupt-map", &interrupt_map(harts, aia));
+    // Where a function sends a message, for one that has been given the capability to
+    // send one rather than a wire to pull.
+    if aia == Aia::AplicImsic {
+        fdt.cells(
+            "msi-parent",
+            &[phandle(harts, Controller::Imsic(Level::Supervisor))],
+        );
+    }
     fdt.end_node();
 
     fdt.begin_node(&format!("clint@{:x}", clint::BASE));
@@ -458,7 +685,7 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8>
     fdt.reg(clint::BASE, clint::SIZE);
     // Its two per hart: the machine software and machine timer interrupts, three and
     // seven.
-    fdt.cells("interrupts-extended", &contexts(harts, [3, 7]));
+    fdt.cells("interrupts-extended", &contexts(harts, &[3, 7]));
     fdt.end_node();
 
     fdt.end_node();

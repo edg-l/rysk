@@ -19,6 +19,7 @@ macro_rules! trace_mem {
 pub const ISA: &str =
     "rv64imafdc_zicsr_zifencei_zicntr_zicond_zaamo_zalrsc_zacas_zabha_zawrs_svade";
 
+pub mod aplic;
 pub mod bus;
 pub mod clint;
 pub mod cpu;
@@ -30,6 +31,7 @@ pub mod fdt;
 pub mod fpu;
 pub mod htif;
 pub mod icache;
+pub mod imsic;
 pub mod inst;
 pub mod machine;
 pub mod mmu;

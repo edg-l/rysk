@@ -137,6 +137,42 @@ pub const CYCLE: usize = 0xC00;
 pub const TIME: usize = 0xC01;
 pub const INSTRET: usize = 0xC02;
 
+/// The Smaia and Ssaia registers: a window onto the registers there is no room in the
+/// address space to name one at a time, the top external interrupt an interrupt file
+/// is offering, the top interrupt of any kind, and the pair that lets machine mode
+/// assert an interrupt to a supervisor that no device raised.
+/// The RISC-V Advanced Interrupt Architecture, 2.1 and 2.2.
+pub const MISELECT: usize = 0x350;
+pub const MIREG: usize = 0x351;
+pub const MTOPEI: usize = 0x35c;
+pub const MTOPI: usize = 0xfb0;
+pub const MVIEN: usize = 0x308;
+pub const MVIP: usize = 0x309;
+pub const SISELECT: usize = 0x150;
+pub const SIREG: usize = 0x151;
+pub const STOPEI: usize = 0x15c;
+pub const STOPI: usize = 0xdb0;
+
+/// The values of `miselect` and `siselect` that name the array of major-interrupt
+/// priorities. Every byte of it is read-only zero on this machine, which is a case the
+/// specification names: an implementation that does that reports one priority for
+/// whatever `mtopi` names rather than a number of its own.
+/// The RISC-V Advanced Interrupt Architecture, 2.1 and 5.2.2.
+pub const IPRIO: std::ops::Range<u64> = 0x30..0x40;
+
+/// What a read of `mtopi` or `stopi` puts the interrupt's identity in, and the one
+/// priority this machine reports. Every byte of the priority array is read-only zero
+/// here, which is the case the specification allows to report a priority of one for
+/// whatever it names. The RISC-V Advanced Interrupt Architecture, 5.2.2.
+pub const TOPI_IDENTITY: u64 = 16;
+pub const TOPI_PRIORITY: u64 = 1;
+
+/// The bits of `mvip` that are a window onto `mip` rather than storage: the two
+/// supervisor interrupts a machine may assert by hand. Its third defined bit, `SEIP`,
+/// is storage, and is the software-writable half of what `mip` reports there.
+/// The RISC-V Advanced Interrupt Architecture, 5.3.
+pub const MVIP_ALIAS: u64 = SSIP | STIP;
+
 pub const MSCRATCH: usize = 0x340;
 pub const MCOUNTEREN: usize = 0x306;
 pub const MENVCFG: usize = 0x30A;
@@ -173,6 +209,16 @@ pub fn exists(addr: usize) -> bool {
         FFLAGS | FRM | FCSR => true,
         _ => false,
     }
+}
+
+/// The CSRs Smaia and Ssaia add. They exist on a hart that has an IMSIC and nowhere
+/// else, since that is the only machine rysk builds them for: without one there is no
+/// interrupt file for the window to reach and nothing for `mtopei` to claim from.
+pub fn aia(addr: usize) -> bool {
+    matches!(
+        addr,
+        MISELECT | MIREG | MTOPEI | MTOPI | MVIEN | MVIP | SISELECT | SIREG | STOPEI | STOPI
+    )
 }
 
 /// The supervisor CSRs that are a view of a machine one, as the register that backs

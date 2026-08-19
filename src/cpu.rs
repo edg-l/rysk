@@ -5,8 +5,10 @@ use crate::{
     bus::{Bus, DRAM_BASE},
     clint,
     csr::{self, *},
+    device::Level,
     fpu::{self, F32, F64, Format, Round},
     icache::{Decoded, Icache},
+    imsic::{self, Imsic},
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
     mmu::{Access, Tlb},
     rvc,
@@ -38,6 +40,10 @@ pub struct Cpu {
     /// the bus that is its own, the interrupt bits the controllers drive for it, and
     /// what `mhartid` reads.
     pub hart: usize,
+    /// The interrupt files this hart receives messages in, if the machine gave it any.
+    /// A hart with one has Smaia and Ssaia and the CSRs that reach the files; a hart
+    /// without one is interrupted by wires alone and those CSRs do not exist for it.
+    pub imsic: Option<Imsic>,
     /// Whether a `wfi` has parked it. A parked hart executes nothing until an
     /// interrupt it has enabled is pending; noticing that is the scheduler's job,
     /// because on a machine with more than one hart the interrupt that ends the wait
@@ -59,6 +65,7 @@ impl Cpu {
             tlb: Tlb::default(),
             icache: Icache::default(),
             hart,
+            imsic: None,
             waiting: false,
         };
 
@@ -103,7 +110,13 @@ impl Cpu {
     /// register reads at the call site, whether or not any device drives one.
     #[inline(never)]
     fn refresh_mip(&mut self, bus: &Bus) {
-        self.csrs[MIP] = (self.csrs[MIP] & !MIP_DEVICE) | bus.interrupts(self.hart);
+        // `SEIP` is the one pending bit with two sources: the controller's wire, and a
+        // bit machine mode may set by hand to post a supervisor external interrupt no
+        // device raised. What `mip` reports is the two together, and the bit software
+        // owns is the one `mvip` exposes on its own.
+        // The RISC-V Instruction Set Manual Volume II, 3.1.9.
+        self.csrs[MIP] =
+            (self.csrs[MIP] & !MIP_DEVICE) | bus.interrupts(self.hart) | (self.csrs[MVIP] & SEIP);
     }
 
     /// The interrupt to take before the next instruction, if there is one: the highest
@@ -296,8 +309,14 @@ impl Cpu {
     /// The RISC-V Instruction Set Manual Volume II, 2.1.
     fn check_csr(&self, addr: usize, word: u32, write: bool) -> Result<(), Exception> {
         let least = ((addr >> 8) & 0b11) as u64;
-        if !csr::exists(addr)
+        if !self.has_csr(addr)
             || (write && addr >> 10 == 0b11)
+            // The window registers are the one pair whose legality is not a property
+            // of their own address: what may be reached through them is whatever the
+            // partner select register currently names.
+            // The RISC-V Advanced Interrupt Architecture, 3.8.3.
+            || (matches!(addr, MIREG | SIREG)
+                && indirect(self.csrs[selects(addr)]) == Indirect::Reserved)
             || (self.mode as u64) < least
             // satp is the one CSR whose address does not say everything: a machine
             // that has set TVM wants to be told before a supervisor changes the page
@@ -310,6 +329,37 @@ impl Cpu {
             return Err(Exception::IllegalInstruction(word as u64));
         }
         Ok(())
+    }
+
+    /// Whether this hart has the CSR `addr` names. Everything Smaia and Ssaia add
+    /// exists only on a hart the machine gave an IMSIC to, and everything else is the
+    /// same on every hart rysk builds.
+    fn has_csr(&self, addr: usize) -> bool {
+        csr::exists(addr) || (self.imsic.is_some() && csr::aia(addr))
+    }
+
+    /// The interrupt file `addr` reaches, for the four registers that come in a
+    /// machine-level and a supervisor-level spelling of the same thing.
+    fn file(&self, addr: usize) -> Option<(&Imsic, Level)> {
+        let level = match addr {
+            MIREG | MTOPEI => Level::Machine,
+            SIREG | STOPEI => Level::Supervisor,
+            _ => return None,
+        };
+        Some((self.imsic.as_ref()?, level))
+    }
+
+    /// The highest-priority interrupt out of `ready`, in the format `mtopi` and
+    /// `stopi` report: its identity, and the one priority this machine has.
+    /// The RISC-V Advanced Interrupt Architecture, 5.2.2.
+    fn topi(&self, ready: u64) -> u64 {
+        match Interrupt::PRIORITY
+            .into_iter()
+            .find(|interrupt| ready >> (*interrupt as u64) & 1 == 1)
+        {
+            Some(interrupt) => ((interrupt as u64) << TOPI_IDENTITY) | TOPI_PRIORITY,
+            None => 0,
+        }
     }
 
     /// Whether one of `mstatus`'s trap-enable bits is holding this supervisor back.
@@ -344,6 +394,38 @@ impl Cpu {
             // `time` is defined to be the same counter the timer compares against, and
             // on this machine that counter lives in the clint.
             TIME => bus.load(clint::BASE + clint::MTIME, 64).unwrap_or(0),
+            // The window onto an interrupt file, and onto the priority array that is
+            // read-only zero here.
+            MIREG | SIREG => {
+                let select = self.csrs[selects(addr)];
+                match self.file(addr) {
+                    Some((imsic, level)) if indirect(select) == Indirect::File => {
+                        imsic.read(self.hart, level, select)
+                    }
+                    _ => 0,
+                }
+            }
+            MTOPEI | STOPEI => match self.file(addr) {
+                Some((imsic, level)) => imsic.topei(self.hart, level),
+                None => 0,
+            },
+            // The top interrupt of either level, out of what is pending and enabled
+            // and belongs to that level. Neither is affected by the global enable of
+            // the mode it reports for.
+            MTOPI | STOPI => {
+                self.refresh_mip(bus);
+                let ready = self.csrs[MIP] & self.csrs[MIE];
+                let mine = match addr {
+                    MTOPI => ready & !self.csrs[MIDELEG],
+                    _ => ready & self.csrs[MIDELEG],
+                };
+                self.topi(mine)
+            }
+            // No interrupt may be made virtual on this machine, so every bit of it is
+            // read-only zero and `sip` and `sie` keep the shape delegation gives them.
+            // The RISC-V Advanced Interrupt Architecture, 5.3.
+            MVIEN => 0,
+            MVIP => (self.csrs[MIP] & MVIP_ALIAS) | (self.csrs[MVIP] & SEIP),
             _ => self.csrs[addr],
         }
     }
@@ -399,8 +481,39 @@ impl Cpu {
                 }
             }
             // The bits a device drives are read-only here: a write cannot argue with a
-            // wire. The RISC-V Instruction Set Manual Volume II, 3.1.9.
-            MIP => self.csrs[MIP] = (self.csrs[MIP] & MIP_DEVICE) | (value & !MIP_DEVICE),
+            // wire. `SEIP` is the exception, since half of what it reports is a bit
+            // machine mode owns, and writing `mip` is one of the two ways to reach it.
+            // The RISC-V Instruction Set Manual Volume II, 3.1.9.
+            MIP => {
+                self.csrs[MVIP] = (self.csrs[MVIP] & !SEIP) | (value & SEIP);
+                self.csrs[MIP] = (self.csrs[MIP] & MIP_DEVICE) | (value & !MIP_DEVICE);
+            }
+            // WARL over the eight bits every value it has to hold fits in. Nothing
+            // above them is a register space this machine implements.
+            // The RISC-V Advanced Interrupt Architecture, 2.1.
+            MISELECT | SISELECT => self.csrs[addr] = value & 0xff,
+            MIREG | SIREG => {
+                let select = self.csrs[selects(addr)];
+                if let Some((imsic, level)) = self.file(addr)
+                    && indirect(select) == Indirect::File
+                {
+                    imsic.write(self.hart, level, select, value);
+                }
+            }
+            // A write claims whatever the register reads as, not what was written.
+            // The RISC-V Advanced Interrupt Architecture, 3.9.
+            MTOPEI | STOPEI => {
+                if let Some((imsic, level)) = self.file(addr) {
+                    imsic.claim(self.hart, level);
+                }
+            }
+            MVIEN => {}
+            // Two of its bits are a window onto `mip` and the third is the only
+            // storage behind `SEIP` there.
+            MVIP => {
+                self.csrs[MIP] = (self.csrs[MIP] & !MVIP_ALIAS) | (value & MVIP_ALIAS);
+                self.csrs[MVIP] = value & SEIP;
+            }
             MSTATUS => self.csrs[MSTATUS] = warl_mstatus(self.csrs[MSTATUS], value),
             _ => self.csrs[addr] = value,
         }
@@ -1167,5 +1280,43 @@ impl Cpu {
             }
         }
         println!()
+    }
+}
+
+/// What a value of `miselect` or `siselect` names. It is what decides both whether an
+/// access to the matching `mireg` or `sireg` is legal at all and what it reaches, which
+/// is why the two window registers cannot be checked by their own address alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Indirect {
+    /// A register of the interrupt file at that level, including the numbers inside
+    /// its range that name nothing and so read as zero.
+    File,
+    /// The array of major-interrupt priorities, every byte of which is read-only zero.
+    Priorities,
+    /// A number this machine has no register space for, which is an illegal
+    /// instruction rather than a register reading as zero.
+    Reserved,
+}
+
+/// Which select register a window register is paired with.
+fn selects(window: usize) -> usize {
+    match window {
+        MIREG => MISELECT,
+        _ => SISELECT,
+    }
+}
+
+/// The RISC-V Advanced Interrupt Architecture, 2.1, 3.7 and 3.8.3.
+fn indirect(select: u64) -> Indirect {
+    match select {
+        _ if IPRIO.contains(&select) => Indirect::Priorities,
+        // With `XLEN` of sixty-four each register of the pending and enable arrays
+        // holds twice as many identities, so the odd-numbered halves do not exist and
+        // naming one is refused rather than read as zero.
+        _ if (imsic::EIP0..imsic::SELECT.end).contains(&select) && !select.is_multiple_of(2) => {
+            Indirect::Reserved
+        }
+        _ if imsic::SELECT.contains(&select) => Indirect::File,
+        _ => Indirect::Reserved,
     }
 }

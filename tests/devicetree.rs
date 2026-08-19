@@ -5,7 +5,9 @@
 //! the blob it is in, that every node closes, and that the addresses in the tree are
 //! the ones the bus decodes.
 
-use rysk::{bus::DRAM_BASE, clint, dram::DRAM_SIZE, machine, pci, plic, uart};
+use rysk::{
+    aplic, bus::DRAM_BASE, clint, dram::DRAM_SIZE, imsic, machine, machine::Aia, pci, plic, uart,
+};
 use std::collections::HashMap;
 
 /// Every property in the tree, by its path, which is enough to check what a driver
@@ -73,7 +75,13 @@ fn text(value: &[u8]) -> String {
 
 #[test]
 fn the_tree_describes_the_machine_the_bus_decodes() {
-    let blob = machine::describe("rv64imac", DRAM_SIZE, 1, &machine::Boot::default());
+    let blob = machine::describe(
+        "rv64imac",
+        DRAM_SIZE,
+        1,
+        &machine::Boot::default(),
+        Aia::None,
+    );
     let tree = parse(&blob);
 
     let reg = |path: &str| cells(&tree[path]);
@@ -126,6 +134,7 @@ fn a_device_names_the_controller_its_line_runs_to() {
         DRAM_SIZE,
         1,
         &machine::Boot::default(),
+        Aia::None,
     ));
     let intc = cells(&tree["/cpus/cpu@0/interrupt-controller/phandle"])[0];
     let plic = cells(&tree["/soc/plic@c000000/phandle"])[0];
@@ -158,7 +167,13 @@ fn what_a_loader_hands_over_reaches_the_tree() {
         bootargs: Some("console=ttyS0 rdinit=/bin/sh".into()),
         initrd: Some((0x8700_0000, 0x8710_0000)),
     };
-    let tree = parse(&machine::describe("rv64imac", DRAM_SIZE, 1, &options));
+    let tree = parse(&machine::describe(
+        "rv64imac",
+        DRAM_SIZE,
+        1,
+        &options,
+        Aia::None,
+    ));
     assert_eq!(
         text(&tree["/chosen/bootargs"]),
         "console=ttyS0 rdinit=/bin/sh"
@@ -172,6 +187,7 @@ fn what_a_loader_hands_over_reaches_the_tree() {
         DRAM_SIZE,
         1,
         &machine::Boot::default(),
+        Aia::None,
     ));
     assert!(!bare.contains_key("/chosen/bootargs"));
     assert!(!bare.contains_key("/chosen/linux,initrd-start"));
@@ -184,6 +200,7 @@ fn every_hart_is_described_and_named_by_the_number_it_reports() {
         DRAM_SIZE,
         4,
         &machine::Boot::default(),
+        Aia::None,
     ));
 
     let intc: Vec<u32> = (0..4)
@@ -231,6 +248,7 @@ fn the_tree_says_where_the_root_complex_is_and_where_its_interrupts_go() {
         DRAM_SIZE,
         2,
         &machine::Boot::default(),
+        Aia::None,
     ));
     let node = "/soc/pci@30000000";
 
@@ -316,5 +334,103 @@ fn the_tree_says_where_the_root_complex_is_and_where_its_interrupts_go() {
             entry[5] <= ndev,
             "on a source the controller says it answers for"
         );
+    }
+}
+
+#[test]
+fn the_advanced_interrupt_architecture_is_described_where_the_bus_put_it() {
+    let tree = parse(&machine::describe(
+        "rv64imac_smaia_ssaia",
+        DRAM_SIZE,
+        2,
+        &machine::Boot::default(),
+        Aia::AplicImsic,
+    ));
+    let reg = |path: &str| cells(&tree[path]);
+    for (base, size) in [
+        (imsic::MACHINE, imsic::PAGE * 2),
+        (imsic::SUPERVISOR, imsic::PAGE * 2),
+        (aplic::MACHINE, aplic::SIZE),
+        (aplic::SUPERVISOR, aplic::SIZE),
+    ] {
+        let path = format!("/soc/interrupt-controller@{base:x}/reg");
+        assert_eq!(
+            reg(&path),
+            [
+                (base >> 32) as u32,
+                base as u32,
+                (size >> 32) as u32,
+                size as u32
+            ],
+            "{path} is where the bus put it"
+        );
+    }
+    assert!(
+        !tree.contains_key("/soc/plic@c000000/reg"),
+        "a machine has one external interrupt controller, not two"
+    );
+
+    let node = |base: u64| format!("/soc/interrupt-controller@{base:x}");
+    let phandle = |base: u64| cells(&tree[&format!("{}/phandle", node(base))])[0];
+    let intc = cells(&tree["/cpus/cpu@0/interrupt-controller/phandle"])[0];
+
+    assert_eq!(
+        cells(&tree[&format!("{}/interrupts-extended", node(imsic::MACHINE))]),
+        [intc, 11, 2, 11],
+        "each hart hears its machine-level file as its machine external interrupt"
+    );
+    assert_eq!(
+        cells(&tree[&format!("{}/msi-parent", node(aplic::MACHINE))]),
+        [phandle(imsic::MACHINE)],
+        "a forwarding domain says where it sends rather than what it drives"
+    );
+    assert_eq!(
+        cells(&tree[&format!("{}/riscv,children", node(aplic::MACHINE))]),
+        [phandle(aplic::SUPERVISOR)],
+        "and the machine-level domain says which domain its sources go to"
+    );
+    assert!(
+        !tree.contains_key(&format!("{}/riscv,children", node(aplic::SUPERVISOR))),
+        "while the child has none of its own"
+    );
+    assert_eq!(
+        cells(&tree["/soc/pci@30000000/msi-parent"]),
+        [phandle(imsic::SUPERVISOR)],
+        "a function that can send a message sends it to the level a driver runs at"
+    );
+}
+
+#[test]
+fn a_device_names_its_source_the_way_its_controller_wants_it_named() {
+    for (aia, cells_per_source) in [(Aia::None, 1), (Aia::Aplic, 2), (Aia::AplicImsic, 2)] {
+        let tree = parse(&machine::describe(
+            "rv64imac",
+            DRAM_SIZE,
+            1,
+            &machine::Boot::default(),
+            aia,
+        ));
+        let controller = match aia {
+            Aia::None => "/soc/plic@c000000".to_string(),
+            _ => format!("/soc/interrupt-controller@{:x}", aplic::SUPERVISOR),
+        };
+        assert_eq!(
+            cells(&tree["/soc/serial@10000000/interrupt-parent"]),
+            cells(&tree[&format!("{controller}/phandle")]),
+            "the serial port reports to the controller a supervisor can reach"
+        );
+        assert_eq!(
+            cells(&tree[&format!("{controller}/#interrupt-cells")]),
+            [cells_per_source],
+        );
+        assert_eq!(
+            cells(&tree["/soc/serial@10000000/interrupts"]).len(),
+            cells_per_source as usize,
+            "and names its source in as many cells as that controller takes"
+        );
+        // Every entry of the map is a child address, a pin, a controller and that
+        // controller's way of naming a source.
+        let map = cells(&tree["/soc/pci@30000000/interrupt-map"]);
+        assert_eq!(map.len() % (5 + cells_per_source as usize), 0);
     }
 }

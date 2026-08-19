@@ -1,6 +1,10 @@
 use std::{env, fs::File, io::Read};
 
-use rysk::{dram::DRAM_SIZE, elf, htif, machine, machine::Machine};
+use rysk::{
+    dram::DRAM_SIZE,
+    elf, htif, machine,
+    machine::{Aia, Machine},
+};
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -52,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut memory = DRAM_SIZE;
     let mut harts = 1;
+    let mut aia = Aia::default();
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
     let mut at = 0;
@@ -62,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-smp" => harts = value.parse::<usize>().expect("a number of harts"),
             "--initrd" => ramdisk = Some(value),
             "--append" => options.bootargs = Some(value),
+            "--aia" => aia = value.parse().unwrap_or_else(|why| panic!("--aia {why}")),
             _ => break,
         }
         at += 2;
@@ -70,7 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(first) = images.first() else {
         panic!(
             "Usage: rysk [-m <mebibytes>] [-smp <harts>] [--initrd <file>] \
-             [--append <args>] <image> [image@address ...]"
+             [--append <args>] [--aia none|aplic|aplic-imsic] \
+             <image> [image@address ...]"
         );
     };
     let mut code = Vec::new();
@@ -118,7 +125,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.initrd = Some((at, at + bytes.len() as u64));
     }
 
-    let keyboard = machine::boot(&mut machine, rysk::ISA, &options);
+    let keyboard = machine::boot(
+        &mut machine,
+        &format!("{}{}", rysk::ISA, aia.isa()),
+        &options,
+        aia,
+    );
     handoff(&mut machine);
 
     // Whatever is typed reaches the port from its own thread, since the hart is busy

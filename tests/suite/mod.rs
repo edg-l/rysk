@@ -1,5 +1,6 @@
 //! The chapters of the instruction set suite.
 
+mod aia;
 mod atomic;
 mod compressed;
 mod control;
