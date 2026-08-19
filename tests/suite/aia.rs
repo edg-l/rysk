@@ -599,3 +599,25 @@ fn reading_the_external_interrupt_back_into_itself_does_not_latch_it() {
     );
     assert_eq!(machine.reg(A1) & SSIP, SSIP, "while what was written stays");
 }
+
+#[test]
+fn a_source_the_controller_does_not_have_reads_as_not_being_there() {
+    // The register layout has room for a thousand sources and this controller has a
+    // fraction of them, so most of that space names nothing.
+    const ABSENT: i32 = 4 * (aplic::SOURCES as i32 + 1);
+    let (program, _) = wired(
+        &[
+            sw(T4, T0, ABSENT),
+            lw(A0, T0, ABSENT),
+            sw(T4, T2, ABSENT),
+            lw(A1, T2, ABSENT),
+        ],
+        Msi::default(),
+    );
+    let machine = program
+        .reg(T2, aplic::MACHINE + TARGETS)
+        .reg(T4, !0u64 >> 32)
+        .run();
+    assert_eq!(machine.reg(A0), 0, "its configuration is not there");
+    assert_eq!(machine.reg(A1), 0, "and neither is its target");
+}

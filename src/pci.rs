@@ -672,18 +672,32 @@ impl Device for Window {
     }
 }
 
-/// A word or part of one out of a vector's four, since a table is defined in words and
-/// software may read it more narrowly.
+/// The bytes of one vector's entry, since an access to it can be narrower than the
+/// words it is defined in and can span two of them.
+fn bytes(entry: &[u32; 4]) -> [u8; VECTOR as usize] {
+    let mut bytes = [0; VECTOR as usize];
+    for (word, value) in entry.iter().enumerate() {
+        bytes[word * 4..word * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 fn read(entry: &[u32; 4], offset: u64, size: u64) -> u64 {
-    let word = entry[(offset / 4) as usize] as u64;
-    (word >> ((offset % 4) * 8)) & (u64::MAX >> (64 - size))
+    let mut value = [0u8; 8];
+    let at = offset as usize;
+    let len = (size / 8) as usize;
+    value[..len].copy_from_slice(&bytes(entry)[at..at + len]);
+    u64::from_le_bytes(value)
 }
 
 fn write(entry: &mut [u32; 4], offset: u64, size: u64, value: u64) {
-    let shift = (offset % 4) * 8;
-    let mask = ((u64::MAX >> (64 - size)) << shift) as u32;
-    let word = &mut entry[(offset / 4) as usize];
-    *word = (*word & !mask) | ((value << shift) as u32 & mask);
+    let mut bytes = bytes(entry);
+    let at = offset as usize;
+    let len = (size / 8) as usize;
+    bytes[at..at + len].copy_from_slice(&value.to_le_bytes()[..len]);
+    for (word, value) in entry.iter_mut().enumerate() {
+        *value = u32::from_le_bytes(bytes[word * 4..word * 4 + 4].try_into().unwrap());
+    }
 }
 
 /// The array of vectors raised while masked, as the bits an access at `byte` covers.

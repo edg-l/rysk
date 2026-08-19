@@ -224,6 +224,11 @@ impl Controller {
     /// domain that has it calls it inactive.
     /// The RISC-V Advanced Interrupt Architecture, 4.2 and 4.5.2.
     fn owner(&self, source: usize) -> Option<(Level, u32)> {
+        // Source zero is not a source, and the register layout has room for far more
+        // of them than this controller has.
+        if source == 0 || source >= SOURCES {
+            return None;
+        }
         let level =
             match self.domains[Level::Machine as usize].sourcecfg[source] & SOURCECFG_DELEGATE {
                 0 => Level::Machine,
@@ -454,6 +459,9 @@ impl Controller {
     /// by being taken as zero.
     /// The RISC-V Advanced Interrupt Architecture, 4.5.2.
     fn configure(&mut self, level: Level, source: usize, value: u32) {
+        if source == 0 || source >= SOURCES {
+            return;
+        }
         match level {
             Level::Machine => {
                 let delegated = value & SOURCECFG_DELEGATE != 0;
@@ -489,15 +497,17 @@ impl Controller {
                     | if domain.enabled { DOMAINCFG_IE } else { 0 }
                     | if domain.forwards { DOMAINCFG_DM } else { 0 }
             }
+            // A source this controller does not have, and one that is not this
+            // domain's, both read as not being there.
             SOURCECFG..SOURCECFG_END => {
                 let source = (offset / 4) as usize;
-                match level {
-                    Level::Machine => domain.sourcecfg[source],
-                    // A source that is not this domain's appears not to exist in it.
-                    Level::Supervisor => match self.owner(source) {
+                match (level, source < SOURCES) {
+                    (Level::Machine, true) => domain.sourcecfg[source],
+                    (Level::Supervisor, true) => match self.owner(source) {
                         Some((Level::Supervisor, _)) => domain.sourcecfg[source],
                         _ => 0,
                     },
+                    _ => 0,
                 }
             }
             // The registers that would say where messages go. They are hardwired here,
