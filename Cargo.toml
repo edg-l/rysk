@@ -11,3 +11,11 @@ trace = []
 [dependencies]
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# The interpreter is one hot loop calling into decode and execute. Split over the
+# default sixteen codegen units those calls cross unit boundaries, and in a position
+# independent binary that makes them indirect through the GOT; whole-program
+# optimisation puts them back together.
+[profile.release]
+lto = "fat"
+codegen-units = 1
