@@ -207,8 +207,9 @@ pub enum Op {
     Csrrc {
         immediate: bool,
     },
-    // ordering. A single in-order hart with no caches is already ordered, so both
-    // retire without doing anything.
+    // ordering. A hart executes its own accesses in order and every other hart sees
+    // them in that order, so `fence` has nothing to order; `fence.i` empties the
+    // instructions this hart has already decoded.
     Fence,
     FenceI,
     // privileged
@@ -580,8 +581,9 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
             (Op::Fp { op, double }, rounding(inst))
         }
         0x2f => {
-            // The aq and rl ordering bits, funct7[1:0], constrain nothing on a single
-            // in-order hart.
+            // The aq and rl ordering bits, funct7[1:0], constrain nothing on a machine
+            // whose harts take turns at whole instructions: everything is already
+            // ordered the way an acquire or a release would ask for.
             if funct7 >> 2 == 0b00101 {
                 let width = match funct3 {
                     0x4 => CasWidth::Quad,
