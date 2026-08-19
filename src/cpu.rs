@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     ops::{BitAnd, BitOr, BitXor},
     time::Instant,
 };
@@ -39,7 +38,7 @@ impl Cpu {
             pc: DRAM_BASE,
             bus: Bus {
                 dram: Dram::new(code),
-                reservations: HashMap::default(),
+                reservation: None,
             },
             csrs: [0; 4096],
             start: Instant::now(),
@@ -205,7 +204,9 @@ impl Cpu {
                 let shamt = (imm & 0x3f) as u32;
                 tracing::Span::current().record("shamt", shamt);
 
-                match (funct3, funct7) {
+                // The immediate shifts take the top six bits of the I-immediate as funct6,
+                // since the sixth shift-amount bit occupies funct7's low bit.
+                match (funct3, funct7 >> 1) {
                     (0x0, _) => {
                         // addi
                         debug!("ADDI");
@@ -229,14 +230,14 @@ impl Cpu {
                     (0x1, 0x00) => {
                         // slli
                         debug!("SLLI");
-                        self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
+                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
                     }
                     (0x5, 0x00) => {
                         // srli
                         debug!("SRLI");
-                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
+                        self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
                     }
-                    (0x5, 0x20) => {
+                    (0x5, 0x10) => {
                         // srai
                         debug!("SRAI");
                         self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
@@ -378,7 +379,7 @@ impl Cpu {
                         // rem
                         debug!("REM");
                         if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
+                            self.regs[rd] = self.regs[rs1];
                         } else {
                             self.regs[rd] =
                                 (self.regs[rs1] as i64).wrapping_rem(self.regs[rs2] as i64) as u64;
@@ -388,12 +389,11 @@ impl Cpu {
                         // remu
                         debug!("REMU");
                         if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
+                            self.regs[rd] = self.regs[rs1];
                         } else {
                             self.regs[rd] = self.regs[rs1].wrapping_rem(self.regs[rs2]);
                         }
                     }
-                    // todo: mulw and friends
                     _ => Err(())?,
                 }
             }
@@ -450,7 +450,7 @@ impl Cpu {
                     (0x6, 0x1) => {
                         debug!("REMW");
                         if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
+                            self.regs[rd] = self.regs[rs1] as i32 as i64 as u64;
                         } else {
                             self.regs[rd] = (self.regs[rs1] as i32)
                                 .wrapping_rem(self.regs[rs2] as i32)
@@ -460,7 +460,7 @@ impl Cpu {
                     (0x7, 0x1) => {
                         debug!("REMUW");
                         if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
+                            self.regs[rd] = self.regs[rs1] as u32 as i32 as i64 as u64;
                         } else {
                             self.regs[rd] =
                                 (self.regs[rs1] as u32).wrapping_rem(self.regs[rs2] as u32) as u64;
@@ -638,7 +638,7 @@ impl Cpu {
                         debug!("CSRRC");
                         self.regs[rd] = csr;
                         if rs1 != 0 {
-                            self.store_csr(csr_addr, csr & self.regs[rs1]);
+                            self.store_csr(csr_addr, csr & !self.regs[rs1]);
                         }
                     }
                     0x5 => {
@@ -675,16 +675,15 @@ impl Cpu {
                         debug!("CSRRCI");
                         self.regs[rd] = csr;
                         if imm != 0 {
-                            self.store_csr(csr_addr, csr & imm);
+                            self.store_csr(csr_addr, csr & !imm);
                         }
                     }
                     _ => Err(())?,
                 }
             }
             0x2f => {
-                // atomic extension
-                let aq = (funct7 >> 1) & 0x1;
-                let rl = funct7 & 0x1;
+                // atomic extension. The aq and rl ordering bits, funct7[1] and funct7[0],
+                // constrain nothing on a single in-order hart.
                 let funct5 = (funct7 >> 2) & 0x1f;
 
                 match funct3 {
@@ -694,26 +693,20 @@ impl Cpu {
                                 // lr.w
                                 debug!("LR.W");
                                 let addr = self.regs[rs1];
-                                let dword = self.bus.load(addr, 32)? as i32 as i64 as u64;
-                                self.regs[rd] = dword;
-                                self.bus.reservations.insert(addr, (dword, false));
+                                self.regs[rd] = self.bus.load(addr, 32)? as i32 as i64 as u64;
+                                self.bus.reserve(addr, 32);
                             }
                             0b00011 => {
                                 // sc.w
                                 debug!("SC.W");
                                 let addr = self.regs[rs1];
 
-                                if let Some((_, changed)) = self.bus.reservations.get(&addr) {
-                                    if !changed {
-                                        self.regs[rd] = 0;
-                                        self.bus.store(addr, 32, self.regs[rs2])?;
-                                    } else {
-                                        self.regs[rd] = 1;
-                                    }
+                                if self.bus.take_reservation(addr, 32) {
+                                    self.bus.store(addr, 32, self.regs[rs2])?;
+                                    self.regs[rd] = 0;
                                 } else {
                                     self.regs[rd] = 1;
                                 }
-                                self.bus.reservations.remove(&addr);
                             }
                             0x1 => {
                                 // amoswap.w
@@ -801,40 +794,26 @@ impl Cpu {
                             0b00010 => {
                                 debug!("LR.D");
 
-                                /* LR.W loads a word from the address in rs1,
-                                places the sign-extended value in rd, and registers a reservation set—a
-                                set of bytes that subsumes the
-                                bytes in the addressed word. */
-
+                                // Loads a doubleword from the address in rs1, places it in rd, and
+                                // reserves a set of bytes that subsumes the addressed doubleword.
                                 let addr = self.regs[rs1];
-                                let dword = self.bus.load(addr, 64)?;
-                                self.regs[rd] = dword;
-                                self.bus.reservations.insert(addr, (dword, false));
+                                self.regs[rd] = self.bus.load(addr, 64)?;
+                                self.bus.reserve(addr, 64);
                             }
                             0b00011 => {
-                                // sc.w
                                 debug!("SC.D");
-                                /* SC.W conditionally writes a word in rs2 to the address in rs1: the SC.W
-                                succeeds only if the reservation is still valid and
-                                the reservation set contains the bytes being written. If
-                                14.1. Specifying Ordering of Atomic Instructions | Page 68
-                                The RISC-V Instruction Set Manual Volume I | © RISC-V
-                                the SC.W succeeds, the instruction writes the word in rs2 to memory, and it writes zero to rd. If the
-                                SC.W fails, the instruction does not write to memory, and it writes a nonzero value to rd.
-                                */
+
+                                // Writes the doubleword in rs2 to the address in rs1 only if the
+                                // reservation is still valid and covers the bytes being written,
+                                // writing zero to rd on success and a nonzero value on failure.
                                 let addr = self.regs[rs1];
 
-                                if let Some((_, changed)) = self.bus.reservations.get(&addr) {
-                                    if !changed {
-                                        self.regs[rd] = 0;
-                                        self.bus.store(addr, 64, self.regs[rs2])?;
-                                    } else {
-                                        self.regs[rd] = 1;
-                                    }
+                                if self.bus.take_reservation(addr, 64) {
+                                    self.bus.store(addr, 64, self.regs[rs2])?;
+                                    self.regs[rd] = 0;
                                 } else {
                                     self.regs[rd] = 1;
                                 }
-                                self.bus.reservations.remove(&addr);
                             }
                             0x1 => {
                                 debug!("AMOSWAP.D");
@@ -923,8 +902,6 @@ impl Cpu {
                 unimplemented!("{:#09b}", x)
             }
         }
-
-        // page 554
 
         Ok(())
     }

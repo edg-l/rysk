@@ -57,9 +57,9 @@ impl Dram {
             | ((self.dram[index + 2] as u64) << 16)
             | ((self.dram[index + 3] as u64) << 24)
             | ((self.dram[index + 4] as u64) << 32)
-            | ((self.dram[index + 5] as u64) << 38)
-            | ((self.dram[index + 6] as u64) << 46)
-            | ((self.dram[index + 7] as u64) << 54)
+            | ((self.dram[index + 5] as u64) << 40)
+            | ((self.dram[index + 6] as u64) << 48)
+            | ((self.dram[index + 7] as u64) << 56)
     }
 
     #[inline]
@@ -70,9 +70,9 @@ impl Dram {
         self.dram[index + 2] = ((value >> 16) & 0xff) as u8;
         self.dram[index + 3] = ((value >> 24) & 0xff) as u8;
         self.dram[index + 4] = ((value >> 32) & 0xff) as u8;
-        self.dram[index + 5] = ((value >> 38) & 0xff) as u8;
-        self.dram[index + 6] = ((value >> 46) & 0xff) as u8;
-        self.dram[index + 7] = ((value >> 54) & 0xff) as u8;
+        self.dram[index + 5] = ((value >> 40) & 0xff) as u8;
+        self.dram[index + 6] = ((value >> 48) & 0xff) as u8;
+        self.dram[index + 7] = ((value >> 56) & 0xff) as u8;
     }
 
     #[inline]

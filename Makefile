@@ -1,4 +1,16 @@
+# riscv64-unknown-elf-gcc if it is installed, otherwise clang, whose integrated
+# assembler and lld target RISC-V without a cross toolchain.
+CROSS := riscv64-unknown-elf
 
+ifneq ($(shell command -v $(CROSS)-gcc),)
+CC      = $(CROSS)-gcc -march=rv64g
+LDFLAGS = -Wl,-Ttext=0x0
+OBJCOPY = $(CROSS)-objcopy
+else
+CC      = clang --target=$(CROSS) -march=rv64g -mno-relax
+LDFLAGS = -fuse-ld=lld -Wl,--image-base=0,-Ttext=0x0
+OBJCOPY = llvm-objcopy
+endif
 
 SRCS = $(wildcard tests/*.s tests/*.c)
 
@@ -12,11 +24,11 @@ test: test_files
 test_files: $(PROGS) $(C_PROGS)
 
 %.bin: %.s
-	riscv64-unknown-elf-gcc -march=rv64g -Wl,-Ttext=0x0 -nostdlib -o $@ $<
-	riscv64-unknown-elf-objcopy -O binary $@ $@
+	$(CC) $(LDFLAGS) -nostdlib -o $@ $<
+	$(OBJCOPY) -O binary $@ $@
 
 %.s: %.c
-	riscv64-unknown-elf-gcc -march=rv64g -S $< -o $@
+	$(CC) -S $< -o $@
 
 .PHONY: clean
 clean:
