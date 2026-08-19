@@ -10,14 +10,22 @@
 
 use crate::inst::Inst;
 
-/// One decoded instruction, and the physical address whose bytes it came from. The
-/// encoding is kept beside it because a trap that rejects an instruction owes `mtval`
-/// the bits it was given.
+/// What a fetch produces: what the instruction does, the bits it was, and how many
+/// bytes of them. The encoding is kept because a trap that rejects an instruction owes
+/// `mtval` the bits it was given, and the length because the fetch already knows it and
+/// the next `pc` is otherwise derived from the encoding all over again.
+#[derive(Debug, Clone, Copy)]
+pub struct Decoded {
+    pub inst: Inst,
+    pub encoding: u32,
+    pub length: u8,
+}
+
+/// One of them, and the physical address whose bytes it came from.
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     pa: u64,
-    inst: Inst,
-    encoding: u32,
+    decoded: Decoded,
 }
 
 /// A direct-mapped cache of them.
@@ -51,15 +59,15 @@ impl Icache {
     }
 
     #[inline]
-    pub fn get(&self, pa: u64) -> Option<(Inst, u32)> {
+    pub fn get(&self, pa: u64) -> Option<Decoded> {
         self.entries[Self::slot(pa)]
             .filter(|entry| entry.pa == pa)
-            .map(|entry| (entry.inst, entry.encoding))
+            .map(|entry| entry.decoded)
     }
 
     #[inline]
-    pub fn insert(&mut self, pa: u64, inst: Inst, encoding: u32) {
-        self.entries[Self::slot(pa)] = Some(Entry { pa, inst, encoding });
+    pub fn insert(&mut self, pa: u64, decoded: Decoded) {
+        self.entries[Self::slot(pa)] = Some(Entry { pa, decoded });
     }
 
     /// Forget everything, which is what `fence.i` means.

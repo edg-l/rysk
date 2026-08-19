@@ -10,7 +10,7 @@ use crate::{
     dram::Dram,
     elf::{Error as ElfError, Image},
     fpu::{self, F32, F64, Format, Round},
-    icache::Icache,
+    icache::{Decoded, Icache},
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
     mmu::{Access, Tlb},
     rvc,
@@ -180,10 +180,14 @@ impl Cpu {
     /// Fetch, decode and execute one instruction.
     #[inline]
     pub fn step(&mut self) -> Result<(), Exception> {
-        let (inst, encoding) = self.fetch()?;
+        let Decoded {
+            inst,
+            encoding,
+            length,
+        } = self.fetch()?;
         trace_insn!("{:#x}  {inst}", self.pc);
 
-        self.next_pc = self.pc.wrapping_add(inst::length(encoding as u16));
+        self.next_pc = self.pc.wrapping_add(length as u64);
         // Each counter runs unless `mcountinhibit` says to hold it still.
         // The RISC-V Instruction Set Manual Volume II, 3.1.12.
         let inhibit = self.csrs[MCOUNTINHIBIT];
@@ -452,7 +456,7 @@ impl Cpu {
     /// compressed instruction can sit in the last two bytes of memory, and reading four
     /// there would fault on bytes it does not have.
     #[inline]
-    fn fetch(&mut self) -> Result<(Inst, u32), Exception> {
+    fn fetch(&mut self) -> Result<Decoded, Exception> {
         let pa = self.translate(self.pc, Access::Fetch)?;
         if let Some(decoded) = self.icache.get(pa) {
             return Ok(decoded);
@@ -470,14 +474,19 @@ impl Cpu {
         };
         // A compressed instruction is the low half alone, and the high half of what was
         // read is not part of it.
-        let decoded = if inst::length(word as u16) == 2 {
-            (rvc::decode(word as u16)?, word & 0xffff)
-        } else {
-            (decode(word)?, word)
+        let length = inst::length(word as u16);
+        let decoded = Decoded {
+            inst: if length == 2 {
+                rvc::decode(word as u16)?
+            } else {
+                decode(word)?
+            },
+            encoding: if length == 2 { word & 0xffff } else { word },
+            length: length as u8,
         };
         // Only what decoded. An encoding this machine refuses raises the same exception
         // every time it is fetched, and remembering it would save nothing.
-        self.icache.insert(pa, decoded.0, decoded.1);
+        self.icache.insert(pa, decoded);
         Ok(decoded)
     }
 
