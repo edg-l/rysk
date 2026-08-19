@@ -627,8 +627,10 @@ impl Cpu {
                 let imm = ((((inst & 0xfff00000) as i32) as i64) >> 20) as u64;
                 tracing::Span::current().record("imm", imm);
 
-                self.regs[rd] = self.pc;
+                // The target comes from rs1's value before the link is written, since
+                // rd and rs1 are commonly the same register.
                 let addr = self.regs[rs1].wrapping_add(imm) & !1;
+                self.regs[rd] = self.pc;
                 self.pc = addr;
                 debug!("JALR");
             }

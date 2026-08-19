@@ -519,6 +519,26 @@ fn jal_links_the_following_instruction() {
 }
 
 #[test]
+fn jalr_reads_its_base_before_writing_the_link() {
+    // `jalr ra, ra, off` is how a compiler calls through an auipc, so the link must not
+    // clobber the base first.
+    let cpu = prog(&[
+        auipc(RA, 0),
+        jalr(RA, RA, 12),
+        addi(T1, ZERO, 1),
+        addi(T2, ZERO, 2),
+    ])
+    .run();
+    assert_eq!(cpu.reg(T1), 0, "the skipped instruction did not run");
+    assert_eq!(cpu.reg(T2), 2);
+    assert_eq!(
+        cpu.reg(RA),
+        DRAM_BASE + 8,
+        "the link is the address after the jalr"
+    );
+}
+
+#[test]
 fn jalr_clears_the_low_bit_of_its_target() {
     // An odd target must be rounded down, not fetched at an odd address.
     let cpu = prog(&[jalr(RA, T0, 1), addi(T1, ZERO, 1), addi(T2, ZERO, 2)])
@@ -730,6 +750,8 @@ fn a_compiled_c_program_runs() {
     let code = std::fs::read("tests/fib.bin").expect("run `make test_files`");
     let mut cpu = Cpu::new(code);
     cpu.run().unwrap();
-    assert_eq!(cpu.reg(A4), 1);
-    assert_eq!(cpu.reg(A5), 0x37, "fib(10) is 55");
+    // main returns fib(10), which the calling convention leaves in a0. Asserting on the
+    // return value rather than on scratch registers keeps this independent of which
+    // compiler built the fixture.
+    assert_eq!(cpu.reg(A0), 55);
 }
