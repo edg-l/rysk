@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (Cpu::new(code), None)
     };
-    machine::virt(&mut cpu.bus);
+    machine::boot(&mut cpu, rysk::ISA);
 
     let stopped = match tohost {
         Some(tohost) => htif::run(&mut cpu, tohost, MAX_STEPS).to_string(),
