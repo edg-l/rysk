@@ -182,3 +182,98 @@ fn same32(ours: f32, theirs: f32) -> bool {
     }
     ours.to_bits() == theirs.to_bits()
 }
+
+#[test]
+fn a_tie_goes_where_the_rounding_mode_says() {
+    // Exactly halfway between 1.0 and the next double up, which is the case every
+    // mode answers differently.
+    let half_way = |sign: f64| (sign * 1.0f64).to_bits();
+    let tiny = (2.0f64.powi(-53)).to_bits();
+    let next = f64::from_bits(1.0f64.to_bits() + 1);
+
+    for (mode, positive, negative) in [
+        (Round::Nearest, 1.0, -1.0),
+        (Round::NearestMax, next, -next),
+        (Round::Zero, 1.0, -1.0),
+        (Round::Down, 1.0, -next),
+        (Round::Up, next, -1.0),
+    ] {
+        let (up, _) = fpu::add(F64, half_way(1.0), tiny, mode);
+        assert_eq!(
+            f64::from_bits(up),
+            positive,
+            "{mode:?} rounding a tie above one"
+        );
+        let (down, _) = fpu::sub(F64, half_way(-1.0), tiny, mode);
+        assert_eq!(
+            f64::from_bits(down),
+            negative,
+            "{mode:?} rounding a tie below minus one"
+        );
+    }
+}
+
+#[test]
+fn the_flags_say_what_happened() {
+    let bits = |v: f64| v.to_bits();
+    for (name, (_, flags), expected) in [
+        (
+            "a division by zero is the one exception about the operands",
+            fpu::div(F64, bits(1.0), bits(0.0), Round::Nearest),
+            fpu::DZ,
+        ),
+        (
+            "zero over zero has no answer at all",
+            fpu::div(F64, bits(0.0), bits(0.0), Round::Nearest),
+            fpu::NV,
+        ),
+        (
+            "the root of a negative has none either",
+            fpu::sqrt(F64, bits(-1.0), Round::Nearest),
+            fpu::NV,
+        ),
+        (
+            "past the top of the range is inexact as well as too large",
+            fpu::mul(F64, bits(f64::MAX), bits(2.0), Round::Nearest),
+            fpu::OF | fpu::NX,
+        ),
+        (
+            "below the bottom of it is inexact as well as too small",
+            fpu::mul(F64, bits(f64::MIN_POSITIVE), bits(0.5), Round::Nearest),
+            0,
+        ),
+        (
+            "and losing something on the way down is both",
+            fpu::div(F64, bits(f64::from_bits(3)), bits(2.0), Round::Nearest),
+            fpu::UF | fpu::NX,
+        ),
+        (
+            "an exact result raises nothing",
+            fpu::add(F64, bits(1.0), bits(1.0), Round::Nearest),
+            0,
+        ),
+    ] {
+        assert_eq!(flags, expected, "{name}");
+    }
+}
+
+#[test]
+fn what_a_number_is_matches_what_it_is_classified_as() {
+    use rysk::fpu::*;
+    for (value, class) in [
+        (f64::NEG_INFINITY.to_bits(), CLASS_NEG_INF),
+        ((-1.0f64).to_bits(), CLASS_NEG_NORMAL),
+        (0x8000_0000_0000_0001, CLASS_NEG_SUBNORMAL),
+        ((-0.0f64).to_bits(), CLASS_NEG_ZERO),
+        (0.0f64.to_bits(), CLASS_POS_ZERO),
+        (1, CLASS_POS_SUBNORMAL),
+        (1.0f64.to_bits(), CLASS_POS_NORMAL),
+        (f64::INFINITY.to_bits(), CLASS_POS_INF),
+        (F64.canonical_nan(), CLASS_QUIET_NAN),
+        // A NaN with the quiet bit clear is the signalling kind, and it needs a
+        // payload: clearing that bit and leaving nothing behind is an infinity.
+        (F64.canonical_nan() ^ (1 << 51) | 1, CLASS_SIGNALLING_NAN),
+    ] {
+        assert_eq!(classify(F64, value), class, "classifying {value:#018x}");
+    }
+}
