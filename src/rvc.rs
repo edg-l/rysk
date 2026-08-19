@@ -15,8 +15,8 @@ use crate::{
 
 /// The eight registers the three-bit fields name, which are `x8` to `x15`.
 /// The RISC-V Instruction Set Manual Volume I, 27.2, table 38.
-const fn popular(field: u16) -> usize {
-    (field & 0b111) as usize + 8
+const fn popular(field: u16) -> u8 {
+    (field & 0b111) as u8 + 8
 }
 
 const fn bits(half: u16, high: u32, low: u32) -> u64 {
@@ -32,7 +32,7 @@ const fn sext(value: u64, top: u32) -> u64 {
     ((value << (63 - top)) as i64 >> (63 - top)) as u64
 }
 
-const fn make(op: Op, rd: usize, rs1: usize, rs2: usize, imm: u64) -> Inst {
+const fn make(op: Op, rd: u8, rs1: u8, rs2: u8, imm: u64) -> Inst {
     Inst {
         op,
         rd,
@@ -54,8 +54,8 @@ pub fn decode(half: u16) -> Result<Inst, Exception> {
     // The three-bit register fields, and the five-bit ones that share their positions.
     let rd_short = popular(half >> 2);
     let rs1_short = popular(half >> 7);
-    let wide = bits(half, 11, 7) as usize;
-    let rs2_wide = bits(half, 6, 2) as usize;
+    let wide = bits(half, 11, 7) as u8;
+    let rs2_wide = bits(half, 6, 2) as u8;
 
     let inst = match (half & 0b11, funct3) {
         // ------------------------------------------------------------ quadrant 0

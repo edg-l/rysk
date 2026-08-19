@@ -258,12 +258,15 @@ pub enum Op {
 /// carries a sign-extended immediate, a shift amount, a csr number, or for a
 /// floating-point instruction its rounding mode and, for a fused one, `rs3` above
 /// that, since only those three instructions have a third source.
+/// The register fields name one of thirty-two registers, and are `u8` rather than
+/// `usize` because every decoded instruction is kept: it makes an `Inst` sixteen bytes
+/// rather than forty. `execute` widens them once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inst {
     pub op: Op,
-    pub rd: usize,
-    pub rs1: usize,
-    pub rs2: usize,
+    pub rd: u8,
+    pub rs1: u8,
+    pub rs2: u8,
     pub imm: u64,
 }
 
@@ -331,9 +334,9 @@ pub const fn length(half: u16) -> u64 {
 #[inline]
 pub fn decode(inst: u32) -> Result<Inst, Exception> {
     let opcode = inst & 0x7f;
-    let rd = ((inst >> 7) & 0x1f) as usize;
-    let rs1 = ((inst >> 15) & 0x1f) as usize;
-    let rs2 = ((inst >> 20) & 0x1f) as usize;
+    let rd = ((inst >> 7) & 0x1f) as u8;
+    let rs1 = ((inst >> 15) & 0x1f) as u8;
+    let rs2 = ((inst >> 20) & 0x1f) as u8;
     let funct3 = (inst >> 12) & 0x7;
     let funct7 = (inst >> 25) & 0x7f;
     let illegal = Exception::IllegalInstruction(inst as u64);
@@ -664,8 +667,8 @@ pub const REG_NAMES: [&str; 32] = [
     "t5", "t6",
 ];
 
-fn reg(n: usize) -> &'static str {
-    REG_NAMES[n]
+fn reg(n: u8) -> &'static str {
+    REG_NAMES[n as usize]
 }
 
 impl fmt::Display for Inst {

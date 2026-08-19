@@ -575,6 +575,9 @@ impl Cpu {
             rs2,
             imm,
         } = inst;
+        // Widened once here, so naming a register below is an index rather than a
+        // conversion.
+        let (rd, rs1, rs2) = (rd as usize, rs1 as usize, rs2 as usize);
         let (a, b) = (self.regs[rs1], self.regs[rs2]);
 
         match op {
