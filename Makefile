@@ -41,10 +41,12 @@ CORPUS_URL = https://github.com/riscv-software-src/riscv-tests
 # the change showing up here.
 CORPUS_REV = 2ebecad997fa58cd9e5724340ba75aa4b59bd1d0
 GROUPS     = rv64ui rv64um rv64ua rv64si rv64mi
-# The supervisor and machine groups define a handler that riscv_test.h has already
-# declared weak, and clang refuses to rebind a weak symbol to global where gcc allows
-# it. They are assembled from a copy with that declaration left weak; four of the
-# rv64mi tests include ../rv64si sources directly, so the copy keeps the tree shape.
+# The corpus is assembled from a copy of its sources, patched for what clang will not
+# take. Two things: the supervisor and machine groups define a handler riscv_test.h has
+# already declared weak, and clang refuses to rebind a weak symbol to global where gcc
+# allows it; and `tcontrol` is a debug-mode csr only recent assemblers know by name, so
+# it goes in by the number the corpus's own encoding.h gives it. Four of the rv64mi
+# tests include ../rv64si sources directly, so the copy keeps the tree shape.
 PATCHED    = $(CACHE)/patched
 
 .PHONY: corpus
@@ -65,7 +67,8 @@ $(CORPUS)/.stamp: | $(CORPUS_SRC)
 	@for group in $(GROUPS); do \
 	  mkdir -p $(PATCHED)/$$group; \
 	  for src in $(CORPUS_SRC)/isa/$$group/*.S; do \
-	    sed -E 's/\.global (m|s)tvec_handler/.weak \1tvec_handler/' \
+	    sed -E -e 's/\.global (m|s)tvec_handler/.weak \1tvec_handler/' \
+	           -e 's/(csr[a-z]+[[:space:]]+)tcontrol/\10x7a5/' \
 	      $$src > $(PATCHED)/$$group/$$(basename $$src); \
 	  done; \
 	done
