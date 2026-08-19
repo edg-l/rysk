@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use rysk::{bus::DRAM_BASE, cpu::Cpu, dram::DRAM_SIZE};
+use rysk::{bus::DRAM_BASE, cpu::Cpu, dram::DRAM_SIZE, exception::Exception};
 
 pub const ZERO: u32 = 0;
 pub const RA: u32 = 1;
@@ -198,6 +198,22 @@ pub const fn csrrci(rd: u32, csr: u32, uimm: u32) -> u32 {
     i(csr as i32, uimm, 0x7, rd, 0x73)
 }
 
+pub const fn ecall() -> u32 {
+    i(0x000, 0, 0x0, 0, 0x73)
+}
+
+pub const fn ebreak() -> u32 {
+    i(0x001, 0, 0x0, 0, 0x73)
+}
+
+pub const fn mret() -> u32 {
+    i(0x302, 0, 0x0, 0, 0x73)
+}
+
+pub const fn wfi() -> u32 {
+    i(0x105, 0, 0x0, 0, 0x73)
+}
+
 /// `nop`, for padding a program out to a known length.
 pub const fn nop() -> u32 {
     addi(ZERO, ZERO, 0)
@@ -226,9 +242,23 @@ impl Program {
         self
     }
 
+    /// Run until a trap nothing handles, and check it was the expected one.
+    pub fn expect(self, expected: Exception) -> Cpu {
+        let (cpu, stopped) = self.run_to_trap();
+        assert_eq!(
+            stopped, expected,
+            "the machine stopped for the wrong reason"
+        );
+        cpu
+    }
+
     /// Run to completion. Execution ends on the zeroed word past the last instruction,
-    /// which decodes as an illegal opcode.
+    /// which decodes as an illegal instruction with nothing installed to take it.
     pub fn run(self) -> Cpu {
+        self.run_to_trap().0
+    }
+
+    fn run_to_trap(self) -> (Cpu, Exception) {
         let mut bytes = Vec::with_capacity(self.code.len() * 4);
         for inst in &self.code {
             bytes.extend_from_slice(&inst.to_le_bytes());
@@ -238,8 +268,8 @@ impl Program {
         for (reg, value) in self.regs {
             cpu.regs[reg as usize] = value;
         }
-        cpu.run().unwrap();
-        cpu
+        let stopped = cpu.run();
+        (cpu, stopped)
     }
 }
 

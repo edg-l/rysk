@@ -3,19 +3,22 @@ use std::{
     time::Instant,
 };
 
-use tracing::error;
 #[cfg(feature = "trace")]
 use tracing::instrument;
 
 use crate::{
     bus::{Bus, DRAM_BASE},
     dram::{DRAM_SIZE, Dram},
+    exception::Exception,
 };
 
 #[derive(Debug, Clone)]
 pub struct Cpu {
     pub regs: [u64; 32],
+    /// The instruction being executed.
     pub pc: u64,
+    /// Where control goes when it retires. Jumps and taken branches overwrite it.
+    pub next_pc: u64,
     pub bus: Bus,
     /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
     /// space (csr[11:0]) for up to 4096 CSRs.
@@ -23,6 +26,19 @@ pub struct Cpu {
     pub start: Instant,
 }
 
+pub const MSTATUS: usize = 0x300;
+/// Bit positions in `mstatus`: the machine interrupt-enable bit, the value it had
+/// before the current trap, and the two-bit field holding the mode the trap came from.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.6.
+pub const MSTATUS_MIE: u64 = 3;
+pub const MSTATUS_MPIE: u64 = 7;
+pub const MSTATUS_MPP: u64 = 0b11 << 11;
+/// Machine mode in the two-bit `MPP` encoding.
+pub const MSTATUS_MPP_M: u64 = 0b11 << 11;
+pub const MTVEC: usize = 0x305;
+pub const MEPC: usize = 0x341;
+pub const MCAUSE: usize = 0x342;
+pub const MTVAL: usize = 0x343;
 pub const MIP: usize = 0x344;
 pub const MIE: usize = 0x304;
 pub const SIP: usize = 0x144;
@@ -38,6 +54,7 @@ impl Cpu {
         let mut cpu = Cpu {
             regs: Default::default(),
             pc: DRAM_BASE,
+            next_pc: DRAM_BASE,
             bus: Bus {
                 dram: Dram::new(code),
                 reservation: None,
@@ -52,29 +69,66 @@ impl Cpu {
         cpu
     }
 
-    pub fn run(&mut self) -> Result<(), std::io::Error> {
-        while let Ok(inst) = self.fetch() {
-            self.pc += 4;
-
-            // Update counters
-            self.csrs[RDCYCLE] += 1;
-            self.csrs[INSTRET] += 1;
-
-            // 3. Decode.
-            // 4. Execute.
-            if self.execute(inst).is_err() {
-                break;
-            }
-
-            self.regs[0] = 0;
-
-            // This is a workaround for avoiding an infinite loop.
-            if self.pc == 0 {
-                break;
+    /// Run until a trap that nothing is installed to handle, and return it. With no
+    /// handler in `mtvec` there is nowhere for a trap to go, so that is where a program
+    /// ends: normally by running off its own code into the zeroed dram behind it.
+    pub fn run(&mut self) -> Exception {
+        loop {
+            if let Err(exception) = self.step() {
+                if self.csrs[MTVEC] == 0 {
+                    return exception;
+                }
+                self.take_trap(exception);
             }
         }
+    }
 
+    /// Fetch, decode and execute one instruction.
+    #[inline]
+    pub fn step(&mut self) -> Result<(), Exception> {
+        let inst = self.fetch()?;
+
+        self.next_pc = self.pc.wrapping_add(4);
+        self.csrs[RDCYCLE] += 1;
+        self.csrs[INSTRET] += 1;
+
+        self.execute(inst)?;
+
+        self.regs[0] = 0;
+        self.pc = self.next_pc;
         Ok(())
+    }
+
+    /// Enter the machine-mode trap handler: record where and why, stack the
+    /// interrupt-enable bit, and jump through `mtvec`.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.6.1 and 3.1.7.
+    fn take_trap(&mut self, exception: Exception) {
+        self.csrs[MEPC] = self.pc;
+        self.csrs[MCAUSE] = exception.cause();
+        self.csrs[MTVAL] = exception.value();
+
+        let status = self.csrs[MSTATUS];
+        let mie = (status >> MSTATUS_MIE) & 1;
+        // MIE moves to MPIE and clears, and the mode we came from lands in MPP, which
+        // is always machine mode until there are other privilege levels.
+        let status = (status & !(1 << MSTATUS_MPIE) & !(1 << MSTATUS_MIE) & !MSTATUS_MPP)
+            | (mie << MSTATUS_MPIE)
+            | MSTATUS_MPP_M;
+        self.csrs[MSTATUS] = status;
+
+        // Vectored mode only spreads interrupts out; exceptions always enter at the base.
+        self.pc = self.csrs[MTVEC] & !0b11;
+    }
+
+    /// Return from a machine-mode trap: unstack the interrupt-enable bit and resume at
+    /// `mepc`.
+    fn trap_return(&mut self) {
+        let status = self.csrs[MSTATUS];
+        let mpie = (status >> MSTATUS_MPIE) & 1;
+        self.csrs[MSTATUS] =
+            (status & !(1 << MSTATUS_MIE)) | (mpie << MSTATUS_MIE) | (1 << MSTATUS_MPIE);
+        self.next_pc = self.csrs[MEPC];
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
@@ -122,7 +176,7 @@ impl Cpu {
         size: u64,
         name: &str,
         op: impl Fn(u64, u64) -> u64,
-    ) -> Result<(), ()> {
+    ) -> Result<(), Exception> {
         trace_insn!("{name}");
         let data = self.bus.load(addr, size)?;
         let value = op(data, src);
@@ -131,9 +185,28 @@ impl Cpu {
         Ok(())
     }
 
+    /// Take a branch or jump relative to the instruction being executed.
     #[inline]
-    fn fetch(&self) -> Result<u64, ()> {
-        self.bus.load(self.pc, 32)
+    fn branch(&mut self, offset: u64) -> Result<(), Exception> {
+        self.jump(self.pc.wrapping_add(offset))
+    }
+
+    /// Transfer control to `addr`, which has to be where an instruction can start.
+    /// Without compressed instructions that means a multiple of four.
+    #[inline]
+    fn jump(&mut self, addr: u64) -> Result<(), Exception> {
+        if addr & 0b11 != 0 {
+            return Err(Exception::InstructionAddressMisaligned(addr));
+        }
+        self.next_pc = addr;
+        Ok(())
+    }
+
+    #[inline]
+    fn fetch(&self) -> Result<u64, Exception> {
+        self.bus
+            .load(self.pc, 32)
+            .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 
     #[cfg_attr(
@@ -143,7 +216,7 @@ impl Cpu {
             fields(opcode, rd, rs1, rs2, funct3, funct7, imm, shamt, csr, csr_addr)
         )
     )]
-    fn execute(&mut self, inst: u64) -> Result<(), ()> {
+    fn execute(&mut self, inst: u64) -> Result<(), Exception> {
         let opcode = inst & 0x7f;
         let rd = ((inst >> 7) & 0x1f) as usize;
         let rs1 = ((inst >> 15) & 0x1f) as usize;
@@ -202,7 +275,7 @@ impl Cpu {
                         trace_insn!("LWU");
                         self.regs[rd] = self.bus.load(addr, 32)?;
                     }
-                    _ => Err(())?,
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 };
             }
             // store
@@ -229,7 +302,7 @@ impl Cpu {
                         trace_insn!("SD");
                         self.bus.store(addr, 64, self.regs[rs2])?
                     }
-                    _ => Err(())?,
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             // base imm
@@ -289,7 +362,7 @@ impl Cpu {
                         trace_insn!("SLTIU");
                         self.regs[rd] = (self.regs[rs1] < imm) as u64
                     }
-                    _ => Err(())?,
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             // base R
@@ -431,7 +504,7 @@ impl Cpu {
                             self.regs[rd] = self.regs[rs1].wrapping_rem(self.regs[rs2]);
                         }
                     }
-                    _ => Err(())?,
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             0x3b => {
@@ -503,10 +576,7 @@ impl Cpu {
                                 (self.regs[rs1] as u32).wrapping_rem(self.regs[rs2] as u32) as u64;
                         }
                     }
-                    _ => {
-                        error!("unimplemented instruction");
-                        unimplemented!("{:#09b} {:#03b} {:#03b}", inst, funct3, funct7)
-                    }
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             0x1b => {
@@ -537,10 +607,7 @@ impl Cpu {
                         trace_insn!("SRAIW");
                         self.regs[rd] = (self.regs[rs1] as i32).wrapping_shr(shamt) as i64 as u64;
                     }
-                    _ => {
-                        error!("unimplemented instruction");
-                        unimplemented!("{:#09b} {:#03b} {:#03b}", inst, funct3, funct7)
-                    }
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             0x63 => {
@@ -557,48 +624,45 @@ impl Cpu {
                         trace_insn!("BEQ");
 
                         if self.regs[rs1] == self.regs[rs2] {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                            self.branch(imm)?;
                         }
                     }
                     0x1 => {
                         trace_insn!("BNE");
 
                         if self.regs[rs1] != self.regs[rs2] {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                            self.branch(imm)?;
                         }
                     }
                     0x4 => {
                         trace_insn!("BLT");
 
                         if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                            self.branch(imm)?;
                         }
                     }
                     0x5 => {
                         trace_insn!("BGE");
 
                         if (self.regs[rs1] as i64) >= (self.regs[rs2] as i64) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                            self.branch(imm)?;
                         }
                     }
                     0x6 => {
                         trace_insn!("BLTU");
 
                         if self.regs[rs1] < self.regs[rs2] {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                            self.branch(imm)?;
                         }
                     }
                     0x7 => {
                         trace_insn!("BGEU");
 
                         if self.regs[rs1] >= self.regs[rs2] {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                            self.branch(imm)?;
                         }
                     }
-                    x => {
-                        error!("unimplemented instruction");
-                        unimplemented!("{:#09b} {:#03b}", x, funct3)
-                    }
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             0x37 => {
@@ -614,7 +678,7 @@ impl Cpu {
                 let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
                 trace_field!("imm", imm32);
                 trace_insn!("AUIPC");
-                self.regs[rd] = self.pc.wrapping_sub(4).wrapping_add(imm32);
+                self.regs[rd] = self.pc.wrapping_add(imm32);
             }
             0x6f => {
                 // JAL
@@ -625,8 +689,9 @@ impl Cpu {
                     | ((inst >> 20) & 0x7fe); // imm[10:1]
                 trace_field!("imm", imm);
                 trace_insn!("JAL");
-                self.regs[rd] = self.pc;
-                self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
+                let link = self.next_pc;
+                self.branch(imm)?;
+                self.regs[rd] = link;
             }
             0x67 => {
                 // JALR
@@ -636,16 +701,38 @@ impl Cpu {
                 // The target comes from rs1's value before the link is written, since
                 // rd and rs1 are commonly the same register.
                 let addr = self.regs[rs1].wrapping_add(imm) & !1;
-                self.regs[rd] = self.pc;
-                self.pc = addr;
+                let link = self.next_pc;
+                self.jump(addr)?;
+                self.regs[rd] = link;
                 trace_insn!("JALR");
             }
             0x73 => {
-                // csr
                 let csr_addr = ((inst & 0xfff00000) >> 20) as usize;
                 trace_field!("csr_addr", csr_addr);
                 let imm = rs1 as u64;
                 match funct3 {
+                    // funct3 of zero is not a csr access: the whole 12-bit immediate
+                    // selects a privileged instruction.
+                    0x0 => match csr_addr {
+                        0x000 => {
+                            trace_insn!("ECALL");
+                            return Err(Exception::EnvironmentCallFromMMode);
+                        }
+                        0x001 => {
+                            trace_insn!("EBREAK");
+                            return Err(Exception::Breakpoint(self.pc));
+                        }
+                        0x302 => {
+                            trace_insn!("MRET");
+                            self.trap_return();
+                        }
+                        0x105 => {
+                            // Nothing can raise an interrupt yet, so waiting for one
+                            // would never end. Retiring immediately is permitted.
+                            trace_insn!("WFI");
+                        }
+                        _ => return Err(Exception::IllegalInstruction(inst)),
+                    },
                     0x1 => {
                         // CSRRW
 
@@ -719,7 +806,7 @@ impl Cpu {
                             self.store_csr(csr_addr, csr & !imm);
                         }
                     }
-                    _ => Err(())?,
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
             0x2f => {
@@ -729,9 +816,12 @@ impl Cpu {
                 let size = match funct3 {
                     0b010 => 32,
                     0b011 => 64,
-                    _ => Err(())?,
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 };
                 let addr = self.regs[rs1];
+                if addr & (size / 8 - 1) != 0 {
+                    return Err(Exception::StoreAmoAddressMisaligned(addr));
+                }
 
                 match funct5 {
                     0b00010 => {
@@ -822,18 +912,10 @@ impl Cpu {
                             _ => data.max(src),
                         },
                     )?,
-                    _ => {
-                        error!("unimplemented atomic instruction");
-                        unimplemented!("{:#09b}", funct5)
-                    }
+                    _ => return Err(Exception::IllegalInstruction(inst)),
                 }
             }
-            0 => Err(())?,
-
-            x => {
-                error!("unimplemented instruction");
-                unimplemented!("{:#09b}", x)
-            }
+            _ => return Err(Exception::IllegalInstruction(inst)),
         }
 
         Ok(())

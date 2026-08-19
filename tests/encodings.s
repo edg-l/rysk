@@ -114,3 +114,8 @@ back:
   bgeu t1, t2, fwd
 fwd:
   addiw t0, t1, 1
+
+  ecall
+  ebreak
+  mret
+  wfi

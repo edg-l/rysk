@@ -3,7 +3,10 @@ use std::ops::Range;
 #[cfg(feature = "trace")]
 use tracing::instrument;
 
-use crate::dram::{DRAM_SIZE, Dram};
+use crate::{
+    dram::{DRAM_SIZE, Dram},
+    exception::Exception,
+};
 
 /// The address which dram starts, same as QEMU virt machine.
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -18,23 +21,28 @@ pub struct Bus {
 
 impl Bus {
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
-    pub fn load(&self, addr: u64, size: u64) -> Result<u64, ()> {
+    pub fn load(&self, addr: u64, size: u64) -> Result<u64, Exception> {
         trace_mem!("load");
-        self.check(addr, size)?;
-        self.dram.load(addr, size)
+        if !self.contains(addr, size) {
+            return Err(Exception::LoadAccessFault(addr));
+        }
+        Ok(self.dram.load(addr, size))
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
-    pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
+    pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
         trace_mem!("store");
-        self.check(addr, size)?;
+        if !self.contains(addr, size) {
+            return Err(Exception::StoreAmoAccessFault(addr));
+        }
         if let Some(reserved) = &self.reservation
             && addr < reserved.end
             && reserved.start < addr + size / 8
         {
             self.reservation = None;
         }
-        self.dram.store(addr, size, value)
+        self.dram.store(addr, size, value);
+        Ok(())
     }
 
     /// Reserve the bytes a load-reserved of `size` bits at `addr` reads.
@@ -52,12 +60,10 @@ impl Bus {
     }
 
     /// Whether `size` bits at `addr` fall inside dram.
-    fn check(&self, addr: u64, size: u64) -> Result<(), ()> {
-        let end = addr.checked_add(size / 8).ok_or(())?;
-        if DRAM_BASE <= addr && end <= DRAM_BASE + DRAM_SIZE {
-            Ok(())
-        } else {
-            Err(())
+    pub fn contains(&self, addr: u64, size: u64) -> bool {
+        match addr.checked_add(size / 8) {
+            Some(end) => DRAM_BASE <= addr && end <= DRAM_BASE + DRAM_SIZE,
+            None => false,
         }
     }
 }

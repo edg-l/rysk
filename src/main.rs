@@ -24,9 +24,10 @@ fn main() -> Result<(), std::io::Error> {
     file.read_to_end(&mut code)?;
 
     let mut cpu = Cpu::new(code);
-    cpu.run()?;
+    let stopped = cpu.run();
     cpu.dump_registers();
     cpu.dump_csr();
+    println!("stopped: {stopped} at pc {:#x}", cpu.pc);
 
     Ok(())
 }

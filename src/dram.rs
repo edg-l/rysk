@@ -16,36 +16,24 @@ impl Dram {
     }
 
     #[inline]
-    pub fn load(&self, addr: u64, size: u64) -> Result<u64, ()> {
+    pub fn load(&self, addr: u64, size: u64) -> u64 {
         match size {
-            8 => Ok(self.load8(addr)),
-            16 => Ok(self.load16(addr)),
-            32 => Ok(self.load32(addr)),
-            64 => Ok(self.load64(addr)),
-            _ => Err(()),
+            8 => self.load8(addr),
+            16 => self.load16(addr),
+            32 => self.load32(addr),
+            64 => self.load64(addr),
+            _ => unreachable!("load of {size} bits"),
         }
     }
 
     #[inline]
-    pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
+    pub fn store(&mut self, addr: u64, size: u64, value: u64) {
         match size {
-            8 => {
-                self.store8(addr, value);
-                Ok(())
-            }
-            16 => {
-                self.store16(addr, value);
-                Ok(())
-            }
-            32 => {
-                self.store32(addr, value);
-                Ok(())
-            }
-            64 => {
-                self.store64(addr, value);
-                Ok(())
-            }
-            _ => Err(()),
+            8 => self.store8(addr, value),
+            16 => self.store16(addr, value),
+            32 => self.store32(addr, value),
+            64 => self.store64(addr, value),
+            _ => unreachable!("store of {size} bits"),
         }
     }
 
