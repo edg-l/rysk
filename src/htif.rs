@@ -43,14 +43,13 @@ pub fn tohost(image: &Image) -> Option<u64> {
 /// longer than `max_steps`.
 pub fn run(cpu: &mut Cpu, tohost: u64, max_steps: u64) -> Outcome {
     for _ in 0..max_steps {
-        if let Err(exception) = cpu.step() {
-            if cpu.csrs[crate::csr::MTVEC] == 0 {
-                return Outcome::Trapped {
-                    exception,
-                    pc: cpu.pc,
-                };
-            }
-            cpu.take_trap(exception);
+        if let Err(exception) = cpu.step()
+            && !cpu.take_trap(exception)
+        {
+            return Outcome::Trapped {
+                exception,
+                pc: cpu.pc,
+            };
         }
 
         // The store lands through the bus like any other, so reading it back is how

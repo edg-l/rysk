@@ -33,8 +33,6 @@ test_files: $(PROGS) $(C_PROGS)
 	$(CC) -S $< -o $@
 
 # The official riscv-tests corpus, built with the same flags its own Makefile uses.
-# rysk implements the base integer set, multiply and atomics, so those are the groups
-# that can pass; rv64mi wants supervisor mode and interrupts.
 CACHE     ?= $(HOME)/.cache/rysk
 CORPUS    ?= $(CACHE)/isa
 CORPUS_SRC = $(CACHE)/riscv-tests
@@ -42,7 +40,12 @@ CORPUS_URL = https://github.com/riscv-software-src/riscv-tests
 # Pinned so a rebuild is reproducible and CI cannot change what it gates on without
 # the change showing up here.
 CORPUS_REV = 2ebecad997fa58cd9e5724340ba75aa4b59bd1d0
-GROUPS     = rv64ui rv64um rv64ua
+GROUPS     = rv64ui rv64um rv64ua rv64si rv64mi
+# The supervisor and machine groups define a handler that riscv_test.h has already
+# declared weak, and clang refuses to rebind a weak symbol to global where gcc allows
+# it. They are assembled from a copy with that declaration left weak; four of the
+# rv64mi tests include ../rv64si sources directly, so the copy keeps the tree shape.
+PATCHED    = $(CACHE)/patched
 
 .PHONY: corpus
 corpus: $(CORPUS)/.stamp
@@ -58,8 +61,16 @@ $(CORPUS_SRC):
 
 $(CORPUS)/.stamp: | $(CORPUS_SRC)
 	@mkdir -p $(CORPUS)
+	@rm -rf $(PATCHED)
 	@for group in $(GROUPS); do \
+	  mkdir -p $(PATCHED)/$$group; \
 	  for src in $(CORPUS_SRC)/isa/$$group/*.S; do \
+	    sed -E 's/\.global (m|s)tvec_handler/.weak \1tvec_handler/' \
+	      $$src > $(PATCHED)/$$group/$$(basename $$src); \
+	  done; \
+	done
+	@for group in $(GROUPS); do \
+	  for src in $(PATCHED)/$$group/*.S; do \
 	    name=$$(basename $$src .S); \
 	    $(CC) -mabi=lp64 -static -mcmodel=medany -fvisibility=hidden -nostdlib \
 	      -nostartfiles $(LDLINK) -I$(CORPUS_SRC)/env/p -I$(CORPUS_SRC)/isa/macros/scalar \

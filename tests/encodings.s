@@ -118,6 +118,7 @@ fwd:
   ecall
   ebreak
   mret
+  sret
   wfi
   fence
   fence.i

@@ -18,6 +18,19 @@ fn corpus() -> PathBuf {
     }
 }
 
+/// Tests that need something rysk does not have yet, and what each of them waits on.
+/// A test on this list is expected to fail; one that starts passing is reported, so the
+/// list can only shrink and cannot quietly go stale.
+const WAITING: &[(&str, &str)] = &[
+    ("rv64mi-p-breakpoint", "debug triggers"),
+    (
+        "rv64mi-p-illegal",
+        "an interrupt, and nothing can raise one yet",
+    ),
+    ("rv64si-p-dirty", "sv39, and the accessed and dirty bits"),
+    ("rv64si-p-icache-alias", "sv39"),
+];
+
 /// Run every test whose name starts with `group`, and report all of the failures
 /// rather than only the first.
 fn run_group(group: &str) {
@@ -54,9 +67,17 @@ fn run_group(group: &str) {
             .unwrap_or_else(|| panic!("{name} has no tohost symbol, so it cannot report"));
         let mut cpu = Cpu::from_elf(&image).unwrap_or_else(|e| panic!("{name}: {e}"));
 
-        match htif::run(&mut cpu, tohost, MAX_STEPS) {
-            htif::Outcome::Passed => {}
-            outcome => failures.push(format!("  {name}: {outcome}")),
+        let waiting = WAITING
+            .iter()
+            .find(|(test, _)| *test == name)
+            .map(|(_, on)| on);
+        match (htif::run(&mut cpu, tohost, MAX_STEPS), waiting) {
+            (htif::Outcome::Passed, None) => {}
+            (htif::Outcome::Passed, Some(on)) => failures.push(format!(
+                "  {name}: passes now, but is still listed as waiting on {on}"
+            )),
+            (outcome, None) => failures.push(format!("  {name}: {outcome}")),
+            (_, Some(_)) => {}
         }
     }
 
@@ -83,4 +104,14 @@ fn rv64um_multiply_and_divide() {
 #[test]
 fn rv64ua_atomics() {
     run_group("rv64ua-p-");
+}
+
+#[test]
+fn rv64si_supervisor_mode() {
+    run_group("rv64si-p-");
+}
+
+#[test]
+fn rv64mi_machine_mode() {
+    run_group("rv64mi-p-");
 }

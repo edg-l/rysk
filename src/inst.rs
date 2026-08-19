@@ -129,6 +129,7 @@ pub enum Op {
     Ecall,
     Ebreak,
     Mret,
+    Sret,
     Wfi,
     // atomics
     Lr { width: Width },
@@ -309,6 +310,7 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
                     0x000 => Op::Ecall,
                     0x001 => Op::Ebreak,
                     0x302 => Op::Mret,
+                    0x102 => Op::Sret,
                     0x105 => Op::Wfi,
                     _ => return Err(illegal),
                 },
@@ -430,6 +432,7 @@ impl fmt::Display for Inst {
             Op::Ecall => write!(f, "ecall"),
             Op::Ebreak => write!(f, "ebreak"),
             Op::Mret => write!(f, "mret"),
+            Op::Sret => write!(f, "sret"),
             Op::Wfi => write!(f, "wfi"),
             Op::Csrrw { immediate } | Op::Csrrs { immediate } | Op::Csrrc { immediate } => {
                 let name = match self.op {

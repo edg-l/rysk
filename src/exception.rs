@@ -1,5 +1,7 @@
 //! Synchronous exceptions, and the values they leave in `mcause` and `mtval`.
 
+use crate::csr::Mode;
+
 /// A synchronous exception, carrying the value the trap handler is owed in `mtval`:
 /// the faulting address for a fault, the instruction encoding for an illegal
 /// instruction, and nothing for an environment call.
@@ -15,7 +17,7 @@ pub enum Exception {
     LoadAccessFault(u64),
     StoreAmoAddressMisaligned(u64),
     StoreAmoAccessFault(u64),
-    EnvironmentCallFromMMode,
+    EnvironmentCall(Mode),
 }
 
 impl Exception {
@@ -30,7 +32,9 @@ impl Exception {
             Self::LoadAccessFault(_) => 5,
             Self::StoreAmoAddressMisaligned(_) => 6,
             Self::StoreAmoAccessFault(_) => 7,
-            Self::EnvironmentCallFromMMode => 11,
+            Self::EnvironmentCall(Mode::User) => 8,
+            Self::EnvironmentCall(Mode::Supervisor) => 9,
+            Self::EnvironmentCall(Mode::Machine) => 11,
         }
     }
 
@@ -45,7 +49,7 @@ impl Exception {
             | Self::LoadAccessFault(v)
             | Self::StoreAmoAddressMisaligned(v)
             | Self::StoreAmoAccessFault(v) => *v,
-            Self::EnvironmentCallFromMMode => 0,
+            Self::EnvironmentCall(_) => 0,
         }
     }
 }
@@ -61,10 +65,10 @@ impl std::fmt::Display for Exception {
             Self::LoadAccessFault(_) => "load access fault",
             Self::StoreAmoAddressMisaligned(_) => "store/amo address misaligned",
             Self::StoreAmoAccessFault(_) => "store/amo access fault",
-            Self::EnvironmentCallFromMMode => "environment call from m-mode",
+            Self::EnvironmentCall(_) => "environment call",
         };
         match self {
-            Self::EnvironmentCallFromMMode => write!(f, "{name}"),
+            Self::EnvironmentCall(mode) => write!(f, "{name} from {mode}"),
             Self::IllegalInstruction(v) => write!(f, "{name} {v:#010x}"),
             _ => write!(f, "{name} at {:#x}", self.value()),
         }

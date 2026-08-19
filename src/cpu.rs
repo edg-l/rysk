@@ -23,6 +23,8 @@ pub struct Cpu {
     /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
     /// space (csr[11:0]) for up to 4096 CSRs.
     pub csrs: [u64; 4096],
+    /// The privilege the hart is running at. A trap raises it, an `xRET` lowers it.
+    pub mode: Mode,
     pub start: Instant,
 }
 
@@ -37,20 +39,27 @@ impl Cpu {
                 reservation: None,
             },
             csrs: [0; 4096],
+            mode: Mode::Machine,
             start: Instant::now(),
         };
 
         cpu.regs[0] = 0;
         cpu.regs[2] = DRAM_BASE + DRAM_SIZE;
-        cpu.csrs[MISA] =
-            MISA_MXL_64 | misa_extension(b'i') | misa_extension(b'm') | misa_extension(b'a');
+        cpu.csrs[MISA] = MISA_MXL_64
+            | misa_extension(b'i')
+            | misa_extension(b'm')
+            | misa_extension(b'a')
+            | misa_extension(b's')
+            | misa_extension(b'u');
+        cpu.csrs[MSTATUS] = MSTATUS_XL_64;
 
         cpu
     }
 
     /// Run until a trap that nothing is installed to handle, and return it. With no
-    /// handler in `mtvec` there is nowhere for a trap to go, so that is where a program
-    /// ends: normally by running off its own code into the zeroed dram behind it.
+    /// handler in the vector the trap would use there is nowhere for it to go, so that
+    /// is where a program ends: normally by running off its own code into the zeroed
+    /// dram behind it.
     /// Place an image in memory and start at its entry point.
     pub fn from_elf(image: &Image) -> Result<Self, ElfError> {
         let mut cpu = Self::new(Vec::new());
@@ -70,11 +79,10 @@ impl Cpu {
 
     pub fn run(&mut self) -> Exception {
         loop {
-            if let Err(exception) = self.step() {
-                if self.csrs[MTVEC] == 0 {
-                    return exception;
-                }
-                self.take_trap(exception);
+            if let Err(exception) = self.step()
+                && !self.take_trap(exception)
+            {
+                return exception;
             }
         }
     }
@@ -82,57 +90,122 @@ impl Cpu {
     /// Fetch, decode and execute one instruction.
     #[inline]
     pub fn step(&mut self) -> Result<(), Exception> {
-        let inst = decode(self.fetch()?)?;
+        let word = self.fetch()?;
+        let inst = decode(word)?;
         trace_insn!("{:#x}  {inst}", self.pc);
 
         self.next_pc = self.pc.wrapping_add(4);
         self.csrs[RDCYCLE] += 1;
         self.csrs[INSTRET] += 1;
 
-        self.execute(inst)?;
+        self.execute(inst, word)?;
 
         self.regs[0] = 0;
         self.pc = self.next_pc;
         Ok(())
     }
 
-    /// Enter the machine-mode trap handler: record where and why, stack the
-    /// interrupt-enable bit, and jump through `mtvec`.
+    /// Enter a trap handler: record where and why, stack the interrupt-enable bit and
+    /// the mode it happened in, and jump through the handler's vector.
     ///
-    /// The RISC-V Instruction Set Manual Volume II, 3.1.6.1 and 3.1.7.
-    pub fn take_trap(&mut self, exception: Exception) {
+    /// A trap goes to supervisor mode when it happened no higher than there and
+    /// `medeleg` delegates its cause, and to machine mode otherwise; a trap never moves
+    /// to a mode less privileged than the one it happened in.
+    ///
+    /// Answers whether anything took it: a zero vector is no handler at all, and the
+    /// caller decides what to do with a trap that has nowhere to go.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.6.1, 3.1.7 and 3.1.8.
+    pub fn take_trap(&mut self, exception: Exception) -> bool {
+        let cause = exception.cause();
+        let delegated = self.mode <= Mode::Supervisor && (self.csrs[MEDELEG] >> cause) & 1 == 1;
+        let status = self.csrs[MSTATUS];
+        if self.csrs[if delegated { STVEC } else { MTVEC }] == 0 {
+            return false;
+        }
+
+        if delegated {
+            self.csrs[SEPC] = self.pc;
+            self.csrs[SCAUSE] = cause;
+            self.csrs[STVAL] = exception.value();
+
+            // SIE moves to SPIE and clears, and the mode we came from lands in SPP,
+            // which is one bit because a supervisor can only be entered from below.
+            let sie = (status >> MSTATUS_SIE) & 1;
+            self.csrs[MSTATUS] =
+                (status & !(1 << MSTATUS_SPIE) & !(1 << MSTATUS_SIE) & !(1 << MSTATUS_SPP))
+                    | (sie << MSTATUS_SPIE)
+                    | ((self.mode as u64) << MSTATUS_SPP);
+            self.mode = Mode::Supervisor;
+            self.pc = self.csrs[STVEC] & !0b11;
+            return true;
+        }
+
         self.csrs[MEPC] = self.pc;
-        self.csrs[MCAUSE] = exception.cause();
+        self.csrs[MCAUSE] = cause;
         self.csrs[MTVAL] = exception.value();
 
-        let status = self.csrs[MSTATUS];
+        // MIE moves to MPIE and clears, and the mode we came from lands in MPP.
         let mie = (status >> MSTATUS_MIE) & 1;
-        // MIE moves to MPIE and clears, and the mode we came from lands in MPP, which
-        // is always machine mode until there are other privilege levels.
-        let status = (status & !(1 << MSTATUS_MPIE) & !(1 << MSTATUS_MIE) & !MSTATUS_MPP)
+        self.csrs[MSTATUS] = (status & !(1 << MSTATUS_MPIE) & !(1 << MSTATUS_MIE) & !MSTATUS_MPP)
             | (mie << MSTATUS_MPIE)
-            | MSTATUS_MPP_M;
-        self.csrs[MSTATUS] = status;
+            | ((self.mode as u64) << MSTATUS_MPP_SHIFT);
+        self.mode = Mode::Machine;
 
         // Vectored mode only spreads interrupts out; exceptions always enter at the base.
         self.pc = self.csrs[MTVEC] & !0b11;
+        true
     }
 
-    /// Return from a machine-mode trap: unstack the interrupt-enable bit and resume at
-    /// `mepc`.
-    fn trap_return(&mut self) {
+    /// Return from a trap taken into `mode`: pop that mode's interrupt-enable and
+    /// privilege stack out of `mstatus` and resume at its `epc`. The popped `xPP`
+    /// becomes the least privileged mode there is, which makes a stack-management bug
+    /// in the handler visible rather than silent.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.6.1 and 3.3.2.
+    fn trap_return(&mut self, mode: Mode) {
         let status = self.csrs[MSTATUS];
-        let mpie = (status >> MSTATUS_MPIE) & 1;
-        self.csrs[MSTATUS] =
-            (status & !(1 << MSTATUS_MIE)) | (mpie << MSTATUS_MIE) | (1 << MSTATUS_MPIE);
-        self.next_pc = self.csrs[MEPC];
+        let (previous, epc) = match mode {
+            Mode::Machine => {
+                let previous = Mode::from_bits((status & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT);
+                let mpie = (status >> MSTATUS_MPIE) & 1;
+                self.csrs[MSTATUS] = (status & !(1 << MSTATUS_MIE) & !MSTATUS_MPP)
+                    | (mpie << MSTATUS_MIE)
+                    | (1 << MSTATUS_MPIE);
+                (previous, self.csrs[MEPC])
+            }
+            _ => {
+                let previous = Mode::from_bits((status >> MSTATUS_SPP) & 1);
+                let spie = (status >> MSTATUS_SPIE) & 1;
+                self.csrs[MSTATUS] = (status & !(1 << MSTATUS_SIE) & !(1 << MSTATUS_SPP))
+                    | (spie << MSTATUS_SIE)
+                    | (1 << MSTATUS_SPIE);
+                (previous, self.csrs[SEPC])
+            }
+        };
+        self.mode = previous;
+        self.next_pc = epc;
+    }
+
+    /// A CSR address carries its own access rules: bits 11:10 hold the encoding
+    /// read-only when both are set, and bits 9:8 name the lowest privilege that may
+    /// reach it. Neither is an encoding question, so unlike everything `decode`
+    /// refuses, this one can only be asked here.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 2.1.
+    fn check_csr(&self, addr: usize, word: u32, write: bool) -> Result<(), Exception> {
+        let least = ((addr >> 8) & 0b11) as u64;
+        if (write && addr >> 10 == 0b11) || (self.mode as u64) < least {
+            return Err(Exception::IllegalInstruction(word as u64));
+        }
+        Ok(())
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
     fn load_csr(&self, addr: usize) -> u64 {
         trace_insn!("loading csr");
-        if let Some((base, mask)) = alias(addr, self.csrs[MIDELEG]) {
-            return self.csrs[base] & mask;
+        if let Some((base, mask, readable)) = alias(addr, self.csrs[MIDELEG]) {
+            return self.csrs[base] & (mask | readable);
         }
         match addr {
             RDTIME => self.start.elapsed().as_secs(),
@@ -148,7 +221,7 @@ impl Cpu {
             return;
         }
         trace_insn!("storing csr");
-        if let Some((base, mask)) = alias(addr, self.csrs[MIDELEG]) {
+        if let Some((base, mask, _)) = alias(addr, self.csrs[MIDELEG]) {
             self.csrs[base] = (self.csrs[base] & !mask) | (value & mask);
             return;
         }
@@ -157,6 +230,7 @@ impl Cpu {
             // is read-only zero, and what it does hold is what sie and sip may reach.
             // The RISC-V Instruction Set Manual Volume II, 3.1.8.
             MIDELEG => self.csrs[MIDELEG] = value & S_INTERRUPTS,
+            MSTATUS => self.csrs[MSTATUS] = warl_mstatus(self.csrs[MSTATUS], value),
             _ => self.csrs[addr] = value,
         }
     }
@@ -187,7 +261,7 @@ impl Cpu {
     }
 
     /// Carry out one decoded instruction.
-    fn execute(&mut self, inst: Inst) -> Result<(), Exception> {
+    fn execute(&mut self, inst: Inst, word: u32) -> Result<(), Exception> {
         let Inst {
             op,
             rd,
@@ -316,6 +390,7 @@ impl Cpu {
             // names no source: x0 for the register forms, zero for the immediate ones.
             Op::Csrrw { immediate } => {
                 let source = if immediate { rs1 as u64 } else { a };
+                self.check_csr(imm as usize, word, true)?;
                 // With nowhere to put the result there is no read at all.
                 if rd != 0 {
                     self.regs[rd] = self.load_csr(imm as usize);
@@ -324,6 +399,9 @@ impl Cpu {
             }
             Op::Csrrs { immediate } | Op::Csrrc { immediate } => {
                 let source = if immediate { rs1 as u64 } else { a };
+                // Naming no bits to change is not a write, so a read-only csr is still
+                // readable this way.
+                self.check_csr(imm as usize, word, rs1 != 0)?;
                 let csr = self.load_csr(imm as usize);
                 // A source of x0, or of zero for the immediate forms, names no bits to
                 // change, and then the csr is not written at all.
@@ -338,9 +416,21 @@ impl Cpu {
             }
 
             // ---------------------------------------------------------- privileged
-            Op::Ecall => return Err(Exception::EnvironmentCallFromMMode),
+            Op::Ecall => return Err(Exception::EnvironmentCall(self.mode)),
             Op::Ebreak => return Err(Exception::Breakpoint(self.pc)),
-            Op::Mret => self.trap_return(),
+            // An xRET below the mode it returns from has no stack to pop.
+            // The RISC-V Instruction Set Manual Volume II, 3.3.2.
+            Op::Mret | Op::Sret => {
+                let mode = if op == Op::Mret {
+                    Mode::Machine
+                } else {
+                    Mode::Supervisor
+                };
+                if self.mode < mode {
+                    return Err(Exception::IllegalInstruction(word as u64));
+                }
+                self.trap_return(mode);
+            }
             // Nothing can raise an interrupt yet, so waiting for one would never end.
             // Retiring immediately is permitted.
             Op::Wfi => {}

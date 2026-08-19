@@ -7,5 +7,6 @@ mod encoding;
 mod integer;
 mod memory;
 mod muldiv;
+mod privilege;
 mod program;
 mod traps;

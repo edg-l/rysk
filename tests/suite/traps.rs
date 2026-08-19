@@ -1,5 +1,5 @@
 use crate::common::*;
-use rysk::{bus::DRAM_BASE, exception::Exception};
+use rysk::{bus::DRAM_BASE, csr::Mode, exception::Exception};
 
 // ------------------------------------------------------------------ traps
 
@@ -18,7 +18,7 @@ fn an_unknown_encoding_is_an_illegal_instruction() {
 
 #[test]
 fn ecall_and_ebreak_raise_rather_than_halt() {
-    prog(&[ecall()]).expect(Exception::EnvironmentCallFromMMode);
+    prog(&[ecall()]).expect(Exception::EnvironmentCall(Mode::Machine));
     prog(&[nop(), ebreak()]).expect(Exception::Breakpoint(DRAM_BASE + 4));
 }
 
@@ -158,7 +158,7 @@ fn an_exception_enters_at_the_base_even_when_mtvec_is_vectored() {
 fn a_trap_with_no_handler_installed_ends_the_run() {
     // mtvec is zero, so there is nowhere to deliver to and run() hands the trap back
     // rather than looping on a handler that does not exist.
-    let cpu = prog(&[ecall(), addi(A0, ZERO, 1)]).expect(Exception::EnvironmentCallFromMMode);
+    let cpu = prog(&[ecall(), addi(A0, ZERO, 1)]).expect(Exception::EnvironmentCall(Mode::Machine));
     assert_eq!(cpu.reg(A0), 0, "nothing after the trap ran");
     assert_eq!(
         cpu.pc, DRAM_BASE,

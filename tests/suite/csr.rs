@@ -1,7 +1,7 @@
 use crate::common::*;
 use rysk::csr::{
-    MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP, MSTATUS_MPP_M, MSTATUS_SIE, S_INTERRUPTS,
-    misa_extension,
+    MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE, MSTATUS_SXL,
+    MSTATUS_UXL, MSTATUS_XL_64, Mode, S_INTERRUPTS, misa_extension,
 };
 
 // ------------------------------------------------------------------ zicsr
@@ -164,12 +164,33 @@ fn sip_is_a_window_onto_mip_and_not_a_register_of_its_own() {
 #[test]
 fn sstatus_shows_the_supervisor_fields_of_mstatus_and_no_others() {
     let cpu = prog(&[csrrw(ZERO, MSTATUS, T0), csrrs(A0, SSTATUS, ZERO)])
-        .reg(T0, (1 << MSTATUS_SIE) | (1 << MSTATUS_MIE) | MSTATUS_MPP_M)
+        .reg(
+            T0,
+            (1 << MSTATUS_SIE) | (1 << MSTATUS_MIE) | ((Mode::Machine as u64) << MSTATUS_MPP_SHIFT),
+        )
         .run();
+    assert_ne!(cpu.reg(A0) & (1 << MSTATUS_SIE), 0, "sie shows through");
     assert_eq!(
-        cpu.reg(A0),
-        1 << MSTATUS_SIE,
+        cpu.reg(A0) & ((1 << MSTATUS_MIE) | MSTATUS_MPP),
+        0,
         "mie and mpp are machine state a supervisor cannot see"
+    );
+}
+
+#[test]
+fn the_register_width_a_supervisor_sees_is_sixty_four_and_it_cannot_change_it() {
+    let cpu = prog(&[
+        csrrw(ZERO, MSTATUS, ZERO),
+        csrrw(ZERO, SSTATUS, ZERO),
+        csrrs(A0, SSTATUS, ZERO),
+        csrrs(A1, MSTATUS, ZERO),
+    ])
+    .run();
+    assert_eq!(cpu.reg(A0) & MSTATUS_UXL, 2 << 32, "uxl reads as 64 bits");
+    assert_eq!(
+        cpu.reg(A1) & (MSTATUS_UXL | MSTATUS_SXL),
+        MSTATUS_XL_64,
+        "and so does sxl, through a write of zeroes to both registers"
     );
 }
 
@@ -180,7 +201,10 @@ fn writing_sstatus_leaves_the_machine_fields_of_mstatus_alone() {
         csrrw(ZERO, SSTATUS, T1),
         csrrs(A0, MSTATUS, ZERO),
     ])
-    .reg(T0, (1 << MSTATUS_MIE) | MSTATUS_MPP_M)
+    .reg(
+        T0,
+        (1 << MSTATUS_MIE) | ((Mode::Machine as u64) << MSTATUS_MPP_SHIFT),
+    )
     .reg(T1, !0)
     .run();
     assert_ne!(
@@ -188,7 +212,11 @@ fn writing_sstatus_leaves_the_machine_fields_of_mstatus_alone() {
         0,
         "mie survives a write of ones through sstatus"
     );
-    assert_eq!(cpu.reg(A0) & MSTATUS_MPP, MSTATUS_MPP_M, "and so does mpp");
+    assert_eq!(
+        cpu.reg(A0) & MSTATUS_MPP,
+        ((Mode::Machine as u64) << MSTATUS_MPP_SHIFT),
+        "and so does mpp"
+    );
     assert_ne!(
         cpu.reg(A0) & (1 << MSTATUS_SIE),
         0,

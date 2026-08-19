@@ -215,6 +215,10 @@ pub const fn mret() -> u32 {
     i(0x302, 0, 0x0, 0, 0x73)
 }
 
+pub const fn sret() -> u32 {
+    i(0x102, 0, 0x0, 0, 0x73)
+}
+
 pub const fn wfi() -> u32 {
     i(0x105, 0, 0x0, 0, 0x73)
 }
