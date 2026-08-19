@@ -529,35 +529,74 @@ impl Cpu {
     /// byte at a time. It is rare enough to be worth the branch and wrong enough to be
     /// worth handling. Only while translating: a device is entitled to see the access
     /// it was given rather than a row of byte-sized ones.
-    fn read(&mut self, va: u64, bits: u64) -> Result<u64, Exception> {
-        if Self::straddles(va, bits) && self.translating(Access::Load) {
+    /// The width is a constant rather than an argument because it decides what every
+    /// step below it does: whether the access can straddle a page at all, how wide the
+    /// load is, and how far to sign-extend it. As an argument each of those was a jump
+    /// table, three of them per access.
+    ///
+    /// Out of line because there are four of it: letting all four into the run loop
+    /// costs more in what it does to the scheduling there than the folded width saves.
+    #[inline(never)]
+    fn read<const BITS: u64>(&mut self, va: u64) -> Result<u64, Exception> {
+        if Self::straddles(va, BITS) && self.translating(Access::Load) {
             let mut value = 0;
-            for byte in 0..bits / 8 {
+            for byte in 0..BITS / 8 {
                 let pa = self.translate(va + byte, Access::Load)?;
                 value |= self.bus.load(pa, 8)? << (byte * 8);
             }
             return Ok(value);
         }
         let pa = self.translate(va, Access::Load)?;
-        self.bus.load(pa, bits)
+        self.bus.load(pa, BITS)
     }
 
-    /// Write `bits` at a virtual address, with the same care about page boundaries.
-    fn write(&mut self, va: u64, bits: u64, value: u64) -> Result<(), Exception> {
-        if Self::straddles(va, bits) && self.translating(Access::Store) {
+    /// Write `BITS` at a virtual address, with the same care about page boundaries and
+    /// for the same reasons out of line.
+    #[inline(never)]
+    fn write<const BITS: u64>(&mut self, va: u64, value: u64) -> Result<(), Exception> {
+        if Self::straddles(va, BITS) && self.translating(Access::Store) {
             // Both halves are translated before either is written, so an access that
             // faults part way through has not half happened.
-            for byte in 0..bits / 8 {
+            for byte in 0..BITS / 8 {
                 self.translate(va + byte, Access::Store)?;
             }
-            for byte in 0..bits / 8 {
+            for byte in 0..BITS / 8 {
                 let pa = self.translate(va + byte, Access::Store)?;
                 self.bus.store(pa, 8, value >> (byte * 8))?;
             }
             return Ok(());
         }
         let pa = self.translate(va, Access::Store)?;
-        self.bus.store(pa, bits, value)
+        self.bus.store(pa, BITS, value)
+    }
+
+    /// A load of `width` bits, widened the way the instruction asked for.
+    #[inline]
+    fn load_width(&mut self, va: u64, width: Width, signed: bool) -> Result<u64, Exception> {
+        let widen = |value, bits| {
+            if signed {
+                Self::sext(value, bits)
+            } else {
+                value
+            }
+        };
+        Ok(match width {
+            Width::Byte => widen(self.read::<8>(va)?, 8),
+            Width::Half => widen(self.read::<16>(va)?, 16),
+            Width::Word => widen(self.read::<32>(va)?, 32),
+            Width::Double => widen(self.read::<64>(va)?, 64),
+        })
+    }
+
+    /// A store of `width` bits.
+    #[inline]
+    fn store_width(&mut self, va: u64, width: Width, value: u64) -> Result<(), Exception> {
+        match width {
+            Width::Byte => self.write::<8>(va, value),
+            Width::Half => self.write::<16>(va, value),
+            Width::Word => self.write::<32>(va, value),
+            Width::Double => self.write::<64>(va, value),
+        }
     }
 
     /// Whether an access of `bits` at `va` reaches into the page after it.
@@ -655,14 +694,9 @@ impl Cpu {
 
             // ---------------------------------------------------------- memory
             Op::Load { width, signed } => {
-                let value = self.read(a.wrapping_add(imm), width.bits())?;
-                self.regs[rd] = if signed {
-                    Self::sext(value, width.bits())
-                } else {
-                    value
-                };
+                self.regs[rd] = self.load_width(a.wrapping_add(imm), width, signed)?;
             }
-            Op::Store { width } => self.write(a.wrapping_add(imm), width.bits(), b)?,
+            Op::Store { width } => self.store_width(a.wrapping_add(imm), width, b)?,
 
             // ---------------------------------------------------------- control
             Op::Lui => self.regs[rd] = imm,
@@ -802,13 +836,23 @@ impl Cpu {
 
             Op::FpLoad { double } => {
                 let format = if double { F64 } else { F32 };
-                let value = self.read(a.wrapping_add(imm), format.bits as u64)?;
+                let va = a.wrapping_add(imm);
+                let value = if double {
+                    self.read::<64>(va)?
+                } else {
+                    self.read::<32>(va)?
+                };
                 self.write_fp(rd, format, value);
             }
             Op::FpStore { double } => {
                 let format = if double { F64 } else { F32 };
                 let value = self.read_fp_raw(rs2, format);
-                self.write(a.wrapping_add(imm), format.bits as u64, value)?;
+                let va = a.wrapping_add(imm);
+                if double {
+                    self.write::<64>(va, value)?;
+                } else {
+                    self.write::<32>(va, value)?;
+                }
             }
 
             Op::FpFused {
