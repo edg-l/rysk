@@ -97,9 +97,58 @@ pub const S_INTERRUPTS: u64 = SSIP | STIP | SEIP;
 /// device: moving a deadline, or completing a claim.
 /// The RISC-V Instruction Set Manual Volume II, 3.1.9.
 pub const MIP_DEVICE: u64 = MSIP | MTIP | SEIP | MEIP;
-pub const RDCYCLE: usize = 0xC00;
-pub const RDTIME: usize = 0xC01;
+/// The counters as machine mode sees them, which is where they actually live.
+pub const MCOUNTINHIBIT: usize = 0x320;
+pub const MCYCLE: usize = 0xB00;
+pub const MINSTRET: usize = 0xB02;
+/// The upper halves. A 32-bit machine needs them to reach a 64-bit counter at all; a
+/// 64-bit one does not, and the manual says so. They are here because the corpus
+/// checks that a counter wraps at sixty-four bits rather than at thirty-two, which it
+/// does by filling both halves and retiring one more instruction, and that is not a
+/// question it can ask without them.
+pub const MCYCLEH: usize = 0xB80;
+pub const MINSTRETH: usize = 0xB82;
+/// And as everything else does: read-only windows onto the same three counters.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.10 and 11.
+pub const CYCLE: usize = 0xC00;
+pub const TIME: usize = 0xC01;
 pub const INSTRET: usize = 0xC02;
+
+pub const MSCRATCH: usize = 0x340;
+pub const MCOUNTEREN: usize = 0x306;
+pub const MENVCFG: usize = 0x30A;
+pub const SCOUNTEREN: usize = 0x106;
+pub const SENVCFG: usize = 0x10A;
+
+/// The CSRs this machine has. Everything else raises an illegal instruction rather
+/// than reading as zero, because that is how software finds out what it is running on:
+/// it writes a register and sees whether the machine objects.
+///
+/// Being wrong in the permissive direction is not harmless. Firmware probing a flat
+/// array concludes the machine implements every extension there is and then uses one:
+/// OpenSBI reported `Sstc`, `Smaia` and `Sdtrig` on a machine that has none of them,
+/// which would have had it hand the timer to a `stimecmp` that does nothing.
+pub fn exists(addr: usize) -> bool {
+    match addr {
+        // Machine information, all read-only and all zero here: no vendor, no
+        // architecture, no implementation, one hart, and no configuration structure.
+        0xf11..=0xf15 => true,
+        MSTATUS | MISA | MEDELEG | MIDELEG | MIE | MTVEC | MCOUNTEREN | MENVCFG => true,
+        MSCRATCH | MEPC | MCAUSE | MTVAL | MIP => true,
+        MCOUNTINHIBIT | MCYCLE | MINSTRET | MCYCLEH | MINSTRETH => true,
+        // Physical memory protection. rysk keeps the registers and enforces nothing,
+        // so firmware configures a protection it does not get; the alternative is
+        // reporting none, which is a different lie and breaks the corpus test that
+        // measures the granularity. Only the even-numbered configuration registers
+        // exist on a 64-bit machine.
+        0x3a0..=0x3af if addr.is_multiple_of(2) => true,
+        0x3b0..=0x3ef => true,
+        SSTATUS | SIE | STVEC | SCOUNTEREN | SENVCFG => true,
+        SSCRATCH | SEPC | SCAUSE | STVAL | SIP | SATP => true,
+        CYCLE | TIME | INSTRET => true,
+        _ => false,
+    }
+}
 
 /// The supervisor CSRs that are a view of a machine one, as the register that backs
 /// them, the bits a write may change, and the further bits a read may see. Reading or

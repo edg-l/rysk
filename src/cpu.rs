@@ -5,7 +5,8 @@ use tracing::instrument;
 
 use crate::{
     bus::{Bus, DRAM_BASE},
-    csr::*,
+    clint,
+    csr::{self, *},
     dram::{DRAM_SIZE, Dram},
     elf::{Error as ElfError, Image},
     inst::{self, AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
@@ -148,10 +149,27 @@ impl Cpu {
         trace_insn!("{:#x}  {inst}", self.pc);
 
         self.next_pc = self.pc.wrapping_add(inst::length(encoding as u16));
-        self.csrs[RDCYCLE] += 1;
-        self.csrs[INSTRET] += 1;
+        // Each counter runs unless `mcountinhibit` says to hold it still.
+        // The RISC-V Instruction Set Manual Volume II, 3.1.12.
+        let inhibit = self.csrs[MCOUNTINHIBIT];
+        if inhibit & 1 == 0 {
+            self.csrs[MCYCLE] = self.csrs[MCYCLE].wrapping_add(1);
+        }
+        // An instruction that names the retired-instruction counter has said what it
+        // should hold, so it does not also count itself.
+        let wrote_instret = matches!(
+            inst.op,
+            Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
+        ) && matches!(inst.imm as usize, MINSTRET | MINSTRETH);
 
         self.execute(inst, encoding)?;
+
+        // Counted here rather than before executing, because this is where it retires:
+        // one that trapped did not, and `ecall` and `ebreak` are specified as never
+        // retiring at all. The RISC-V Instruction Set Manual Volume II, 3.3.1.
+        if inhibit & 0b100 == 0 && !wrote_instret {
+            self.csrs[MINSTRET] = self.csrs[MINSTRET].wrapping_add(1);
+        }
 
         self.regs[0] = 0;
         self.pc = self.next_pc;
@@ -260,7 +278,8 @@ impl Cpu {
     /// The RISC-V Instruction Set Manual Volume II, 2.1.
     fn check_csr(&self, addr: usize, word: u32, write: bool) -> Result<(), Exception> {
         let least = ((addr >> 8) & 0b11) as u64;
-        if (write && addr >> 10 == 0b11)
+        if !csr::exists(addr)
+            || (write && addr >> 10 == 0b11)
             || (self.mode as u64) < least
             // satp is the one CSR whose address does not say everything: a machine
             // that has set TVM wants to be told before a supervisor changes the page
@@ -290,7 +309,16 @@ impl Cpu {
             return self.csrs[base] & (mask | readable);
         }
         match addr {
-            RDTIME => self.start.elapsed().as_secs(),
+            // The three unprivileged counters are read-only windows onto the machine's
+            // own, not registers of their own.
+            // The RISC-V Instruction Set Manual Volume II, 11.
+            CYCLE => self.csrs[MCYCLE],
+            INSTRET => self.csrs[MINSTRET],
+            MCYCLEH => self.csrs[MCYCLE] >> 32,
+            MINSTRETH => self.csrs[MINSTRET] >> 32,
+            // `time` is defined to be the same counter the timer compares against, and
+            // on this machine that counter lives in the clint.
+            TIME => self.bus.load(clint::BASE + clint::MTIME, 64).unwrap_or(0),
             _ => self.csrs[addr],
         }
     }
@@ -318,6 +346,8 @@ impl Cpu {
             // two-byte target legal.
             // The RISC-V Instruction Set Manual Volume II, 3.1.14.
             MEPC | SEPC => self.csrs[addr] = value & !1,
+            MCYCLEH => self.csrs[MCYCLE] = (self.csrs[MCYCLE] & 0xffff_ffff) | (value << 32),
+            MINSTRETH => self.csrs[MINSTRET] = (self.csrs[MINSTRET] & 0xffff_ffff) | (value << 32),
             // satp's mode is WARL over the schemes the machine has, which is how
             // software finds out which those are: it writes one and reads it back.
             // rysk has bare and Sv39. The RISC-V Instruction Set Manual Volume II,

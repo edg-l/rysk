@@ -25,7 +25,9 @@ pub const FREQUENCY: u64 = 10_000_000;
 
 const MSIP0: u64 = 0x0000;
 const MTIMECMP0: u64 = 0x4000;
-const MTIME: u64 = 0xbff8;
+/// Where the counter is, which the `time` CSR has to agree with: they are the same
+/// counter seen two ways.
+pub const MTIME: u64 = 0xbff8;
 
 #[derive(Debug)]
 pub struct Clint {
