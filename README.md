@@ -1,6 +1,6 @@
 <div align="center">
 
-# Rysk
+<img src="docs/logo.svg" alt="Rysk" width="380">
 
 **A RISC-V emulator, written in Rust.**
 
