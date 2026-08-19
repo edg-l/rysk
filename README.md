@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/logo.svg" alt="Rysk" width="380">
+<img src="docs/logo.svg" alt="rysk" width="340">
 
 **A RISC-V emulator, written in Rust.**
 
