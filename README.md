@@ -35,9 +35,11 @@ privilege modes: everything runs as if in machine mode with translation off.
 | **Zicntr** | `cycle` and `instret`, counted per instruction; `time` from the host clock |
 | **Zicond** | `czero.eqz`, `czero.nez` |
 
-Execution stops when `pc` reaches zero, when a fetch falls below `DRAM_BASE`, or
-on `ecall`/`ebreak`. Nothing traps: no handler runs, no cause is recorded, and
-the program simply ends.
+`ecall`, `ebreak`, an illegal instruction, an access outside dram and a
+misaligned jump or atomic all raise: rysk records `mepc`, `mcause` and `mtval`,
+stacks the interrupt-enable bit and enters the handler in `mtvec`, and `mret`
+comes back. With no handler installed there is nowhere to deliver, so that is
+where a program ends, and `run` hands the trap back saying why.
 
 ## Quick start
 
@@ -89,16 +91,22 @@ emits.
 
 ```
 src/
-  cpu.rs      the emulator: fetch, decode, execute, and the CSR file
-  bus.rs      address decode, and the LR/SC reservation table
-  dram.rs     128 MiB of RAM behind sized load and store helpers
-  main.rs     argv, tracing, run, dump
-tests/        .s and .c fixtures, their assembled .bin, and the rstest suite
+  inst.rs      decoding: a word becomes an Op and its operands, and prints itself
+  cpu.rs       the machine: registers, the run loop, traps, and execute
+  csr.rs       control and status register numbers, and the mstatus layout
+  exception.rs the causes a trap can have, and what each owes mtval
+  bus.rs       address decode, and the LR/SC reservation
+  dram.rs      128 MiB of RAM behind sized load and store helpers
+  main.rs      argv, tracing, run, dump
+tests/
+  isa.rs       the suite, one test binary
+  suite/       its chapters, by extension
+  common/      an assembler and a harness to run what it emits
 ```
 
-`cpu.rs` is the whole machine. `Cpu::execute` is one match on the opcode,
-nested on `funct3` and `funct7` from there, in the order the encoding tables in
-the manual list them.
+Decoding is separate from execution, so `Op` is a small enum an interpreter can
+dispatch on and `Inst` knows how to print itself. That is where the disassembly
+in a trace comes from.
 
 ## Status
 
@@ -106,9 +114,9 @@ Working, and not finished. What is missing, roughly in the order it matters:
 
 | | |
 |---|---|
-| **Traps** | no `mret`, no trap vector, no cause codes. `ecall` halts instead of trapping |
+| **Interrupts** | traps work, but nothing can raise one asynchronously yet, so `wfi` retires immediately and `mie`/`mip` go unread |
 | **Zacas** | `amocas.w/d/q` is the next extension in |
-| **Zifencei, `fence`** | unimplemented, and an unknown opcode panics rather than raising an illegal-instruction exception |
+| **Zifencei, `fence`** | unimplemented, so both are illegal instructions |
 | **Privilege modes** | machine mode is assumed, never enforced. The CSR file has no WARL or access checks |
 | **Devices** | no CLINT, no PLIC, no UART. The bus decodes DRAM and nothing else |
 | **Compliance** | tested by a handful of hand-written programs, not by `riscv-tests` |

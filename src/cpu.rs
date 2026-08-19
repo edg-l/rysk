@@ -1,15 +1,14 @@
-use std::{
-    ops::{BitAnd, BitOr, BitXor},
-    time::Instant,
-};
+use std::time::Instant;
 
 #[cfg(feature = "trace")]
 use tracing::instrument;
 
 use crate::{
     bus::{Bus, DRAM_BASE},
+    csr::*,
     dram::{DRAM_SIZE, Dram},
     exception::Exception,
+    inst::{AmoOp, Cond, Inst, Op, Width, decode},
 };
 
 #[derive(Debug, Clone)]
@@ -25,29 +24,6 @@ pub struct Cpu {
     pub csrs: [u64; 4096],
     pub start: Instant,
 }
-
-pub const MSTATUS: usize = 0x300;
-/// Bit positions in `mstatus`: the machine interrupt-enable bit, the value it had
-/// before the current trap, and the two-bit field holding the mode the trap came from.
-/// The RISC-V Instruction Set Manual Volume II, 3.1.6.
-pub const MSTATUS_MIE: u64 = 3;
-pub const MSTATUS_MPIE: u64 = 7;
-pub const MSTATUS_MPP: u64 = 0b11 << 11;
-/// Machine mode in the two-bit `MPP` encoding.
-pub const MSTATUS_MPP_M: u64 = 0b11 << 11;
-pub const MTVEC: usize = 0x305;
-pub const MEPC: usize = 0x341;
-pub const MCAUSE: usize = 0x342;
-pub const MTVAL: usize = 0x343;
-pub const MIP: usize = 0x344;
-pub const MIE: usize = 0x304;
-pub const SIP: usize = 0x144;
-pub const SIE: usize = 0x104;
-pub const MEDELEG: usize = 0x302;
-pub const MIDELEG: usize = 0x303;
-pub const RDCYCLE: usize = 0xC00;
-pub const RDTIME: usize = 0xC01;
-pub const INSTRET: usize = 0xC02;
 
 impl Cpu {
     pub fn new(code: Vec<u8>) -> Self {
@@ -86,7 +62,8 @@ impl Cpu {
     /// Fetch, decode and execute one instruction.
     #[inline]
     pub fn step(&mut self) -> Result<(), Exception> {
-        let inst = self.fetch()?;
+        let inst = decode(self.fetch()?)?;
+        trace_insn!("{:#x}  {inst}", self.pc);
 
         self.next_pc = self.pc.wrapping_add(4);
         self.csrs[RDCYCLE] += 1;
@@ -153,38 +130,6 @@ impl Cpu {
         }
     }
 
-    /// Widen a value loaded from memory to the full register, sign-extending anything
-    /// narrower than XLEN.
-    #[inline]
-    fn sext(&self, value: u64, size: u64) -> u64 {
-        match size {
-            8 => value as i8 as i64 as u64,
-            16 => value as i16 as i64 as u64,
-            32 => value as i32 as i64 as u64,
-            _ => value,
-        }
-    }
-
-    /// Load `size` bits at `addr`, store `op` applied to the loaded value and rs2 back
-    /// over them, and leave the loaded value in rd.
-    #[cfg_attr(not(feature = "trace"), allow(unused_variables))]
-    fn amo(
-        &mut self,
-        rd: usize,
-        addr: u64,
-        src: u64,
-        size: u64,
-        name: &str,
-        op: impl Fn(u64, u64) -> u64,
-    ) -> Result<(), Exception> {
-        trace_insn!("{name}");
-        let data = self.bus.load(addr, size)?;
-        let value = op(data, src);
-        self.bus.store(addr, size, value)?;
-        self.regs[rd] = self.sext(data, size);
-        Ok(())
-    }
-
     /// Take a branch or jump relative to the instruction being executed.
     #[inline]
     fn branch(&mut self, offset: u64) -> Result<(), Exception> {
@@ -203,722 +148,266 @@ impl Cpu {
     }
 
     #[inline]
-    fn fetch(&self) -> Result<u64, Exception> {
+    fn fetch(&self) -> Result<u32, Exception> {
         self.bus
             .load(self.pc, 32)
+            .map(|word| word as u32)
             .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 
-    #[cfg_attr(
-        feature = "trace",
-        instrument(
-            skip(self),
-            fields(opcode, rd, rs1, rs2, funct3, funct7, imm, shamt, csr, csr_addr)
-        )
-    )]
-    fn execute(&mut self, inst: u64) -> Result<(), Exception> {
-        let opcode = inst & 0x7f;
-        let rd = ((inst >> 7) & 0x1f) as usize;
-        let rs1 = ((inst >> 15) & 0x1f) as usize;
-        let rs2 = ((inst >> 20) & 0x1f) as usize;
-        let funct3 = (inst >> 12) & 0x7;
-        let funct7 = (inst >> 25) & 0x7f;
+    /// Carry out one decoded instruction.
+    fn execute(&mut self, inst: Inst) -> Result<(), Exception> {
+        let Inst {
+            op,
+            rd,
+            rs1,
+            rs2,
+            imm,
+        } = inst;
+        let (a, b) = (self.regs[rs1], self.regs[rs2]);
 
-        trace_field!("opcode", opcode);
-        trace_field!("rd", rd);
-        trace_field!("rs1", rs1);
-        trace_field!("rs2", rs2);
-        trace_field!("funct3", funct3);
-        trace_field!("funct7", funct7);
+        match op {
+            // ---------------------------------------------------------- integer
+            Op::Addi => self.regs[rd] = a.wrapping_add(imm),
+            Op::Slti => self.regs[rd] = ((a as i64) < imm as i64) as u64,
+            Op::Sltiu => self.regs[rd] = (a < imm) as u64,
+            Op::Xori => self.regs[rd] = a ^ imm,
+            Op::Ori => self.regs[rd] = a | imm,
+            Op::Andi => self.regs[rd] = a & imm,
+            Op::Slli => self.regs[rd] = a << imm,
+            Op::Srli => self.regs[rd] = a >> imm,
+            Op::Srai => self.regs[rd] = ((a as i64) >> imm) as u64,
 
-        match opcode {
-            // load
-            0x03 => {
-                // imm[11:0] = inst[31:20]
-                let imm = ((inst as i32 as i64) >> 20) as u64;
-                trace_field!("imm", imm);
-                let addr = self.regs[rs1].wrapping_add(imm);
+            Op::Add => self.regs[rd] = a.wrapping_add(b),
+            Op::Sub => self.regs[rd] = a.wrapping_sub(b),
+            Op::Sll => self.regs[rd] = a << (b & 0x3f),
+            Op::Slt => self.regs[rd] = ((a as i64) < b as i64) as u64,
+            Op::Sltu => self.regs[rd] = (a < b) as u64,
+            Op::Xor => self.regs[rd] = a ^ b,
+            Op::Srl => self.regs[rd] = a >> (b & 0x3f),
+            Op::Sra => self.regs[rd] = ((a as i64) >> (b & 0x3f)) as u64,
+            Op::Or => self.regs[rd] = a | b,
+            Op::And => self.regs[rd] = a & b,
 
-                match funct3 {
-                    0x0 => {
-                        // lb
-                        trace_insn!("LB");
-                        self.regs[rd] = self.bus.load(addr, 8)? as i8 as i64 as u64;
-                    }
-                    0x1 => {
-                        // lh
-                        trace_insn!("LH");
-                        self.regs[rd] = self.bus.load(addr, 16)? as i16 as i64 as u64;
-                    }
-                    0x2 => {
-                        // lw
-                        trace_insn!("LW");
-                        self.regs[rd] = self.bus.load(addr, 32)? as i32 as i64 as u64;
-                    }
-                    0x3 => {
-                        // ld
-                        trace_insn!("LD");
-                        self.regs[rd] = self.bus.load(addr, 64)? as i64 as u64;
-                    }
-                    0x4 => {
-                        // lbu
-                        trace_insn!("LBU");
-                        self.regs[rd] = self.bus.load(addr, 8)?;
-                    }
-                    0x5 => {
-                        // lhu
-                        trace_insn!("LHU");
-                        self.regs[rd] = self.bus.load(addr, 16)?;
-                    }
-                    0x6 => {
-                        // lwu
-                        trace_insn!("LWU");
-                        self.regs[rd] = self.bus.load(addr, 32)?;
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
+            // ---------------------------------------------------------- word forms
+            // Every result is sign-extended from bit 31 into the full register.
+            Op::Addiw => self.regs[rd] = a.wrapping_add(imm) as i32 as i64 as u64,
+            Op::Slliw => self.regs[rd] = ((a as u32) << imm) as i32 as i64 as u64,
+            Op::Srliw => self.regs[rd] = ((a as u32) >> imm) as i32 as i64 as u64,
+            Op::Sraiw => self.regs[rd] = ((a as i32) >> imm) as i64 as u64,
+
+            Op::Addw => self.regs[rd] = a.wrapping_add(b) as i32 as i64 as u64,
+            Op::Subw => self.regs[rd] = a.wrapping_sub(b) as i32 as i64 as u64,
+            Op::Sllw => self.regs[rd] = ((a as u32) << (b & 0x1f)) as i32 as i64 as u64,
+            Op::Srlw => self.regs[rd] = ((a as u32) >> (b & 0x1f)) as i32 as i64 as u64,
+            Op::Sraw => self.regs[rd] = ((a as i32) >> (b & 0x1f)) as i64 as u64,
+
+            // ---------------------------------------------------------- multiply
+            Op::Mul => self.regs[rd] = a.wrapping_mul(b),
+            Op::Mulh => {
+                self.regs[rd] = ((a as i64 as i128).wrapping_mul(b as i64 as i128) >> 64) as u64
+            }
+            Op::Mulhsu => {
+                self.regs[rd] = ((a as i64 as i128).wrapping_mul(b as u128 as i128) >> 64) as u64
+            }
+            Op::Mulhu => self.regs[rd] = ((a as u128).wrapping_mul(b as u128) >> 64) as u64,
+            Op::Mulw => self.regs[rd] = (a as i32).wrapping_mul(b as i32) as i64 as u64,
+
+            // The quotient of a division by zero has all bits set and its remainder is
+            // the dividend; signed overflow returns the dividend and no remainder.
+            // The RISC-V Instruction Set Manual Volume I, 12.2, table 11.
+            Op::Div => self.regs[rd] = Self::div(a as i64, b as i64) as u64,
+            Op::Rem => self.regs[rd] = Self::rem(a as i64, b as i64) as u64,
+            Op::Divu => self.regs[rd] = a.checked_div(b).unwrap_or(u64::MAX),
+            Op::Remu => self.regs[rd] = a.checked_rem(b).unwrap_or(a),
+            Op::Divw => {
+                self.regs[rd] = Self::div(a as i32 as i64, b as i32 as i64) as i32 as i64 as u64
+            }
+            Op::Remw => {
+                self.regs[rd] = Self::rem(a as i32 as i64, b as i32 as i64) as i32 as i64 as u64
+            }
+            Op::Divuw => {
+                let (a, b) = (a as u32, b as u32);
+                self.regs[rd] = a.checked_div(b).unwrap_or(u32::MAX) as i32 as i64 as u64
+            }
+            Op::Remuw => {
+                let (a, b) = (a as u32, b as u32);
+                self.regs[rd] = a.checked_rem(b).unwrap_or(a) as i32 as i64 as u64
+            }
+
+            // ---------------------------------------------------------- zicond
+            Op::CzeroEqz => self.regs[rd] = if b == 0 { 0 } else { a },
+            Op::CzeroNez => self.regs[rd] = if b != 0 { 0 } else { a },
+
+            // ---------------------------------------------------------- memory
+            Op::Load { width, signed } => {
+                let value = self.bus.load(a.wrapping_add(imm), width.bits())?;
+                self.regs[rd] = if signed {
+                    Self::sext(value, width.bits())
+                } else {
+                    value
                 };
             }
-            // store
-            0x23 => {
-                // imm[11:5|4:0] = inst[31:25|11:7]
-                let imm = (((inst & 0xfe000000) as i32 as i64 >> 20) as u64) | ((inst >> 7) & 0x1f);
-                trace_field!("imm", imm);
-                let addr = self.regs[rs1].wrapping_add(imm);
+            Op::Store { width } => self.bus.store(a.wrapping_add(imm), width.bits(), b)?,
 
-                match funct3 {
-                    0x0 => {
-                        trace_insn!("SB");
-                        self.bus.store(addr, 8, self.regs[rs2])?
-                    }
-                    0x1 => {
-                        trace_insn!("SH");
-                        self.bus.store(addr, 16, self.regs[rs2])?
-                    }
-                    0x2 => {
-                        trace_insn!("SW");
-                        self.bus.store(addr, 32, self.regs[rs2])?
-                    }
-                    0x3 => {
-                        trace_insn!("SD");
-                        self.bus.store(addr, 64, self.regs[rs2])?
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            // base imm
-            0x13 => {
-                let imm = ((inst & 0xfff00000) as i32 as i64 >> 20) as u64;
-                trace_field!("imm", imm);
-
-                // "The shift amount is encoded in the lower 6 bits of the I-immediate field for RV64I."
-                let shamt = (imm & 0x3f) as u32;
-                trace_field!("shamt", shamt);
-
-                // The immediate shifts take the top six bits of the I-immediate as funct6,
-                // since the sixth shift-amount bit occupies funct7's low bit.
-                match (funct3, funct7 >> 1) {
-                    (0x0, _) => {
-                        // addi
-                        trace_insn!("ADDI");
-                        self.regs[rd] = self.regs[rs1].wrapping_add(imm);
-                    }
-                    (0x4, _) => {
-                        // xori
-                        trace_insn!("XORI");
-                        self.regs[rd] = self.regs[rs1].bitxor(imm);
-                    }
-                    (0x6, _) => {
-                        // ori
-                        trace_insn!("ORI");
-                        self.regs[rd] = self.regs[rs1].bitor(imm);
-                    }
-                    (0x7, _) => {
-                        // andi
-                        trace_insn!("ANDI");
-                        self.regs[rd] = self.regs[rs1].bitand(imm);
-                    }
-                    (0x1, 0x00) => {
-                        // slli
-                        trace_insn!("SLLI");
-                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
-                    }
-                    (0x5, 0x00) => {
-                        // srli
-                        trace_insn!("SRLI");
-                        self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
-                    }
-                    (0x5, 0x10) => {
-                        // srai
-                        trace_insn!("SRAI");
-                        self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
-                    }
-                    (0x2, _) => {
-                        // slti
-                        trace_insn!("SLTI");
-                        self.regs[rd] = ((self.regs[rs1] as i64) < (imm as i64)) as u64
-                    }
-                    (0x3, _) => {
-                        // sltiu
-                        trace_insn!("SLTIU");
-                        self.regs[rd] = (self.regs[rs1] < imm) as u64
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            // base R
-            0x33 => {
-                // In RV64I, only the low 6 bits of rs2 are considered for the shift amount."
-                let shamt = (self.regs[rs2] & 0x3f) as u32;
-                trace_field!("shamt", shamt);
-
-                match (funct3, funct7) {
-                    (0x0, 0x0) => {
-                        // add
-                        trace_insn!("ADD");
-                        self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
-                    }
-                    (0x0, 0x20) => {
-                        // sub
-                        trace_insn!("SUB");
-                        self.regs[rd] = self.regs[rs1].wrapping_sub(self.regs[rs2]);
-                    }
-                    (0x4, 0x0) => {
-                        // xor
-                        trace_insn!("XOR");
-                        self.regs[rd] = self.regs[rs1].bitxor(self.regs[rs2]);
-                    }
-                    (0x6, 0x0) => {
-                        // and
-                        trace_insn!("OR");
-                        self.regs[rd] = self.regs[rs1].bitor(self.regs[rs2]);
-                    }
-                    (0x7, 0x0) => {
-                        // and
-                        trace_insn!("AND");
-                        self.regs[rd] = self.regs[rs1].bitand(self.regs[rs2]);
-                    }
-                    (0x1, 0x0) => {
-                        // sll logical
-                        trace_insn!("SLL");
-                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
-                    }
-                    (0x5, 0x0) => {
-                        // srl logical
-                        trace_insn!("SRL");
-                        self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
-                    }
-                    (0x5, 0x20) => {
-                        // sra
-                        trace_insn!("SRA");
-                        self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
-                    }
-                    (0x2, 0x0) => {
-                        // slt
-                        trace_insn!("SLT");
-                        self.regs[rd] = ((self.regs[rs1] as i64) < (self.regs[rs2] as i64)) as u64
-                    }
-                    (0x3, 0x0) => {
-                        // sltu
-                        trace_insn!("SLTU");
-                        self.regs[rd] = (self.regs[rs1] < self.regs[rs2]) as u64
-                    }
-                    (0x5, 0x7) => {
-                        trace_insn!("CZERO.EQZ");
-
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = 0;
-                        } else {
-                            self.regs[rd] = self.regs[rs1];
-                        }
-                    }
-                    (0x7, 0x7) => {
-                        trace_insn!("CZERO.NEZ");
-
-                        if self.regs[rs2] != 0 {
-                            self.regs[rd] = 0;
-                        } else {
-                            self.regs[rd] = self.regs[rs1];
-                        }
-                    }
-                    (0x0, 0x1) => {
-                        // mul
-                        trace_insn!("MUL");
-                        self.regs[rd] = self.regs[rs1].wrapping_mul(self.regs[rs2]);
-                    }
-                    (0x1, 0x1) => {
-                        // mulh
-                        trace_insn!("MULH");
-                        self.regs[rd] = ((self.regs[rs1] as i64 as i128)
-                            .wrapping_mul(self.regs[rs2] as i64 as i128)
-                            >> 64) as u64;
-                    }
-                    (0x3, 0x1) => {
-                        // mulhu
-                        trace_insn!("MULHU");
-                        self.regs[rd] = ((self.regs[rs1] as u128)
-                            .wrapping_mul(self.regs[rs2] as u128)
-                            >> 64) as u64;
-                    }
-                    (0x2, 0x1) => {
-                        // mulhsu
-                        trace_insn!("MULHSU");
-                        self.regs[rd] = ((self.regs[rs1] as i64 as i128)
-                            .wrapping_mul(self.regs[rs2] as u128 as i128)
-                            >> 64) as u64;
-                    }
-                    (0x4, 0x1) => {
-                        // div
-                        trace_insn!("DIV");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
-                        } else {
-                            self.regs[rd] =
-                                (self.regs[rs1] as i64).wrapping_div(self.regs[rs2] as i64) as u64;
-                        }
-                    }
-                    (0x5, 0x1) => {
-                        // divu
-                        trace_insn!("DIVU");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
-                        } else {
-                            self.regs[rd] = self.regs[rs1].wrapping_div(self.regs[rs2]);
-                        }
-                    }
-                    (0x6, 0x1) => {
-                        // rem
-                        trace_insn!("REM");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = self.regs[rs1];
-                        } else {
-                            self.regs[rd] =
-                                (self.regs[rs1] as i64).wrapping_rem(self.regs[rs2] as i64) as u64;
-                        }
-                    }
-                    (0x7, 0x1) => {
-                        // remu
-                        trace_insn!("REMU");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = self.regs[rs1];
-                        } else {
-                            self.regs[rd] = self.regs[rs1].wrapping_rem(self.regs[rs2]);
-                        }
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            0x3b => {
-                // addw and family
-                let shamt = (self.regs[rs2] & 0x1f) as u32;
-                match (funct3, funct7) {
-                    (0x0, 0x0) => {
-                        trace_insn!("ADDW");
-                        self.regs[rd] =
-                            self.regs[rs1].wrapping_add(self.regs[rs2]) as i32 as i64 as u64;
-                    }
-                    (0x0, 0x20) => {
-                        trace_insn!("SUBW");
-                        self.regs[rd] =
-                            self.regs[rs1].wrapping_sub(self.regs[rs2]) as i32 as i64 as u64;
-                    }
-                    (0x1, 0x00) => {
-                        trace_insn!("SLLW");
-                        self.regs[rd] = (self.regs[rs1] as u32).wrapping_shl(shamt) as i32 as u64;
-                    }
-                    (0x5, 0x00) => {
-                        trace_insn!("SRLW");
-                        self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as u64;
-                    }
-                    (0x5, 0x20) => {
-                        trace_insn!("SRAW");
-                        self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
-                    }
-                    (0x0, 0x1) => {
-                        trace_insn!("MULW");
-                        self.regs[rd] = (self.regs[rs1] as i32).wrapping_mul(self.regs[rs2] as i32)
-                            as i64 as u64
-                    }
-                    (0x4, 0x1) => {
-                        trace_insn!("DIVW");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
-                        } else {
-                            self.regs[rd] = (self.regs[rs1] as i32)
-                                .wrapping_div(self.regs[rs2] as i32)
-                                as i64 as u64
-                        }
-                    }
-                    (0x5, 0x1) => {
-                        trace_insn!("DIVUW");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = u64::MAX;
-                        } else {
-                            self.regs[rd] =
-                                (self.regs[rs1] as u32).wrapping_div(self.regs[rs2] as u32) as u64;
-                        }
-                    }
-                    (0x6, 0x1) => {
-                        trace_insn!("REMW");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = self.regs[rs1] as i32 as i64 as u64;
-                        } else {
-                            self.regs[rd] = (self.regs[rs1] as i32)
-                                .wrapping_rem(self.regs[rs2] as i32)
-                                as i64 as u64;
-                        }
-                    }
-                    (0x7, 0x1) => {
-                        trace_insn!("REMUW");
-                        if self.regs[rs2] == 0 {
-                            self.regs[rd] = self.regs[rs1] as u32 as i32 as i64 as u64;
-                        } else {
-                            self.regs[rd] =
-                                (self.regs[rs1] as u32).wrapping_rem(self.regs[rs2] as u32) as u64;
-                        }
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            0x1b => {
-                // addiw and family
-
-                let imm = ((inst as i32 as i64) >> 20) as u64;
-                let shamt = (imm & 0x1f) as u32;
-
-                match (funct3, funct7) {
-                    (0x0, _) => {
-                        trace_field!("imm", imm);
-                        trace_insn!("ADDIW");
-                        self.regs[rd] = self.regs[rs1].wrapping_add(imm) as i32 as i64 as u64;
-                    }
-                    (0x1, _) => {
-                        trace_field!("shamt", shamt);
-                        trace_insn!("SLLIW");
-                        self.regs[rd] = self.regs[rs1].wrapping_shl(shamt) as i32 as i64 as u64;
-                    }
-                    (0x5, 0) => {
-                        trace_field!("shamt", shamt);
-                        trace_insn!("SRLIW");
-                        self.regs[rd] =
-                            (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as i64 as u64;
-                    }
-                    (0x5, 0x20) => {
-                        trace_field!("shamt", shamt);
-                        trace_insn!("SRAIW");
-                        self.regs[rd] = (self.regs[rs1] as i32).wrapping_shr(shamt) as i64 as u64;
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            0x63 => {
-                // branching
-                // imm[12|10:5|4:1|11] = inst[31|30:25|11:8|7]
-                let imm = (((inst & 0x80000000) as i32 as i64 >> 19) as u64)
-                    | ((inst & 0x80) << 4) // imm[11]
-                    | ((inst >> 20) & 0x7e0) // imm[10:5]
-                    | ((inst >> 7) & 0x1e); // imm[4:1]
-                trace_field!("imm", imm);
-
-                match funct3 {
-                    0x0 => {
-                        trace_insn!("BEQ");
-
-                        if self.regs[rs1] == self.regs[rs2] {
-                            self.branch(imm)?;
-                        }
-                    }
-                    0x1 => {
-                        trace_insn!("BNE");
-
-                        if self.regs[rs1] != self.regs[rs2] {
-                            self.branch(imm)?;
-                        }
-                    }
-                    0x4 => {
-                        trace_insn!("BLT");
-
-                        if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) {
-                            self.branch(imm)?;
-                        }
-                    }
-                    0x5 => {
-                        trace_insn!("BGE");
-
-                        if (self.regs[rs1] as i64) >= (self.regs[rs2] as i64) {
-                            self.branch(imm)?;
-                        }
-                    }
-                    0x6 => {
-                        trace_insn!("BLTU");
-
-                        if self.regs[rs1] < self.regs[rs2] {
-                            self.branch(imm)?;
-                        }
-                    }
-                    0x7 => {
-                        trace_insn!("BGEU");
-
-                        if self.regs[rs1] >= self.regs[rs2] {
-                            self.branch(imm)?;
-                        }
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            0x37 => {
-                // LUI
-                let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
-                trace_field!("imm", imm32);
-                trace_insn!("LUI");
-                self.regs[rd] = imm32;
-            }
-            0x17 => {
-                // AUIPC, relative to the address of this instruction, which run() has
-                // already stepped past
-                let imm32 = (inst & 0xfffff000) as i32 as i64 as u64;
-                trace_field!("imm", imm32);
-                trace_insn!("AUIPC");
-                self.regs[rd] = self.pc.wrapping_add(imm32);
-            }
-            0x6f => {
-                // JAL
-                // imm[20|10:1|11|19:12] = inst[31|30:21|20|19:12]
-                let imm = (((inst & 0x80000000) as i32 as i64 >> 11) as u64) // imm[20]
-                    | (inst & 0xff000) // imm[19:12]
-                    | ((inst >> 9) & 0x800) // imm[11]
-                    | ((inst >> 20) & 0x7fe); // imm[10:1]
-                trace_field!("imm", imm);
-                trace_insn!("JAL");
+            // ---------------------------------------------------------- control
+            Op::Lui => self.regs[rd] = imm,
+            Op::Auipc => self.regs[rd] = self.pc.wrapping_add(imm),
+            Op::Jal => {
                 let link = self.next_pc;
                 self.branch(imm)?;
                 self.regs[rd] = link;
             }
-            0x67 => {
-                // JALR
-                let imm = ((((inst & 0xfff00000) as i32) as i64) >> 20) as u64;
-                trace_field!("imm", imm);
-
+            Op::Jalr => {
                 // The target comes from rs1's value before the link is written, since
                 // rd and rs1 are commonly the same register.
-                let addr = self.regs[rs1].wrapping_add(imm) & !1;
+                let target = a.wrapping_add(imm) & !1;
                 let link = self.next_pc;
-                self.jump(addr)?;
+                self.jump(target)?;
                 self.regs[rd] = link;
-                trace_insn!("JALR");
             }
-            0x73 => {
-                let csr_addr = ((inst & 0xfff00000) >> 20) as usize;
-                trace_field!("csr_addr", csr_addr);
-                let imm = rs1 as u64;
-                match funct3 {
-                    // funct3 of zero is not a csr access: the whole 12-bit immediate
-                    // selects a privileged instruction.
-                    0x0 => match csr_addr {
-                        0x000 => {
-                            trace_insn!("ECALL");
-                            return Err(Exception::EnvironmentCallFromMMode);
-                        }
-                        0x001 => {
-                            trace_insn!("EBREAK");
-                            return Err(Exception::Breakpoint(self.pc));
-                        }
-                        0x302 => {
-                            trace_insn!("MRET");
-                            self.trap_return();
-                        }
-                        0x105 => {
-                            // Nothing can raise an interrupt yet, so waiting for one
-                            // would never end. Retiring immediately is permitted.
-                            trace_insn!("WFI");
-                        }
-                        _ => return Err(Exception::IllegalInstruction(inst)),
-                    },
-                    0x1 => {
-                        // CSRRW
-
-                        // dont read if rd is 0
-                        if rd != 0 {
-                            let csr = self.load_csr(csr_addr);
-                            trace_field!("csr", csr);
-
-                            self.store_csr(csr_addr, self.regs[rs1]);
-                            self.regs[rd] = csr;
-                        } else {
-                            self.store_csr(csr_addr, self.regs[rs1]);
-                        }
-                        trace_insn!("CSRRW");
-                    }
-                    0x2 => {
-                        // CSRRS
-
-                        let csr = self.load_csr(csr_addr);
-                        trace_field!("csr", csr);
-                        trace_insn!("CSRRS");
-                        self.regs[rd] = csr;
-                        if rs1 != 0 {
-                            self.store_csr(csr_addr, csr | self.regs[rs1]);
-                        }
-                    }
-                    0x3 => {
-                        // CSRRC
-                        let csr = self.load_csr(csr_addr);
-                        trace_field!("csr", csr);
-                        trace_insn!("CSRRC");
-                        self.regs[rd] = csr;
-                        if rs1 != 0 {
-                            self.store_csr(csr_addr, csr & !self.regs[rs1]);
-                        }
-                    }
-                    0x5 => {
-                        // CSRRWI
-
-                        // dont read if rd is 0
-                        if rd != 0 {
-                            let csr = self.load_csr(csr_addr);
-                            trace_field!("csr", csr);
-                            self.store_csr(csr_addr, imm);
-                            self.regs[rd] = csr;
-                        } else {
-                            self.store_csr(csr_addr, imm);
-                        }
-                        trace_insn!("CSRRWI");
-                    }
-                    0x6 => {
-                        // CSRRSI
-
-                        let csr = self.load_csr(csr_addr);
-                        trace_field!("csr", csr);
-
-                        self.regs[rd] = csr;
-                        if imm != 0 {
-                            self.store_csr(csr_addr, csr | imm);
-                        }
-                        trace_insn!("CSRRWSI");
-                    }
-                    0x7 => {
-                        // CSRRCI
-
-                        let csr = self.load_csr(csr_addr);
-                        trace_field!("csr", csr);
-                        trace_insn!("CSRRCI");
-                        self.regs[rd] = csr;
-                        if imm != 0 {
-                            self.store_csr(csr_addr, csr & !imm);
-                        }
-                    }
-                    _ => return Err(Exception::IllegalInstruction(inst)),
-                }
-            }
-            0x2f => {
-                // The aq and rl ordering bits, funct7[1] and funct7[0], constrain
-                // nothing on a single in-order hart.
-                let funct5 = (funct7 >> 2) & 0x1f;
-                let size = match funct3 {
-                    0b010 => 32,
-                    0b011 => 64,
-                    _ => return Err(Exception::IllegalInstruction(inst)),
+            Op::Branch { cond } => {
+                let taken = match cond {
+                    Cond::Eq => a == b,
+                    Cond::Ne => a != b,
+                    Cond::Lt => (a as i64) < b as i64,
+                    Cond::Ge => (a as i64) >= b as i64,
+                    Cond::Ltu => a < b,
+                    Cond::Geu => a >= b,
                 };
-                let addr = self.regs[rs1];
-                if addr & (size / 8 - 1) != 0 {
-                    return Err(Exception::StoreAmoAddressMisaligned(addr));
-                }
-
-                match funct5 {
-                    0b00010 => {
-                        // lr: load, and reserve a set of bytes subsuming what was read
-                        trace_insn!("LR");
-                        self.regs[rd] = self.sext(self.bus.load(addr, size)?, size);
-                        self.bus.reserve(addr, size);
-                    }
-                    0b00011 => {
-                        // sc: write rs2 only if the reservation still covers these
-                        // bytes, leaving zero in rd on success and nonzero on failure
-                        trace_insn!("SC");
-                        if self.bus.take_reservation(addr, size) {
-                            self.bus.store(addr, size, self.regs[rs2])?;
-                            self.regs[rd] = 0;
-                        } else {
-                            self.regs[rd] = 1;
-                        }
-                    }
-                    // The amos load, apply a binary operator to the loaded value and
-                    // rs2, and store the result back, returning the loaded value.
-                    0b00001 => self.amo(rd, addr, self.regs[rs2], size, "AMOSWAP", |_, src| src)?,
-                    0b00000 => self.amo(
-                        rd,
-                        addr,
-                        self.regs[rs2],
-                        size,
-                        "AMOADD",
-                        |data, src| match size {
-                            32 => (data as u32).wrapping_add(src as u32) as u64,
-                            _ => data.wrapping_add(src),
-                        },
-                    )?,
-                    0b00100 => {
-                        self.amo(rd, addr, self.regs[rs2], size, "AMOXOR", |data, src| {
-                            data ^ src
-                        })?
-                    }
-                    0b01100 => {
-                        self.amo(rd, addr, self.regs[rs2], size, "AMOAND", |data, src| {
-                            data & src
-                        })?
-                    }
-                    0b01000 => self.amo(rd, addr, self.regs[rs2], size, "AMOOR", |data, src| {
-                        data | src
-                    })?,
-                    0b10000 => self.amo(
-                        rd,
-                        addr,
-                        self.regs[rs2],
-                        size,
-                        "AMOMIN",
-                        |data, src| match size {
-                            32 => (data as i32).min(src as i32) as u32 as u64,
-                            _ => (data as i64).min(src as i64) as u64,
-                        },
-                    )?,
-                    0b10100 => self.amo(
-                        rd,
-                        addr,
-                        self.regs[rs2],
-                        size,
-                        "AMOMAX",
-                        |data, src| match size {
-                            32 => (data as i32).max(src as i32) as u32 as u64,
-                            _ => (data as i64).max(src as i64) as u64,
-                        },
-                    )?,
-                    0b11000 => self.amo(
-                        rd,
-                        addr,
-                        self.regs[rs2],
-                        size,
-                        "AMOMINU",
-                        |data, src| match size {
-                            32 => (data as u32).min(src as u32) as u64,
-                            _ => data.min(src),
-                        },
-                    )?,
-                    0b11100 => self.amo(
-                        rd,
-                        addr,
-                        self.regs[rs2],
-                        size,
-                        "AMOMAXU",
-                        |data, src| match size {
-                            32 => (data as u32).max(src as u32) as u64,
-                            _ => data.max(src),
-                        },
-                    )?,
-                    _ => return Err(Exception::IllegalInstruction(inst)),
+                if taken {
+                    self.branch(imm)?;
                 }
             }
-            _ => return Err(Exception::IllegalInstruction(inst)),
+
+            // ---------------------------------------------------------- zicsr
+            // A csr is read before it is written, and left alone when the instruction
+            // names no source: x0 for the register forms, zero for the immediate ones.
+            Op::Csrrw { immediate } => {
+                let source = if immediate { rs1 as u64 } else { a };
+                // With nowhere to put the result there is no read at all.
+                if rd != 0 {
+                    self.regs[rd] = self.load_csr(imm as usize);
+                }
+                self.store_csr(imm as usize, source);
+            }
+            Op::Csrrs { immediate } | Op::Csrrc { immediate } => {
+                let source = if immediate { rs1 as u64 } else { a };
+                let csr = self.load_csr(imm as usize);
+                // A source of x0, or of zero for the immediate forms, names no bits to
+                // change, and then the csr is not written at all.
+                if rs1 != 0 {
+                    let value = match op {
+                        Op::Csrrs { .. } => csr | source,
+                        _ => csr & !source,
+                    };
+                    self.store_csr(imm as usize, value);
+                }
+                self.regs[rd] = csr;
+            }
+
+            // ---------------------------------------------------------- privileged
+            Op::Ecall => return Err(Exception::EnvironmentCallFromMMode),
+            Op::Ebreak => return Err(Exception::Breakpoint(self.pc)),
+            Op::Mret => self.trap_return(),
+            // Nothing can raise an interrupt yet, so waiting for one would never end.
+            // Retiring immediately is permitted.
+            Op::Wfi => {}
+
+            // ---------------------------------------------------------- atomics
+            Op::Lr { width } | Op::Sc { width } | Op::Amo { width, .. } => {
+                let bits = width.bits();
+                if a & (bits / 8 - 1) != 0 {
+                    return Err(Exception::StoreAmoAddressMisaligned(a));
+                }
+                match op {
+                    Op::Lr { .. } => {
+                        self.regs[rd] = Self::sext(self.bus.load(a, bits)?, bits);
+                        self.bus.reserve(a, bits);
+                    }
+                    Op::Sc { .. } => {
+                        // The store happens only if the reservation still covers these
+                        // bytes, and rd reports zero for success, nonzero for failure.
+                        self.regs[rd] = if self.bus.take_reservation(a, bits) {
+                            self.bus.store(a, bits, b)?;
+                            0
+                        } else {
+                            1
+                        };
+                    }
+                    Op::Amo { op, .. } => {
+                        let data = self.bus.load(a, bits)?;
+                        let value = Self::amo(op, width, data, b);
+                        self.bus.store(a, bits, value)?;
+                        self.regs[rd] = Self::sext(data, bits);
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// The quotient the manual specifies, including division by zero and the one
+    /// signed case that overflows.
+    #[inline]
+    fn div(a: i64, b: i64) -> i64 {
+        match b {
+            0 => -1,
+            _ => a.wrapping_div(b),
+        }
+    }
+
+    /// The matching remainder: the dividend when there is no divisor, and none when
+    /// the division overflows.
+    #[inline]
+    fn rem(a: i64, b: i64) -> i64 {
+        match b {
+            0 => a,
+            _ => a.wrapping_rem(b),
+        }
+    }
+
+    /// Widen a value loaded from memory to the full register, sign-extending anything
+    /// narrower than XLEN.
+    #[inline]
+    fn sext(value: u64, bits: u64) -> u64 {
+        match bits {
+            8 => value as i8 as i64 as u64,
+            16 => value as i16 as i64 as u64,
+            32 => value as i32 as i64 as u64,
+            _ => value,
+        }
+    }
+
+    /// The read-modify-write an atomic performs, at the width it performs it.
+    fn amo(op: AmoOp, width: Width, data: u64, src: u64) -> u64 {
+        if width == Width::Word {
+            let (d, s) = (data as u32, src as u32);
+            return match op {
+                AmoOp::Swap => s,
+                AmoOp::Add => d.wrapping_add(s),
+                AmoOp::Xor => d ^ s,
+                AmoOp::And => d & s,
+                AmoOp::Or => d | s,
+                AmoOp::Min => (d as i32).min(s as i32) as u32,
+                AmoOp::Max => (d as i32).max(s as i32) as u32,
+                AmoOp::MinU => d.min(s),
+                AmoOp::MaxU => d.max(s),
+            } as u64;
+        }
+        match op {
+            AmoOp::Swap => src,
+            AmoOp::Add => data.wrapping_add(src),
+            AmoOp::Xor => data ^ src,
+            AmoOp::And => data & src,
+            AmoOp::Or => data | src,
+            AmoOp::Min => (data as i64).min(src as i64) as u64,
+            AmoOp::Max => (data as i64).max(src as i64) as u64,
+            AmoOp::MinU => data.min(src),
+            AmoOp::MaxU => data.max(src),
+        }
     }
 
     pub fn dump_registers(&self) {

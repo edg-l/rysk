@@ -14,15 +14,9 @@ macro_rules! trace_mem {
     }};
 }
 
-/// Record a decoded field on the current span.
-macro_rules! trace_field {
-    ($name:literal, $value:expr) => {{
-        #[cfg(feature = "trace")]
-        ::tracing::Span::current().record($name, $value);
-    }};
-}
-
 pub mod bus;
 pub mod cpu;
+pub mod csr;
 pub mod dram;
 pub mod exception;
+pub mod inst;
