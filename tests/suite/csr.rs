@@ -1,5 +1,8 @@
 use crate::common::*;
-use rysk::csr::{MISA, MISA_MXL_64, misa_extension};
+use rysk::csr::{
+    MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP, MSTATUS_MPP_M, MSTATUS_SIE, S_INTERRUPTS,
+    misa_extension,
+};
 
 // ------------------------------------------------------------------ zicsr
 
@@ -74,4 +77,121 @@ fn misa_ignores_writes_because_no_extension_can_be_turned_off() {
     assert_eq!(cpu.reg(A0), cpu.csrs[MISA]);
     assert_eq!(cpu.reg(A0) >> 62, 2);
     assert_eq!(cpu.reg(A0) & MISA_MXL_64, MISA_MXL_64);
+}
+
+// ------------------------------------------------- the supervisor's view
+
+const MSTATUS: u32 = 0x300;
+const SSTATUS: u32 = 0x100;
+const MIE: u32 = 0x304;
+const SIE: u32 = 0x104;
+const MIP: u32 = 0x344;
+const SIP: u32 = 0x144;
+const MIDELEG: u32 = 0x303;
+
+const SSIP: u64 = 1 << 1;
+const STIP: u64 = 1 << 5;
+const MSIP: u64 = 1 << 3;
+const MTIP: u64 = 1 << 7;
+
+#[test]
+fn mideleg_holds_only_the_interrupts_that_can_be_delegated() {
+    let cpu = prog(&[csrrw(ZERO, MIDELEG, T0), csrrs(A0, MIDELEG, ZERO)])
+        .reg(T0, !0)
+        .run();
+    assert_eq!(
+        cpu.reg(A0),
+        S_INTERRUPTS,
+        "the machine-level and unimplemented bits are read-only zero"
+    );
+}
+
+#[test]
+fn sie_shows_only_the_interrupts_mideleg_delegates() {
+    let cpu = prog(&[
+        csrrw(ZERO, MIDELEG, T0),
+        csrrw(ZERO, MIE, T1),
+        csrrs(A0, SIE, ZERO),
+    ])
+    .reg(T0, STIP)
+    .reg(T1, !0)
+    .run();
+    assert_eq!(cpu.reg(A0), STIP, "only the delegated timer interrupt");
+}
+
+#[test]
+fn writing_sie_writes_mie_and_leaves_the_undelegated_bits_alone() {
+    let cpu = prog(&[
+        csrrw(ZERO, MIDELEG, T0),
+        csrrw(ZERO, MIE, T1),
+        csrrw(ZERO, SIE, ZERO),
+        csrrs(A0, MIE, ZERO),
+    ])
+    .reg(T0, STIP)
+    .reg(T1, STIP | MTIP)
+    .run();
+    assert_eq!(
+        cpu.reg(A0),
+        MTIP,
+        "stie cleared through sie, mtie untouched"
+    );
+}
+
+#[test]
+fn sip_is_a_window_onto_mip_and_not_a_register_of_its_own() {
+    let cpu = prog(&[
+        csrrw(ZERO, MIDELEG, T0),
+        csrrw(ZERO, MIP, T1),
+        csrrs(A0, SIP, ZERO),
+        csrrw(ZERO, SIP, ZERO),
+        csrrs(A1, MIP, ZERO),
+    ])
+    .reg(T0, SSIP)
+    .reg(T1, SSIP | MSIP)
+    .run();
+    assert_eq!(
+        cpu.reg(A0),
+        SSIP,
+        "the delegated software interrupt shows through"
+    );
+    assert_eq!(
+        cpu.reg(A1),
+        MSIP,
+        "clearing sip cleared it in mip, not in storage of its own"
+    );
+}
+
+#[test]
+fn sstatus_shows_the_supervisor_fields_of_mstatus_and_no_others() {
+    let cpu = prog(&[csrrw(ZERO, MSTATUS, T0), csrrs(A0, SSTATUS, ZERO)])
+        .reg(T0, (1 << MSTATUS_SIE) | (1 << MSTATUS_MIE) | MSTATUS_MPP_M)
+        .run();
+    assert_eq!(
+        cpu.reg(A0),
+        1 << MSTATUS_SIE,
+        "mie and mpp are machine state a supervisor cannot see"
+    );
+}
+
+#[test]
+fn writing_sstatus_leaves_the_machine_fields_of_mstatus_alone() {
+    let cpu = prog(&[
+        csrrw(ZERO, MSTATUS, T0),
+        csrrw(ZERO, SSTATUS, T1),
+        csrrs(A0, MSTATUS, ZERO),
+    ])
+    .reg(T0, (1 << MSTATUS_MIE) | MSTATUS_MPP_M)
+    .reg(T1, !0)
+    .run();
+    assert_ne!(
+        cpu.reg(A0) & (1 << MSTATUS_MIE),
+        0,
+        "mie survives a write of ones through sstatus"
+    );
+    assert_eq!(cpu.reg(A0) & MSTATUS_MPP, MSTATUS_MPP_M, "and so does mpp");
+    assert_ne!(
+        cpu.reg(A0) & (1 << MSTATUS_SIE),
+        0,
+        "while the supervisor fields did take the write"
+    );
 }

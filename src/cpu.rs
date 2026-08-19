@@ -131,8 +131,10 @@ impl Cpu {
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
     fn load_csr(&self, addr: usize) -> u64 {
         trace_insn!("loading csr");
+        if let Some((base, mask)) = alias(addr, self.csrs[MIDELEG]) {
+            return self.csrs[base] & mask;
+        }
         match addr {
-            SIE => self.csrs[MIE] & self.csrs[MIDELEG],
             RDTIME => self.start.elapsed().as_secs(),
             _ => self.csrs[addr],
         }
@@ -146,11 +148,15 @@ impl Cpu {
             return;
         }
         trace_insn!("storing csr");
+        if let Some((base, mask)) = alias(addr, self.csrs[MIDELEG]) {
+            self.csrs[base] = (self.csrs[base] & !mask) | (value & mask);
+            return;
+        }
         match addr {
-            SIE => {
-                self.csrs[MIE] =
-                    (self.csrs[MIE] & !self.csrs[MIDELEG]) | (value & self.csrs[MIDELEG]);
-            }
+            // Only supervisor-level interrupts are delegatable, so the rest of mideleg
+            // is read-only zero, and what it does hold is what sie and sip may reach.
+            // The RISC-V Instruction Set Manual Volume II, 3.1.8.
+            MIDELEG => self.csrs[MIDELEG] = value & S_INTERRUPTS,
             _ => self.csrs[addr] = value,
         }
     }
