@@ -91,10 +91,16 @@ $(CORPUS)/.stamp: | $(CORPUS_SRC)
 
 # The interpreter benchmark. The .bin is committed like the test fixtures, so
 # profiling needs no cross toolchain.
+BENCHES = bench/loop.bin bench/paging.bin
+# hyperfine takes one -L value list, comma separated, where make holds a list as words.
+comma := ,
+space := $(subst ,, )
+BENCH_LIST = $(subst $(space),$(comma),$(BENCHES))
+
 .PHONY: bench
-bench: bench/loop.bin bench/paging.bin
+bench: $(BENCHES)
 	cargo build --release
-	hyperfine -w3 -r15 -N -L prog $^ './target/release/rysk {prog}'
+	hyperfine -w3 -r15 -N -L prog $(BENCH_LIST) './target/release/rysk {prog}'
 
 # Same run under perf. dwarf unwinding, not fp: rust omits frame pointers and fp
 # walks garbage.
