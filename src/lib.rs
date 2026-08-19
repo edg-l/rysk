@@ -17,6 +17,7 @@ macro_rules! trace_mem {
 pub mod bus;
 pub mod cpu;
 pub mod csr;
+pub mod device;
 pub mod dram;
 pub mod elf;
 pub mod exception;

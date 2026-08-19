@@ -6,7 +6,9 @@ mod asm;
 
 pub use asm::*;
 
-use rysk::{bus::DRAM_BASE, cpu::Cpu, csr::Mode, dram::DRAM_SIZE, exception::Exception};
+use rysk::{
+    bus::DRAM_BASE, cpu::Cpu, csr::Mode, device::Device, dram::DRAM_SIZE, exception::Exception,
+};
 
 /// An address in dram that no test program occupies, for tests that need memory.
 pub const SCRATCH: u64 = DRAM_BASE + 0x1000;
@@ -19,6 +21,7 @@ pub struct Program {
     regs: Vec<(u32, u64)>,
     csrs: Vec<(usize, u64)>,
     mode: Mode,
+    devices: Vec<(u64, u64, Box<dyn Device>)>,
 }
 
 /// Assemble `code` into a program starting from a zeroed register file.
@@ -28,6 +31,7 @@ pub fn prog(code: &[u32]) -> Program {
         regs: Vec::new(),
         csrs: Vec::new(),
         mode: Mode::Machine,
+        devices: Vec::new(),
     }
 }
 
@@ -42,6 +46,12 @@ impl Program {
     /// installed should not have to write one in assembly first.
     pub fn csr(mut self, csr: usize, value: u64) -> Self {
         self.csrs.push((csr, value));
+        self
+    }
+
+    /// Put a device on the bus, answering for `size` bytes from `base`.
+    pub fn device(mut self, base: u64, size: u64, device: Box<dyn Device>) -> Self {
+        self.devices.push((base, size, device));
         self
     }
 
@@ -83,6 +93,9 @@ impl Program {
             cpu.csrs[csr] = value;
         }
         cpu.mode = self.mode;
+        for (base, size, device) in self.devices {
+            cpu.bus.attach(base, size, device);
+        }
         let stopped = cpu.run();
         (cpu, stopped)
     }
@@ -108,6 +121,8 @@ impl Inspect for Cpu {
             (DRAM_BASE..DRAM_BASE + DRAM_SIZE).contains(&addr),
             "address {addr:#x} is outside dram"
         );
-        self.bus.load(addr, bytes * 8).expect("load failed")
+        // Straight at dram, because inspecting a machine should not disturb it and a
+        // device read can be an action.
+        self.bus.dram.load(addr, bytes * 8)
     }
 }

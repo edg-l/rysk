@@ -12,7 +12,7 @@ use crate::{
     inst::{AmoOp, Cond, Inst, Op, Width, decode},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Cpu {
     pub regs: [u64; 32],
     /// The instruction being executed.
@@ -34,10 +34,7 @@ impl Cpu {
             regs: Default::default(),
             pc: DRAM_BASE,
             next_pc: DRAM_BASE,
-            bus: Bus {
-                dram: Dram::new(code),
-                reservation: None,
-            },
+            bus: Bus::new(Dram::new(code)),
             csrs: [0; 4096],
             mode: Mode::Machine,
             start: Instant::now(),
@@ -253,7 +250,7 @@ impl Cpu {
     }
 
     #[inline]
-    fn fetch(&self) -> Result<u32, Exception> {
+    fn fetch(&mut self) -> Result<u32, Exception> {
         self.bus
             .load(self.pc, 32)
             .map(|word| word as u32)
