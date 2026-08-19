@@ -73,7 +73,7 @@ fn text(value: &[u8]) -> String {
 
 #[test]
 fn the_tree_describes_the_machine_the_bus_decodes() {
-    let blob = machine::describe("rv64imac", DRAM_SIZE);
+    let blob = machine::describe("rv64imac", DRAM_SIZE, &machine::Boot::default());
     let tree = parse(&blob);
 
     let reg = |path: &str| cells(&tree[path]);
@@ -121,7 +121,11 @@ fn the_tree_describes_the_machine_the_bus_decodes() {
 
 #[test]
 fn a_device_names_the_controller_its_line_runs_to() {
-    let tree = parse(&machine::describe("rv64imac", DRAM_SIZE));
+    let tree = parse(&machine::describe(
+        "rv64imac",
+        DRAM_SIZE,
+        &machine::Boot::default(),
+    ));
     let intc = cells(&tree["/cpus/cpu@0/interrupt-controller/phandle"])[0];
     let plic = cells(&tree["/soc/plic@c000000/phandle"])[0];
 
@@ -145,4 +149,28 @@ fn a_device_names_the_controller_its_line_runs_to() {
         source <= cells(&tree["/soc/plic@c000000/riscv,ndev"])[0],
         "a source the controller says it has"
     );
+}
+
+#[test]
+fn what_a_loader_hands_over_reaches_the_tree() {
+    let options = machine::Boot {
+        bootargs: Some("console=ttyS0 rdinit=/bin/sh".into()),
+        initrd: Some((0x8700_0000, 0x8710_0000)),
+    };
+    let tree = parse(&machine::describe("rv64imac", DRAM_SIZE, &options));
+    assert_eq!(
+        text(&tree["/chosen/bootargs"]),
+        "console=ttyS0 rdinit=/bin/sh"
+    );
+    assert_eq!(cells(&tree["/chosen/linux,initrd-start"]), [0, 0x8700_0000]);
+    assert_eq!(cells(&tree["/chosen/linux,initrd-end"]), [0, 0x8710_0000]);
+
+    // And none of it appears when there is none of it to say.
+    let bare = parse(&machine::describe(
+        "rv64imac",
+        DRAM_SIZE,
+        &machine::Boot::default(),
+    ));
+    assert!(!bare.contains_key("/chosen/bootargs"));
+    assert!(!bare.contains_key("/chosen/linux,initrd-start"));
 }

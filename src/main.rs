@@ -47,21 +47,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The first image is what the machine starts on, at the bottom of dram. Any after
     // it are placed where they say, which is how firmware and the kernel it hands off
     // to are both in memory at once: `rysk fw_jump.bin vmlinux@0x80200000`.
-    let mut args = env::args().skip(1).peekable();
+    let args: Vec<String> = env::args().skip(1).collect();
     let mut memory = DRAM_SIZE;
-    if args.peek().is_some_and(|arg| arg == "-m") {
-        args.next();
-        let mib: u64 = args
-            .next()
-            .and_then(|arg| arg.parse().ok())
-            .expect("-m takes a size in mebibytes");
-        memory = mib * 1024 * 1024;
+    let mut options = machine::Boot::default();
+    let mut ramdisk = None;
+    let mut at = 0;
+    while at + 1 < args.len() {
+        let value = args[at + 1].clone();
+        match args[at].as_str() {
+            "-m" => memory = value.parse::<u64>().expect("a size in mebibytes") * 1024 * 1024,
+            "--initrd" => ramdisk = Some(value),
+            "--append" => options.bootargs = Some(value),
+            _ => break,
+        }
+        at += 2;
     }
-    let Some(first) = args.next() else {
-        panic!("Usage: rysk [-m <mebibytes>] <image> [image@address ...]");
+    let images = &args[at..];
+    let Some(first) = images.first() else {
+        panic!(
+            "Usage: rysk [-m <mebibytes>] [--initrd <file>] [--append <args>] \
+             <image> [image@address ...]"
+        );
     };
     let mut code = Vec::new();
-    File::open(&first)?.read_to_end(&mut code)?;
+    File::open(first)?.read_to_end(&mut code)?;
 
     // An image that carries a `tohost` symbol is a test: it signals its result there
     // and then spins, so watching that address is the only way the run ends.
@@ -72,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Cpu::with_memory(code, memory), None)
     };
 
-    for arg in args {
+    for arg in &images[1..] {
         let (path, at) = arg
             .rsplit_once('@')
             .unwrap_or_else(|| panic!("{arg}: an image after the first needs an @address"));
@@ -87,7 +96,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("loaded {path} at {at:#x}, {} KiB", bytes.len() / 1024);
     }
 
-    machine::boot(&mut cpu, rysk::ISA);
+    // The ramdisk goes as high as it fits, out of the way of a kernel that was loaded
+    // at the bottom and of the device tree that says where this is.
+    if let Some(path) = ramdisk {
+        let mut bytes = Vec::new();
+        File::open(&path)?.read_to_end(&mut bytes)?;
+        let end = machine::fdt_base(memory) - 0x10_0000;
+        let at = (end - bytes.len() as u64) & !0xfff;
+        assert!(
+            cpu.bus.dram.write(at, &bytes, 0),
+            "{path} does not fit in memory"
+        );
+        println!("loaded {path} at {at:#x}, {} KiB", bytes.len() / 1024);
+        options.initrd = Some((at, at + bytes.len() as u64));
+    }
+
+    machine::boot(&mut cpu, rysk::ISA, &options);
     handoff(&mut cpu);
 
     let stopped = match tohost {

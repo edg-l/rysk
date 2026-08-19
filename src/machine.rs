@@ -37,11 +37,19 @@ pub fn fdt_base(memory: u64) -> u64 {
 /// Attach the machine's devices, describe them, and leave the description where the
 /// guest is told to look: `a0` is the hart that is booting and `a1` is the tree, which
 /// is the handover every RISC-V kernel expects from whatever ran before it.
-pub fn boot(cpu: &mut Cpu, isa: &str) {
+/// What a guest is told that is not a device: the command line it was started with,
+/// and where its initial ramdisk was left.
+#[derive(Debug, Default)]
+pub struct Boot {
+    pub bootargs: Option<String>,
+    pub initrd: Option<(u64, u64)>,
+}
+
+pub fn boot(cpu: &mut Cpu, isa: &str, options: &Boot) {
     virt(&mut cpu.bus);
     let memory = cpu.bus.dram.size();
     let at = fdt_base(memory);
-    let tree = describe(isa, memory);
+    let tree = describe(isa, memory, options);
     assert!(
         cpu.bus.dram.write(at, &tree, 0),
         "the device tree does not fit in dram"
@@ -66,7 +74,7 @@ pub fn virt(bus: &mut Bus) {
 
 /// The same machine, described. Firmware and a kernel read this to find what `virt`
 /// attached above, so the two are written next to each other on purpose.
-pub fn describe(isa: &str, memory: u64) -> Vec<u8> {
+pub fn describe(isa: &str, memory: u64, options: &Boot) -> Vec<u8> {
     let mut fdt = Fdt::new();
     fdt.begin_node("");
     fdt.cells("#address-cells", &[2]);
@@ -76,6 +84,15 @@ pub fn describe(isa: &str, memory: u64) -> Vec<u8> {
 
     fdt.begin_node("chosen");
     fdt.string("stdout-path", "/soc/serial@10000000");
+    if let Some(bootargs) = &options.bootargs {
+        fdt.string("bootargs", bootargs);
+    }
+    // Where the ramdisk is, as two cells each, which is how a kernel finds the root
+    // filesystem it was handed rather than one it has to go looking for.
+    if let Some((start, end)) = options.initrd {
+        fdt.cells("linux,initrd-start", &[(start >> 32) as u32, start as u32]);
+        fdt.cells("linux,initrd-end", &[(end >> 32) as u32, end as u32]);
+    }
     fdt.end_node();
 
     fdt.begin_node("cpus");
