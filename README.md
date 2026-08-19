@@ -56,22 +56,29 @@ RUST_LOG=trace cargo run -- tests/fib.bin   # every bus load and store as well
 ## Testing
 
 ```bash
-cargo test    # runs the committed test binaries
-make test     # reassembles them first, then runs the same suite
+cargo test    # the whole suite, no cross toolchain needed
+make test     # reassembles the two fixtures first, then the same suite
 ```
 
-Each case is a small program in `tests/`, assembled or compiled by
-`riscv64-unknown-elf-gcc` and flattened with `objcopy`. The resulting `.bin` is
-committed, so `cargo test` and CI need no cross toolchain; only `make test`
-does.
-
-A new case is three steps: write `tests/<name>.s` or `tests/<name>.c`, run
-`make test_files`, and add a row to `tests/instructions.rs` naming the
-registers, memory bytes and CSRs the program should end with.
+`tests/common` is a small assembler, so a test is a Rust array of instructions
+run on a fresh machine:
 
 ```rust
-#[case::fib("tests/fib.bin", &[(14, 1), (15, 0x37)], &[], &[])]
+#[test]
+fn immediate_shifts_take_six_bits_of_shift_amount() {
+    let cpu = prog(&[slli(T1, T0, 40)]).reg(T0, 1).run();
+    assert_eq!(cpu.reg(T1), 1 << 40);
+}
 ```
+
+`reg` preloads a register so a test does not have to build its inputs in
+assembly, and execution ends on the zero word past the last instruction.
+
+Two fixtures come from a real toolchain and need `make test_files` to rebuild.
+`tests/encodings.s` is assembled ground truth that the Rust assembler is checked
+against, so the tests cannot agree with a misunderstanding twice; `tests/fib.c`
+is a compiled C program, the one case that proves rysk runs what a compiler
+emits.
 
 ## Layout
 

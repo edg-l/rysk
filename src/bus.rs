@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use tracing::{instrument, trace};
 
-use crate::dram::{Dram, DRAM_SIZE};
+use crate::dram::{DRAM_SIZE, Dram};
 
 /// The address which dram starts, same as QEMU virt machine.
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -27,10 +27,11 @@ impl Bus {
     pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), ()> {
         trace!("store");
         self.check(addr, size)?;
-        if let Some(reserved) = &self.reservation {
-            if addr < reserved.end && reserved.start < addr + size / 8 {
-                self.reservation = None;
-            }
+        if let Some(reserved) = &self.reservation
+            && addr < reserved.end
+            && reserved.start < addr + size / 8
+        {
+            self.reservation = None;
         }
         self.dram.store(addr, size, value)
     }
