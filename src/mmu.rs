@@ -58,6 +58,62 @@ const PTE_D: u64 = 1 << 7;
 /// them is asking for something this machine does not do.
 const PTE_UNSUPPORTED: u64 = 0x7fc0_0000_0000_0000;
 
+/// One remembered walk: the leaf entry a page number resolved to, and the level it was
+/// found at, since a superpage answers for a range rather than for one page.
+///
+/// What is remembered is the reads the walk made, not the decision it reached. The
+/// permission and accessed-bit checks happen again on every hit, which is what it
+/// means for the cache to hold the results of step 2 alone: the mode, `SUM`, `MXR` and
+/// what the access is for can all have changed since.
+///
+/// The RISC-V Instruction Set Manual Volume II, 12.3.2.
+#[derive(Debug, Clone, Copy)]
+struct Translation {
+    vpn: u64,
+    pte: u64,
+    level: u64,
+}
+
+/// A direct-mapped cache of them, indexed by the low bits of the page number.
+///
+/// It is emptied whole rather than by entry. An `sfence.vma` naming one address is
+/// allowed to invalidate more than it names, and the alternative is being wrong in a
+/// way that only shows up under a real operating system.
+#[derive(Debug)]
+pub struct Tlb {
+    entries: [Option<Translation>; Self::SIZE],
+}
+
+impl Default for Tlb {
+    fn default() -> Self {
+        Self {
+            entries: [None; Self::SIZE],
+        }
+    }
+}
+
+impl Tlb {
+    const SIZE: usize = 64;
+
+    #[inline]
+    const fn slot(vpn: u64) -> usize {
+        (vpn as usize) & (Self::SIZE - 1)
+    }
+
+    #[inline]
+    fn get(&self, vpn: u64) -> Option<Translation> {
+        self.entries[Self::slot(vpn)].filter(|entry| entry.vpn == vpn)
+    }
+
+    fn insert(&mut self, entry: Translation) {
+        self.entries[Self::slot(entry.vpn)] = Some(entry);
+    }
+
+    pub fn flush(&mut self) {
+        self.entries = [None; Self::SIZE];
+    }
+}
+
 impl Cpu {
     /// The mode an access is checked against. A load or store takes the mode `MPP`
     /// names while `MPRV` is set, which is how machine-mode software reaches memory
@@ -90,11 +146,13 @@ impl Cpu {
         if !self.translating(access) {
             return Ok(va);
         }
-        self.walk(va, access)
+        match self.tlb.get(va >> PAGE_BITS) {
+            Some(entry) => self.finish(va, entry, access),
+            None => self.walk(va, access),
+        }
     }
 
     fn walk(&mut self, va: u64, access: Access) -> Result<u64, Exception> {
-        let mode = self.effective_mode(access);
         if self.csrs[SATP] & MODE != SV39 {
             return Err(access.fault(va));
         }
@@ -134,23 +192,41 @@ impl Cpu {
             if ppn & ((1 << (9 * level)) - 1) != 0 {
                 return Err(access.fault(va));
             }
-            self.permitted(pte, mode, access)
-                .map_err(|()| access.fault(va))?;
-
-            // rysk implements Svade: the accessed and dirty bits are software's to
-            // maintain, and hardware faults rather than setting them.
-            // The RISC-V Instruction Set Manual Volume II, 12.3.2, step 9.
-            if pte & PTE_A == 0 || (access == Access::Store && pte & PTE_D == 0) {
-                return Err(access.fault(va));
-            }
-
-            // The levels the entry did not translate are taken from the address, which
-            // is what makes a superpage one page rather than many.
-            let translated =
-                (ppn >> (9 * level)) << (9 * level) | (va >> PAGE_BITS) & ((1 << (9 * level)) - 1);
-            return Ok((translated * PAGE_SIZE) | (va & (PAGE_SIZE - 1)));
+            let entry = Translation {
+                vpn: va >> PAGE_BITS,
+                pte,
+                level,
+            };
+            let translated = self.finish(va, entry, access)?;
+            self.tlb.insert(entry);
+            return Ok(translated);
         }
         unreachable!("the walk returns or faults at every level")
+    }
+
+    /// What a remembered walk still has to do: whether this access is allowed through
+    /// this entry, and where in the frame it lands.
+    fn finish(&self, va: u64, entry: Translation, access: Access) -> Result<u64, Exception> {
+        let Translation { pte, level, .. } = entry;
+        let mode = self.effective_mode(access);
+        self.permitted(pte, mode, access)
+            .map_err(|()| access.fault(va))?;
+
+        // rysk implements Svade: the accessed and dirty bits are software's to
+        // maintain, and hardware faults rather than setting them. That is also why
+        // they are checked here rather than once during the walk, since the cache is
+        // not allowed to answer for them.
+        // The RISC-V Instruction Set Manual Volume II, 12.3.2, step 9.
+        if pte & PTE_A == 0 || (access == Access::Store && pte & PTE_D == 0) {
+            return Err(access.fault(va));
+        }
+
+        // The levels the entry did not translate are taken from the address, which is
+        // what makes a superpage one page rather than many.
+        let ppn = (pte >> 10) & 0xfff_ffff_ffff;
+        let translated =
+            (ppn >> (9 * level)) << (9 * level) | (va >> PAGE_BITS) & ((1 << (9 * level)) - 1);
+        Ok((translated * PAGE_SIZE) | (va & (PAGE_SIZE - 1)))
     }
 
     /// Whether the page a leaf entry describes may be reached this way.

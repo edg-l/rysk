@@ -92,9 +92,9 @@ $(CORPUS)/.stamp: | $(CORPUS_SRC)
 # The interpreter benchmark. The .bin is committed like the test fixtures, so
 # profiling needs no cross toolchain.
 .PHONY: bench
-bench: bench/loop.bin
+bench: bench/loop.bin bench/paging.bin
 	cargo build --release
-	hyperfine -w3 -r15 -N './target/release/rysk $<'
+	hyperfine -w3 -r15 -N -L prog $^ './target/release/rysk {prog}'
 
 # Same run under perf. dwarf unwinding, not fp: rust omits frame pointers and fp
 # walks garbage.

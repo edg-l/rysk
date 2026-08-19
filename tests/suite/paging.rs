@@ -260,3 +260,27 @@ fn sfence_vma_is_a_supervisor_instruction() {
     prog(&[inst]).mode(Mode::Supervisor).run();
     prog(&[inst]).run();
 }
+
+#[test]
+fn a_change_to_the_table_takes_effect_after_sfence_vma() {
+    // The program remaps its own window from one frame to another and invalidates the
+    // translation; the load after that has to see the new frame rather than whatever
+    // the last walk found.
+    let other = FRAME + 0x1000;
+    let cpu = mapped(
+        &[
+            ld(A0, T0, 0),
+            sd(T2, T1, 0),
+            sfence_vma(ZERO, ZERO),
+            ld(A1, T0, 0),
+        ],
+        V | R | W | A | D,
+    )
+    .reg(T1, LEAF + 8)
+    .reg(T2, pte(other, V | R | W | A | D))
+    .memory(FRAME, 1)
+    .memory(other, 2)
+    .run();
+    assert_eq!(cpu.reg(A0), 1, "the frame it was mapped to");
+    assert_eq!(cpu.reg(A1), 2, "and the one it was remapped to");
+}

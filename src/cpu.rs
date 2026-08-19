@@ -9,7 +9,7 @@ use crate::{
     dram::{DRAM_SIZE, Dram},
     elf::{Error as ElfError, Image},
     inst::{self, AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
-    mmu::Access,
+    mmu::{Access, Tlb},
     rvc,
     trap::{Exception, Interrupt, Trap},
 };
@@ -27,6 +27,8 @@ pub struct Cpu {
     pub csrs: [u64; 4096],
     /// The privilege the hart is running at. A trap raises it, an `xRET` lowers it.
     pub mode: Mode,
+    /// What the last few page table walks found, so most of them do not happen.
+    pub tlb: Tlb,
     pub start: Instant,
 }
 
@@ -39,6 +41,7 @@ impl Cpu {
             bus: Bus::new(Dram::new(code)),
             csrs: [0; 4096],
             mode: Mode::Machine,
+            tlb: Tlb::default(),
             start: Instant::now(),
         };
 
@@ -322,6 +325,8 @@ impl Cpu {
             SATP => {
                 if matches!(value >> 60, 0 | 8) {
                     self.csrs[SATP] = value;
+                    // A different table, or none, is a different set of answers.
+                    self.tlb.flush();
                 }
             }
             // The bits a device drives are read-only here: a write cannot argue with a
@@ -627,6 +632,7 @@ impl Cpu {
                 if self.mode < Mode::Supervisor || self.trapped(MSTATUS_TVM) {
                     return Err(Exception::IllegalInstruction(encoding as u64));
                 }
+                self.tlb.flush();
             }
 
             Op::Wrs { .. } => {}
