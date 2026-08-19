@@ -15,6 +15,7 @@ use crate::{
     dram::Dram,
     elf::{Error as ElfError, Image},
     fdt::Fdt,
+    pci::{self, HostBridge, Ports, Root},
     plic::{self, Plic},
     trap::Trap,
     uart::{self, Keyboard, Uart},
@@ -22,9 +23,14 @@ use crate::{
 
 /// The interrupt source the first serial port drives, as the `virt` machine wires it.
 const UART_IRQ: usize = 10;
+/// The first of the four the root complex's functions are swizzled onto.
+const PCI_IRQ: usize = 32;
 /// How many interrupt sources the controller answers for, which is as many as the
 /// machine wires.
-const SOURCES: u32 = UART_IRQ as u32;
+const SOURCES: u32 = (PCI_IRQ + pci::PINS - 1) as u32;
+
+/// Which device number the host bridge is, which is where enumeration looks first.
+const HOST_BRIDGE: usize = 0;
 
 /// The phandles the tree refers to its interrupt controllers by. A device says which
 /// controller its line runs to, so the controllers need names, and each hart has a
@@ -256,6 +262,15 @@ pub fn virt(bus: &mut Bus, harts: usize) -> Keyboard {
     let mut plic = Plic::new(harts);
     plic.connect(UART_IRQ, serial.clone());
 
+    // The four wires the root complex swizzles its functions onto, in the order the
+    // tree's `interrupt-map` lists them.
+    let pins: [Line; pci::PINS] = std::array::from_fn(|_| Line::default());
+    for (pin, line) in pins.iter().enumerate() {
+        plic.connect(PCI_IRQ + pin, line.clone());
+    }
+    let root = Root::new(pins);
+    root.plug(HOST_BRIDGE, Box::new(HostBridge));
+
     bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::new(harts)));
     bus.attach(plic::BASE, plic::SIZE, Box::new(plic));
     bus.attach(
@@ -263,7 +278,39 @@ pub fn virt(bus: &mut Bus, harts: usize) -> Keyboard {
         uart::SIZE,
         Box::new(Uart::new(serial, keyboard.clone(), Box::new(io::stdout()))),
     );
+    bus.attach(pci::ECAM, pci::ECAM_SIZE, Box::new(root.config()));
+    bus.attach(pci::MMIO, pci::MMIO_SIZE, Box::new(root.window(pci::MMIO)));
+    bus.attach(
+        pci::MMIO64,
+        pci::MMIO64_SIZE,
+        Box::new(root.window(pci::MMIO64)),
+    );
+    bus.attach(pci::PIO, pci::PIO_SIZE, Box::new(Ports));
     keyboard
+}
+
+/// The `interrupt-map` of the root complex: for each of the four device numbers the
+/// mask below keeps, and each of the four pins, which controller and which of its
+/// sources that combination reaches.
+///
+/// Six cells an entry: three for the child address, of which only the device number
+/// matters, one for the pin, one for the controller and one for its source. It has to
+/// say exactly what `pci::swizzle` computes, or an interrupt arrives as another one.
+fn interrupt_map(harts: usize) -> Vec<u32> {
+    (0..pci::PINS)
+        .flat_map(|device| {
+            (1..=pci::PINS as u32).flat_map(move |pin| {
+                [
+                    (device << 11) as u32,
+                    0,
+                    0,
+                    pin,
+                    plic_phandle(harts),
+                    (PCI_IRQ + pci::swizzle(device, pin as u8)) as u32,
+                ]
+            })
+        })
+        .collect()
 }
 
 /// The same machine, described. Firmware and a kernel read this to find what `virt`
@@ -353,6 +400,59 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8>
     fdt.cells("phandle", &[plic_phandle(harts)]);
     fdt.end_node();
 
+    // What the guest enumerates rather than what it is told: the tree says where
+    // config space is and which addresses the windows hand out, and everything below
+    // that the guest finds for itself.
+    fdt.begin_node(&format!("pci@{:x}", pci::ECAM));
+    fdt.strings("compatible", &["pci-host-ecam-generic"]);
+    fdt.string("device_type", "pci");
+    fdt.reg(pci::ECAM, pci::ECAM_SIZE);
+    // Three cells to name an address below here, because the first of them holds
+    // which space it is in and which function it belongs to rather than any of the
+    // address. PCI Bus Binding to Open Firmware, 2.2.1.
+    fdt.cells("#address-cells", &[3]);
+    fdt.cells("#size-cells", &[2]);
+    fdt.cells("#interrupt-cells", &[1]);
+    fdt.cells("bus-range", &[0, 0xff]);
+    fdt.cells("linux,pci-domain", &[0]);
+    // Nothing on this machine caches, so a device reads what the hart wrote.
+    fdt.flag("dma-coherent");
+    // Each window as the space it is in, the address it starts at down there, the
+    // address it starts at up here, and how big it is. The first cell's top two bits
+    // are the space: one is ports, two is a 32-bit window and three a 64-bit one.
+    fdt.cells(
+        "ranges",
+        &[
+            0x0100_0000,
+            0,
+            0,
+            (pci::PIO >> 32) as u32,
+            pci::PIO as u32,
+            (pci::PIO_SIZE >> 32) as u32,
+            pci::PIO_SIZE as u32,
+            0x0200_0000,
+            (pci::MMIO >> 32) as u32,
+            pci::MMIO as u32,
+            (pci::MMIO >> 32) as u32,
+            pci::MMIO as u32,
+            (pci::MMIO_SIZE >> 32) as u32,
+            pci::MMIO_SIZE as u32,
+            0x0300_0000,
+            (pci::MMIO64 >> 32) as u32,
+            pci::MMIO64 as u32,
+            (pci::MMIO64 >> 32) as u32,
+            pci::MMIO64 as u32,
+            (pci::MMIO64_SIZE >> 32) as u32,
+            pci::MMIO64_SIZE as u32,
+        ],
+    );
+    // Only the low two bits of the device number and the pin decide which wire an
+    // interrupt lands on, which is what makes sixteen entries enough for a bus of
+    // thirty-two devices.
+    fdt.cells("interrupt-map-mask", &[0x1800, 0, 0, 7]);
+    fdt.cells("interrupt-map", &interrupt_map(harts));
+    fdt.end_node();
+
     fdt.begin_node(&format!("clint@{:x}", clint::BASE));
     fdt.strings("compatible", &["riscv,clint0", "sifive,clint0"]);
     fdt.reg(clint::BASE, clint::SIZE);
@@ -364,4 +464,18 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot) -> Vec<u8>
     fdt.end_node();
     fdt.end_node();
     fdt.finish(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A machine has to be able to cross a thread boundary, because phase 10 puts the
+    /// window on the main thread and the harts on another. Nothing does that yet, so
+    /// this is what notices the day something on the bus stops allowing it.
+    #[test]
+    fn a_machine_can_be_handed_to_another_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Machine>();
+    }
 }

@@ -11,6 +11,7 @@ mod interrupt;
 mod memory;
 mod muldiv;
 mod paging;
+mod pci;
 mod privilege;
 mod program;
 mod serial;

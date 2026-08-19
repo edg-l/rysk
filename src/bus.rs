@@ -48,6 +48,14 @@ impl Bus {
     /// claim the same address, and a machine that says they do is built wrong.
     pub fn attach(&mut self, base: u64, size: u64, device: Box<dyn Device>) {
         let range = base..base + size;
+        // Dram is answered before the devices are searched, so a device underneath it
+        // would never be reached. That is a machine built wrong rather than a device
+        // that quietly stops answering, and it only becomes reachable once a machine
+        // has a window above dram and enough memory to grow into it.
+        assert!(
+            range.start >= DRAM_BASE + self.dram.size() || range.end <= DRAM_BASE,
+            "dram already answers for part of {range:#x?}"
+        );
         let at = self
             .devices
             .partition_point(|(existing, _)| existing.start < range.start);

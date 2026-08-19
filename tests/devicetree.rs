@@ -5,7 +5,7 @@
 //! the blob it is in, that every node closes, and that the addresses in the tree are
 //! the ones the bus decodes.
 
-use rysk::{bus::DRAM_BASE, clint, dram::DRAM_SIZE, machine, plic, uart};
+use rysk::{bus::DRAM_BASE, clint, dram::DRAM_SIZE, machine, pci, plic, uart};
 use std::collections::HashMap;
 
 /// Every property in the tree, by its path, which is enough to check what a driver
@@ -222,4 +222,99 @@ fn every_hart_is_described_and_named_by_the_number_it_reports() {
             .flat_map(|&hart| [hart, 3, hart, 7])
             .collect::<Vec<_>>(),
     );
+}
+
+#[test]
+fn the_tree_says_where_the_root_complex_is_and_where_its_interrupts_go() {
+    let tree = parse(&machine::describe(
+        "rv64imac",
+        DRAM_SIZE,
+        2,
+        &machine::Boot::default(),
+    ));
+    let node = "/soc/pci@30000000";
+
+    assert_eq!(
+        text(&tree[&format!("{node}/compatible")]),
+        "pci-host-ecam-generic",
+        "the binding a kernel already has a driver for"
+    );
+    assert_eq!(
+        cells(&tree[&format!("{node}/reg")]),
+        [
+            (pci::ECAM >> 32) as u32,
+            pci::ECAM as u32,
+            (pci::ECAM_SIZE >> 32) as u32,
+            pci::ECAM_SIZE as u32
+        ],
+        "config space, which is the only part of it that is placed rather than found"
+    );
+    assert_eq!(
+        cells(&tree[&format!("{node}/bus-range")]),
+        [0, 0xff],
+        "as many buses as config space has room for"
+    );
+    assert_eq!(cells(&tree[&format!("{node}/#address-cells")]), [3]);
+    assert_eq!(cells(&tree[&format!("{node}/#interrupt-cells")]), [1]);
+
+    // Each window as the space it is in, where it starts down there, where it starts
+    // up here, and how big it is.
+    let ranges = cells(&tree[&format!("{node}/ranges")]);
+    assert_eq!(ranges.len(), 21, "three windows of seven cells each");
+    let window = |n: usize| {
+        let w = &ranges[n * 7..n * 7 + 7];
+        (
+            w[0] >> 24,
+            ((w[3] as u64) << 32) | w[4] as u64,
+            ((w[5] as u64) << 32) | w[6] as u64,
+        )
+    };
+    assert_eq!(
+        window(0),
+        (0x01, pci::PIO, pci::PIO_SIZE),
+        "the port window"
+    );
+    assert_eq!(
+        window(1),
+        (0x02, pci::MMIO, pci::MMIO_SIZE),
+        "the 32-bit window, which ends where dram begins"
+    );
+    assert_eq!(
+        window(1).1 + window(1).2,
+        DRAM_BASE,
+        "and really does end there"
+    );
+    assert_eq!(
+        window(2),
+        (0x03, pci::MMIO64, pci::MMIO64_SIZE),
+        "the 64-bit window"
+    );
+
+    // The map has to say exactly what the swizzle computes, or an interrupt is
+    // delivered as a different one than the tree promised.
+    assert_eq!(
+        cells(&tree[&format!("{node}/interrupt-map-mask")]),
+        [0x1800, 0, 0, 7]
+    );
+    let map = cells(&tree[&format!("{node}/interrupt-map")]);
+    assert_eq!(
+        map.len(),
+        16 * 6,
+        "four devices of four pins, six cells each"
+    );
+    let plic = cells(&tree["/soc/plic@c000000/phandle"])[0];
+    let ndev = cells(&tree["/soc/plic@c000000/riscv,ndev"])[0];
+    for entry in map.chunks(6) {
+        let (device, pin) = ((entry[0] >> 11) as usize, entry[3] as u8);
+        assert_eq!(entry[4], plic, "every pin runs to the platform controller");
+        assert_eq!(
+            entry[5] as usize,
+            32 + pci::swizzle(device, pin),
+            "device {device} pin {pin} lands where the swizzle puts it"
+        );
+        assert!(
+            entry[5] <= ndev,
+            "on a source the controller says it answers for"
+        );
+    }
 }

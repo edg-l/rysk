@@ -33,6 +33,7 @@ pub mod icache;
 pub mod inst;
 pub mod machine;
 pub mod mmu;
+pub mod pci;
 pub mod plic;
 pub mod rvc;
 pub mod trap;

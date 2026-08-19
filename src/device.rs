@@ -31,7 +31,10 @@ impl Line {
     }
 }
 
-pub trait Device: std::fmt::Debug {
+/// `Send`, because phase 10 puts the window on the main thread and the harts on
+/// another, and a machine cannot cross a thread boundary if the things on its bus
+/// cannot. Everything here already qualifies; saying so is what keeps it that way.
+pub trait Device: std::fmt::Debug + Send {
     /// Read `size` bits at `offset` from the device's base.
     ///
     /// This takes `&mut self` because a read can be an action rather than a question:
