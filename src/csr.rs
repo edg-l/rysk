@@ -176,7 +176,10 @@ pub fn exists(addr: usize) -> bool {
 /// The RISC-V Instruction Set Manual Volume II, 12.1.1 and 12.1.3.
 pub fn alias(addr: usize, mideleg: u64) -> Option<(usize, u64, u64)> {
     match addr {
-        SSTATUS => Some((MSTATUS, SSTATUS_MASK, MSTATUS_UXL)),
+        // `SD` is readable and not writable: it is what `FS` says rather than a bit
+        // of its own, which is how a supervisor can tell in one test whether there is
+        // any extended state worth saving.
+        SSTATUS => Some((MSTATUS, SSTATUS_MASK, MSTATUS_UXL | MSTATUS_SD)),
         SIE => Some((MIE, mideleg, 0)),
         SIP => Some((MIP, mideleg, 0)),
         _ => None,
