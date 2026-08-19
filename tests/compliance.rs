@@ -21,15 +21,7 @@ fn corpus() -> PathBuf {
 /// Tests that need something rysk does not have yet, and what each of them waits on.
 /// A test on this list is expected to fail; one that starts passing is reported, so the
 /// list can only shrink and cannot quietly go stale.
-const WAITING: &[(&str, &str)] = &[
-    ("rv64mi-p-breakpoint", "debug triggers"),
-    (
-        "rv64mi-p-illegal",
-        "sfence.vma, satp, and the trap-enable bits of mstatus",
-    ),
-    ("rv64si-p-dirty", "sv39, and the accessed and dirty bits"),
-    ("rv64si-p-icache-alias", "sv39"),
-];
+const WAITING: &[(&str, &str)] = &[("rv64mi-p-breakpoint", "debug triggers")];
 
 /// Run every test whose name starts with `group`, and report all of the failures
 /// rather than only the first.

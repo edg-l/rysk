@@ -18,6 +18,7 @@ pub struct Program {
     code: Vec<u8>,
     regs: Vec<(u32, u64)>,
     csrs: Vec<(usize, u64)>,
+    memory: Vec<(u64, u64)>,
     mode: Mode,
     devices: Vec<(u64, u64, Box<dyn Device>)>,
 }
@@ -38,6 +39,7 @@ fn image(code: Vec<u8>) -> Program {
         code,
         regs: Vec::new(),
         csrs: Vec::new(),
+        memory: Vec::new(),
         mode: Mode::Machine,
         devices: Vec::new(),
     }
@@ -60,6 +62,13 @@ impl Program {
     /// Put a device on the bus, answering for `size` bytes from `base`.
     pub fn device(mut self, base: u64, size: u64, device: Box<dyn Device>) -> Self {
         self.devices.push((base, size, device));
+        self
+    }
+
+    /// Place a doubleword in dram before the run, for the page tables a translation
+    /// test needs and for anything else that has to be there rather than written.
+    pub fn memory(mut self, addr: u64, value: u64) -> Self {
+        self.memory.push((addr, value));
         self
     }
 
@@ -97,6 +106,9 @@ impl Program {
             cpu.csrs[csr] = value;
         }
         cpu.mode = self.mode;
+        for (addr, value) in self.memory {
+            cpu.bus.dram.store(addr, 64, value);
+        }
         for (base, size, device) in self.devices {
             cpu.bus.attach(base, size, device);
         }

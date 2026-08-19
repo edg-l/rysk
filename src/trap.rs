@@ -19,6 +19,9 @@ pub enum Exception {
     StoreAmoAddressMisaligned(u64),
     StoreAmoAccessFault(u64),
     EnvironmentCall(Mode),
+    InstructionPageFault(u64),
+    LoadPageFault(u64),
+    StoreAmoPageFault(u64),
 }
 
 impl Exception {
@@ -36,6 +39,9 @@ impl Exception {
             Self::EnvironmentCall(Mode::User) => 8,
             Self::EnvironmentCall(Mode::Supervisor) => 9,
             Self::EnvironmentCall(Mode::Machine) => 11,
+            Self::InstructionPageFault(_) => 12,
+            Self::LoadPageFault(_) => 13,
+            Self::StoreAmoPageFault(_) => 15,
         }
     }
 
@@ -49,7 +55,10 @@ impl Exception {
             | Self::LoadAddressMisaligned(v)
             | Self::LoadAccessFault(v)
             | Self::StoreAmoAddressMisaligned(v)
-            | Self::StoreAmoAccessFault(v) => *v,
+            | Self::StoreAmoAccessFault(v)
+            | Self::InstructionPageFault(v)
+            | Self::LoadPageFault(v)
+            | Self::StoreAmoPageFault(v) => *v,
             Self::EnvironmentCall(_) => 0,
         }
     }
@@ -62,6 +71,9 @@ impl Exception {
     pub fn at(self, addr: u64) -> Self {
         match self {
             Self::InstructionAddressMisaligned(_) => Self::InstructionAddressMisaligned(addr),
+            Self::InstructionPageFault(_) => Self::InstructionPageFault(addr),
+            Self::LoadPageFault(_) => Self::LoadPageFault(addr),
+            Self::StoreAmoPageFault(_) => Self::StoreAmoPageFault(addr),
             Self::InstructionAccessFault(_) => Self::InstructionAccessFault(addr),
             Self::Breakpoint(_) => Self::Breakpoint(addr),
             Self::LoadAddressMisaligned(_) => Self::LoadAddressMisaligned(addr),
@@ -84,6 +96,9 @@ impl std::fmt::Display for Exception {
             Self::LoadAccessFault(_) => "load access fault",
             Self::StoreAmoAddressMisaligned(_) => "store/amo address misaligned",
             Self::StoreAmoAccessFault(_) => "store/amo access fault",
+            Self::InstructionPageFault(_) => "instruction page fault",
+            Self::LoadPageFault(_) => "load page fault",
+            Self::StoreAmoPageFault(_) => "store/amo page fault",
             Self::EnvironmentCall(_) => "environment call",
         };
         match self {

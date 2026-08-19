@@ -28,6 +28,17 @@ pub const MSTATUS_SPIE: u64 = 5;
 pub const MSTATUS_SPP: u64 = 8;
 pub const MSTATUS_SUM: u64 = 18;
 pub const MSTATUS_MXR: u64 = 19;
+/// When set, a load or store is translated and checked as if the hart were in the mode
+/// `MPP` names. An instruction fetch is not affected.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.6.3.
+pub const MSTATUS_MPRV: u64 = 17;
+/// The three bits that take a supervisor's privileges away one at a time, so that a
+/// machine or a hypervisor underneath it can see what it was about to do: `TVM`
+/// intercepts the page table, `TW` the idle loop, and `TSR` the return from a trap.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.6.5.
+pub const MSTATUS_TVM: u64 = 20;
+pub const MSTATUS_TW: u64 = 21;
+pub const MSTATUS_TSR: u64 = 22;
 /// The fields of `mstatus` that `sstatus` exposes. `FS`, `VS`, `XS` and the `SD` that
 /// summarises them are absent because rysk has no floating-point or vector state, so
 /// they are read-only zero, and `UXL` because a machine that implements a single width
@@ -57,6 +68,7 @@ pub const SEPC: usize = 0x141;
 pub const SCAUSE: usize = 0x142;
 pub const STVAL: usize = 0x143;
 pub const SIP: usize = 0x144;
+pub const SATP: usize = 0x180;
 pub const MEDELEG: usize = 0x302;
 pub const MIDELEG: usize = 0x303;
 /// The interrupt bits of `mip` and `mie`, which share their layout with `mcause`'s

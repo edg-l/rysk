@@ -151,6 +151,7 @@ pub enum Op {
     Mret,
     Sret,
     Wrs { timeout: bool },
+    SfenceVma,
     Wfi,
     // atomics
     Lr { width: Width },
@@ -349,16 +350,23 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
             // The csr number occupies the same bits as an I-immediate, unsigned.
             let csr = ((inst >> 20) & 0xfff) as u64;
             let op = match funct3 {
-                // funct3 of zero is not a csr access: the whole immediate selects a
-                // privileged instruction, and rd and rs1 must be zero.
-                0x0 if rd == 0 && rs1 == 0 => match csr {
-                    0x000 => Op::Ecall,
-                    0x001 => Op::Ebreak,
-                    0x302 => Op::Mret,
-                    0x102 => Op::Sret,
-                    0x105 => Op::Wfi,
-                    0x00d => Op::Wrs { timeout: false },
-                    0x01d => Op::Wrs { timeout: true },
+                // funct3 of zero is not a csr access: the immediate selects a
+                // privileged instruction instead.
+                0x0 if rd == 0 => match (csr >> 5, rs1) {
+                    // sfence.vma is the one that takes operands: an address in rs1 and
+                    // an address space in rs2, either of which being x0 means all of
+                    // them. So its immediate is not a whole constant like the rest.
+                    (0x09, _) => Op::SfenceVma,
+                    (_, 0) => match csr {
+                        0x000 => Op::Ecall,
+                        0x001 => Op::Ebreak,
+                        0x302 => Op::Mret,
+                        0x102 => Op::Sret,
+                        0x105 => Op::Wfi,
+                        0x00d => Op::Wrs { timeout: false },
+                        0x01d => Op::Wrs { timeout: true },
+                        _ => return Err(illegal),
+                    },
                     _ => return Err(illegal),
                 },
                 0x1 => Op::Csrrw { immediate: false },
@@ -499,6 +507,7 @@ impl fmt::Display for Inst {
             Op::Mret => write!(f, "mret"),
             Op::Sret => write!(f, "sret"),
             Op::Wfi => write!(f, "wfi"),
+            Op::SfenceVma => write!(f, "sfence.vma {rs1}, {rs2}"),
             Op::Wrs { timeout } => {
                 write!(f, "wrs.{}", if timeout { "sto" } else { "nto" })
             }

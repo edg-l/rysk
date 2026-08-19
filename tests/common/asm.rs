@@ -223,6 +223,10 @@ pub const fn sret() -> u32 {
     i(0x102, 0, 0x0, 0, 0x73)
 }
 
+pub const fn sfence_vma(rs1: u32, rs2: u32) -> u32 {
+    r(0x09, rs2, rs1, 0x0, 0, 0x73)
+}
+
 pub const fn wrs_nto() -> u32 {
     i(0x00d, 0, 0x0, 0, 0x73)
 }

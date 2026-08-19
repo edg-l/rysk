@@ -10,6 +10,7 @@ mod integer;
 mod interrupt;
 mod memory;
 mod muldiv;
+mod paging;
 mod privilege;
 mod program;
 mod serial;

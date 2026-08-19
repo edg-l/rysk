@@ -9,6 +9,7 @@ use crate::{
     dram::{DRAM_SIZE, Dram},
     elf::{Error as ElfError, Image},
     inst::{self, AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
+    mmu::Access,
     rvc,
     trap::{Exception, Interrupt, Trap},
 };
@@ -256,10 +257,22 @@ impl Cpu {
     /// The RISC-V Instruction Set Manual Volume II, 2.1.
     fn check_csr(&self, addr: usize, word: u32, write: bool) -> Result<(), Exception> {
         let least = ((addr >> 8) & 0b11) as u64;
-        if (write && addr >> 10 == 0b11) || (self.mode as u64) < least {
+        if (write && addr >> 10 == 0b11)
+            || (self.mode as u64) < least
+            // satp is the one CSR whose address does not say everything: a machine
+            // that has set TVM wants to be told before a supervisor changes the page
+            // table. The RISC-V Instruction Set Manual Volume II, 3.1.6.5.
+            || (addr == SATP && self.trapped(MSTATUS_TVM))
+        {
             return Err(Exception::IllegalInstruction(word as u64));
         }
         Ok(())
+    }
+
+    /// Whether one of `mstatus`'s trap-enable bits is holding this supervisor back.
+    /// None of them applies in machine mode, which is where they are set from.
+    fn trapped(&self, bit: u64) -> bool {
+        self.mode < Mode::Machine && (self.csrs[MSTATUS] >> bit) & 1 == 1
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
@@ -302,6 +315,15 @@ impl Cpu {
             // two-byte target legal.
             // The RISC-V Instruction Set Manual Volume II, 3.1.14.
             MEPC | SEPC => self.csrs[addr] = value & !1,
+            // satp's mode is WARL over the schemes the machine has, which is how
+            // software finds out which those are: it writes one and reads it back.
+            // rysk has bare and Sv39. The RISC-V Instruction Set Manual Volume II,
+            // 12.1.11.
+            SATP => {
+                if matches!(value >> 60, 0 | 8) {
+                    self.csrs[SATP] = value;
+                }
+            }
             // The bits a device drives are read-only here: a write cannot argue with a
             // wire. The RISC-V Instruction Set Manual Volume II, 3.1.9.
             MIP => self.csrs[MIP] = (self.csrs[MIP] & MIP_DEVICE) | (value & !MIP_DEVICE),
@@ -340,24 +362,76 @@ impl Cpu {
     /// there would fault on bytes it does not have.
     #[inline]
     fn fetch(&mut self) -> Result<(Inst, u32), Exception> {
-        let half = self.halfword(self.pc)?;
+        let pa = self.translate(self.pc, Access::Fetch)?;
+        let half = self.halfword(pa)?;
         if inst::length(half) == 2 {
             return Ok((rvc::decode(half)?, half as u32));
         }
-        let word = half as u32 | (self.halfword(self.pc + 2)? as u32) << 16;
+        // Both halves are in the same page unless the first one ends it, which is the
+        // only place a translation could differ between them.
+        let next = if self.pc & 0xfff == 0xffe {
+            self.translate(self.pc + 2, Access::Fetch)?
+        } else {
+            pa + 2
+        };
+        let word = half as u32 | (self.halfword(next)? as u32) << 16;
         Ok((decode(word)?, word))
     }
 
     #[inline]
-    fn halfword(&mut self, addr: u64) -> Result<u16, Exception> {
+    fn halfword(&mut self, pa: u64) -> Result<u16, Exception> {
         self.bus
-            .load(addr, 16)
+            .load(pa, 16)
             .map(|half| half as u16)
             .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 
+    /// Read `bits` at a virtual address.
+    ///
+    /// An access that is not aligned to its own width can straddle two pages, which
+    /// are separate translations and may be separately absent, so that case is read a
+    /// byte at a time. It is rare enough to be worth the branch and wrong enough to be
+    /// worth handling. Only while translating: a device is entitled to see the access
+    /// it was given rather than a row of byte-sized ones.
+    fn read(&mut self, va: u64, bits: u64) -> Result<u64, Exception> {
+        if Self::straddles(va, bits) && self.translating(Access::Load) {
+            let mut value = 0;
+            for byte in 0..bits / 8 {
+                let pa = self.translate(va + byte, Access::Load)?;
+                value |= self.bus.load(pa, 8)? << (byte * 8);
+            }
+            return Ok(value);
+        }
+        let pa = self.translate(va, Access::Load)?;
+        self.bus.load(pa, bits)
+    }
+
+    /// Write `bits` at a virtual address, with the same care about page boundaries.
+    fn write(&mut self, va: u64, bits: u64, value: u64) -> Result<(), Exception> {
+        if Self::straddles(va, bits) && self.translating(Access::Store) {
+            // Both halves are translated before either is written, so an access that
+            // faults part way through has not half happened.
+            for byte in 0..bits / 8 {
+                self.translate(va + byte, Access::Store)?;
+            }
+            for byte in 0..bits / 8 {
+                let pa = self.translate(va + byte, Access::Store)?;
+                self.bus.store(pa, 8, value >> (byte * 8))?;
+            }
+            return Ok(());
+        }
+        let pa = self.translate(va, Access::Store)?;
+        self.bus.store(pa, bits, value)
+    }
+
+    /// Whether an access of `bits` at `va` reaches into the page after it.
+    #[inline]
+    const fn straddles(va: u64, bits: u64) -> bool {
+        (va & 0xfff) + bits / 8 > 0x1000
+    }
+
     /// Carry out one decoded instruction.
-    fn execute(&mut self, inst: Inst, word: u32) -> Result<(), Exception> {
+    fn execute(&mut self, inst: Inst, encoding: u32) -> Result<(), Exception> {
         let Inst {
             op,
             rd,
@@ -442,14 +516,14 @@ impl Cpu {
 
             // ---------------------------------------------------------- memory
             Op::Load { width, signed } => {
-                let value = self.bus.load(a.wrapping_add(imm), width.bits())?;
+                let value = self.read(a.wrapping_add(imm), width.bits())?;
                 self.regs[rd] = if signed {
                     Self::sext(value, width.bits())
                 } else {
                     value
                 };
             }
-            Op::Store { width } => self.bus.store(a.wrapping_add(imm), width.bits(), b)?,
+            Op::Store { width } => self.write(a.wrapping_add(imm), width.bits(), b)?,
 
             // ---------------------------------------------------------- control
             Op::Lui => self.regs[rd] = imm,
@@ -486,7 +560,7 @@ impl Cpu {
             // names no source: x0 for the register forms, zero for the immediate ones.
             Op::Csrrw { immediate } => {
                 let source = if immediate { rs1 as u64 } else { a };
-                self.check_csr(imm as usize, word, true)?;
+                self.check_csr(imm as usize, encoding, true)?;
                 // With nowhere to put the result there is no read at all.
                 if rd != 0 {
                     self.regs[rd] = self.load_csr(imm as usize);
@@ -497,7 +571,7 @@ impl Cpu {
                 let source = if immediate { rs1 as u64 } else { a };
                 // Naming no bits to change is not a write, so a read-only csr is still
                 // readable this way.
-                self.check_csr(imm as usize, word, rs1 != 0)?;
+                self.check_csr(imm as usize, encoding, rs1 != 0)?;
                 let csr = self.load_csr(imm as usize);
                 // A source of x0, or of zero for the immediate forms, names no bits to
                 // change, and then the csr is not written at all.
@@ -522,8 +596,8 @@ impl Cpu {
                 } else {
                     Mode::Supervisor
                 };
-                if self.mode < mode {
-                    return Err(Exception::IllegalInstruction(word as u64));
+                if self.mode < mode || (mode == Mode::Supervisor && self.trapped(MSTATUS_TSR)) {
+                    return Err(Exception::IllegalInstruction(encoding as u64));
                 }
                 self.trap_return(mode);
             }
@@ -545,9 +619,24 @@ impl Cpu {
             // the manual permits for any reason. Devices that master the bus would
             // make this a real wait.
             // The RISC-V Instruction Set Manual Volume I, 14.1.
+            // There is no address-translation cache to invalidate yet, so ordering
+            // the walk against the stores that changed the table is all this has to
+            // do, and one in-order hart does that by itself. It still has to be a
+            // supervisor asking. The RISC-V Instruction Set Manual Volume II, 12.2.1.
+            Op::SfenceVma => {
+                if self.mode < Mode::Supervisor || self.trapped(MSTATUS_TVM) {
+                    return Err(Exception::IllegalInstruction(encoding as u64));
+                }
+            }
+
             Op::Wrs { .. } => {}
 
             Op::Wfi => {
+                // With TW set, a wait below machine mode has to end within a bounded
+                // time or trap, and rysk's bound is no time at all.
+                if self.trapped(MSTATUS_TW) {
+                    return Err(Exception::IllegalInstruction(encoding as u64));
+                }
                 self.refresh_mip();
                 while self.csrs[MIP] & self.csrs[MIE] == 0 {
                     std::hint::spin_loop();
@@ -572,6 +661,9 @@ impl Cpu {
                 if a & (bytes - 1) != 0 {
                     return Err(Exception::StoreAmoAddressMisaligned(a));
                 }
+                // A compare-and-swap writes, so it needs a page it may write, and a
+                // quadword's second half is inside the page its first half is in.
+                let a = self.translate(a, Access::Store)?;
                 match width {
                     // A pair beginning at x0 reads as zero at both halves, and one
                     // named as the destination discards the result entirely rather
@@ -617,6 +709,14 @@ impl Cpu {
                 if a & (bits / 8 - 1) != 0 {
                     return Err(Exception::StoreAmoAddressMisaligned(a));
                 }
+                // A load-reserved only reads; everything else here writes. The
+                // reservation is on the physical address, which is what another hart
+                // would be storing to.
+                let access = match op {
+                    Op::Lr { .. } => Access::Load,
+                    _ => Access::Store,
+                };
+                let a = self.translate(a, access)?;
                 match op {
                     Op::Lr { .. } => {
                         self.regs[rd] = Self::sext(self.bus.load(a, bits)?, bits);

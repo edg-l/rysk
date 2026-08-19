@@ -3,7 +3,8 @@ use rysk::{
     bus::DRAM_BASE,
     csr::{
         MCAUSE, MEDELEG, MEPC, MSTATUS, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE,
-        MSTATUS_SPIE, MSTATUS_SPP, MTVAL, MTVEC, Mode, SCAUSE, SEPC, STVAL, STVEC,
+        MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW, MTVAL, MTVEC, Mode,
+        SCAUSE, SEPC, STVAL, STVEC,
     },
     trap::Exception,
 };
@@ -215,4 +216,33 @@ fn a_fault_below_machine_mode_still_reports_its_value() {
     assert_eq!(cpu.csrs[MCAUSE], 5, "load access fault");
     assert_eq!(cpu.csrs[MTVAL], 2, "the address it tried to read");
     assert_eq!(cpu.csrs[MSTATUS] & MSTATUS_MPP, mpp(Mode::Supervisor));
+}
+
+#[test]
+fn the_trap_enable_bits_take_a_supervisors_privileges_away_one_at_a_time() {
+    let satp = csrrs(A0, 0x180, ZERO);
+    let fence = sfence_vma(ZERO, ZERO);
+    // TVM intercepts the page table: reading satp and invalidating a translation both
+    // stop being a supervisor's to do.
+    for inst in [satp, fence] {
+        prog(&[inst])
+            .mode(Mode::Supervisor)
+            .csr(MSTATUS, 1 << MSTATUS_TVM)
+            .expect(Exception::IllegalInstruction(inst as u64));
+        prog(&[inst]).mode(Mode::Supervisor).run();
+        // and none of them applies to the mode that sets them
+        prog(&[inst]).csr(MSTATUS, 1 << MSTATUS_TVM).run();
+    }
+
+    // TSR intercepts the return from a trap.
+    prog(&[sret()])
+        .mode(Mode::Supervisor)
+        .csr(MSTATUS, 1 << MSTATUS_TSR)
+        .expect(Exception::IllegalInstruction(sret() as u64));
+
+    // TW intercepts the idle loop, whose bounded wait here is no wait at all.
+    prog(&[wfi()])
+        .mode(Mode::Supervisor)
+        .csr(MSTATUS, 1 << MSTATUS_TW)
+        .expect(Exception::IllegalInstruction(wfi() as u64));
 }

@@ -24,6 +24,7 @@ pub mod elf;
 pub mod htif;
 pub mod inst;
 pub mod machine;
+pub mod mmu;
 pub mod plic;
 pub mod rvc;
 pub mod trap;

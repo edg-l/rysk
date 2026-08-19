@@ -132,6 +132,8 @@ fwd:
   amocas.h t0, t2, (t1)
   wrs.nto
   wrs.sto
+  sfence.vma
+  sfence.vma t0, t1
 
   amocas.w t0, t2, (t1)
   amocas.d t0, t2, (t1)

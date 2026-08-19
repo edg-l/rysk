@@ -58,7 +58,7 @@ fn encoder_matches_the_toolchain() {
         ecall(), ebreak(), mret(), sret(), wfi(),
         amoadd_b(T0, T2, T1), amomin_h(T0, T2, T1), amomaxu_b(T0, T2, T1),
         amoswap_h(T0, T2, T1), amocas_b(T0, T2, T1), amocas_h(T0, T2, T1),
-        wrs_nto(), wrs_sto(),
+        wrs_nto(), wrs_sto(), sfence_vma(ZERO, ZERO), sfence_vma(T0, T1),
         amocas_w(T0, T2, T1), amocas_d(T0, T2, T1), amocas_q(A0, A2, T1),
         fence(), fence_i(),
     ];
@@ -150,6 +150,7 @@ fn decoding_round_trips_to_readable_assembly() {
         (amocas_q(A0, A2, T1), "amocas.q a0, a2, (t1)"),
         (amoadd_b(T0, T2, T1), "amoadd.b t0, t2, (t1)"),
         (wrs_sto(), "wrs.sto"),
+        (sfence_vma(T0, T1), "sfence.vma t0, t1"),
         (czero_eqz(A0, A1, A2), "czero.eqz a0, a1, a2"),
     ];
     for &(encoding, text) in cases {
