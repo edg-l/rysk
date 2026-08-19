@@ -42,7 +42,7 @@ impl Format {
         self.min_exp() - (self.sig as i32 - 1)
     }
 
-    const fn sign_bit(self) -> u64 {
+    pub const fn sign_bit(self) -> u64 {
         1 << (self.bits - 1)
     }
 
@@ -143,7 +143,7 @@ enum Number {
     Zero(bool),
     Infinite(bool),
     /// Carrying whether it was signalling.
-    NotANumber(bool),
+    Nan(bool),
     Finite {
         sign: bool,
         exp: i32,
@@ -155,18 +155,18 @@ impl Number {
     fn sign(self) -> bool {
         match self {
             Self::Zero(sign) | Self::Infinite(sign) | Self::Finite { sign, .. } => sign,
-            Self::NotANumber(_) => false,
+            Self::Nan(_) => false,
         }
     }
 
     fn is_nan(self) -> bool {
-        matches!(self, Self::NotANumber(_))
+        matches!(self, Self::Nan(_))
     }
 
     /// A NaN that has to be reported as an invalid operation: a signalling one always,
     /// and a quiet one never.
     fn signalling(self) -> bool {
-        matches!(self, Self::NotANumber(true))
+        matches!(self, Self::Nan(true))
     }
 }
 
@@ -185,7 +185,7 @@ fn unpack(f: Format, bits: u64) -> Number {
             sig: sig as u128,
         },
         (e, 0) if e == top => Number::Infinite(sign),
-        (e, _) if e == top => Number::NotANumber(sig & f.quiet_bit() == 0),
+        (e, _) if e == top => Number::Nan(sig & f.quiet_bit() == 0),
         (e, _) => Number::Finite {
             sign,
             exp: e - f.bias() - (f.sig as i32 - 1),
@@ -487,7 +487,7 @@ pub fn sqrt(f: Format, a: u64, mode: Round) -> Outcome {
             let root = integer_sqrt(sig);
             round(f, false, exp / 2, root, root * root != sig, mode)
         }
-        Number::NotANumber(_) => unreachable!("answered above"),
+        Number::Nan(_) => unreachable!("answered above"),
     }
 }
 
@@ -561,7 +561,7 @@ pub fn fma(f: Format, a: u64, b: u64, c: u64, mode: Round) -> Outcome {
                 sig: gc,
             },
         ) => add_finite(f, (product_sign, exp, sig), (sign, ec, gc), mode),
-        (_, Number::NotANumber(_)) => unreachable!("answered above"),
+        (_, Number::Nan(_)) => unreachable!("answered above"),
     }
 }
 
@@ -578,7 +578,7 @@ fn compare(f: Format, a: u64, b: u64) -> Option<std::cmp::Ordering> {
             Number::Zero(sign) => (sign, i32::MIN, 0),
             Number::Infinite(sign) => (sign, i32::MAX, 0),
             Number::Finite { sign, exp, sig } => (sign, exp, sig),
-            Number::NotANumber(_) => unreachable!("answered above"),
+            Number::Nan(_) => unreachable!("answered above"),
         }
     };
     // Two zeroes are equal whichever signs they carry.
@@ -658,8 +658,8 @@ pub fn min_max(f: Format, a: u64, b: u64, want_max: bool) -> Outcome {
 /// Which of the ten kinds of value this is.
 pub fn classify(f: Format, a: u64) -> u64 {
     match unpack(f, a) {
-        Number::NotANumber(true) => CLASS_SIGNALLING_NAN,
-        Number::NotANumber(false) => CLASS_QUIET_NAN,
+        Number::Nan(true) => CLASS_SIGNALLING_NAN,
+        Number::Nan(false) => CLASS_QUIET_NAN,
         Number::Infinite(true) => CLASS_NEG_INF,
         Number::Infinite(false) => CLASS_POS_INF,
         Number::Zero(true) => CLASS_NEG_ZERO,
@@ -679,7 +679,7 @@ pub fn classify(f: Format, a: u64) -> u64 {
 /// Move a number from one format to another.
 pub fn convert(from: Format, to: Format, a: u64, mode: Round) -> Outcome {
     match unpack(from, a) {
-        Number::NotANumber(signalling) => (to.canonical_nan(), if signalling { NV } else { 0 }),
+        Number::Nan(signalling) => (to.canonical_nan(), if signalling { NV } else { 0 }),
         Number::Infinite(sign) => (to.infinity(sign), 0),
         Number::Zero(sign) => (to.zero(sign), 0),
         Number::Finite { sign, exp, sig } => round(to, sign, exp, sig, false, mode),
@@ -707,7 +707,7 @@ pub fn to_integer(f: Format, a: u64, bits: u32, signed: bool, mode: Round) -> Ou
     match number {
         // Every value that has no integer to round to saturates and says so, and a NaN
         // goes to the largest rather than to either end.
-        Number::NotANumber(_) => return invalid(high as i128),
+        Number::Nan(_) => return invalid(high as i128),
         Number::Infinite(sign) => return invalid(if sign { low } else { high as i128 }),
         Number::Zero(_) => return (0, 0),
         Number::Finite { .. } => {}

@@ -9,7 +9,8 @@ use crate::{
     csr::{self, *},
     dram::Dram,
     elf::{Error as ElfError, Image},
-    inst::{self, AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
+    fpu::{self, F32, F64, Format, Round},
+    inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
     mmu::{Access, Tlb},
     rvc,
     trap::{Exception, Interrupt, Trap},
@@ -26,6 +27,11 @@ pub struct Cpu {
     /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
     /// space (csr[11:0]) for up to 4096 CSRs.
     pub csrs: [u64; 4096],
+    /// The floating-point registers. A value narrower than the widest format is kept
+    /// with every bit above it set, so a register holding a single can be told from
+    /// one holding a double whose bits happen to look like one.
+    /// The RISC-V Instruction Set Manual Volume I, 21.2.
+    pub fregs: [u64; 32],
     /// The privilege the hart is running at. A trap raises it, an `xRET` lowers it.
     pub mode: Mode,
     /// What the last few page table walks found, so most of them do not happen.
@@ -46,6 +52,7 @@ impl Cpu {
             next_pc: DRAM_BASE,
             bus: Bus::new(Dram::with_size(code, memory)),
             csrs: [0; 4096],
+            fregs: [0; 32],
             mode: Mode::Machine,
             tlb: Tlb::default(),
             start: Instant::now(),
@@ -58,9 +65,13 @@ impl Cpu {
             | misa_extension(b'm')
             | misa_extension(b'a')
             | misa_extension(b'c')
+            | misa_extension(b'f')
+            | misa_extension(b'd')
             | misa_extension(b's')
             | misa_extension(b'u');
-        cpu.csrs[MSTATUS] = MSTATUS_XL_64;
+        // The floating-point registers are there and untouched, which is what a
+        // supervisor needs to know to skip saving them.
+        cpu.csrs[MSTATUS] = MSTATUS_XL_64 | (1 << MSTATUS_FS_SHIFT);
 
         cpu
     }
@@ -290,6 +301,9 @@ impl Cpu {
             // that has set TVM wants to be told before a supervisor changes the page
             // table. The RISC-V Instruction Set Manual Volume II, 3.1.6.5.
             || (addr == SATP && self.trapped(MSTATUS_TVM))
+            // The floating-point status is part of the floating-point state, so it is
+            // out of reach on a machine that has turned that off.
+            || (matches!(addr, FFLAGS | FRM | FCSR) && !self.fp_usable())
         {
             return Err(Exception::IllegalInstruction(word as u64));
         }
@@ -317,6 +331,10 @@ impl Cpu {
             // The three unprivileged counters are read-only windows onto the machine's
             // own, not registers of their own.
             // The RISC-V Instruction Set Manual Volume II, 11.
+            // The two halves of fcsr have numbers of their own, and are windows onto
+            // it rather than registers beside it.
+            FFLAGS => self.csrs[FCSR] & FFLAGS_MASK,
+            FRM => (self.csrs[FCSR] >> FRM_SHIFT) & 0x7,
             CYCLE => self.csrs[MCYCLE],
             INSTRET => self.csrs[MINSTRET],
             MCYCLEH => self.csrs[MCYCLE] >> 32,
@@ -351,6 +369,20 @@ impl Cpu {
             // two-byte target legal.
             // The RISC-V Instruction Set Manual Volume II, 3.1.14.
             MEPC | SEPC => self.csrs[addr] = value & !1,
+            FFLAGS => {
+                self.csrs[FCSR] = (self.csrs[FCSR] & !FFLAGS_MASK) | (value & FFLAGS_MASK);
+                self.dirty_fp();
+            }
+            FRM => {
+                self.csrs[FCSR] =
+                    (self.csrs[FCSR] & !(0x7 << FRM_SHIFT)) | ((value & 0x7) << FRM_SHIFT);
+                self.dirty_fp();
+            }
+            // Nothing above the rounding mode is defined, so nothing above it is kept.
+            FCSR => {
+                self.csrs[FCSR] = value & 0xff;
+                self.dirty_fp();
+            }
             MCYCLEH => self.csrs[MCYCLE] = (self.csrs[MCYCLE] & 0xffff_ffff) | (value << 32),
             MINSTRETH => self.csrs[MINSTRET] = (self.csrs[MINSTRET] & 0xffff_ffff) | (value << 32),
             // satp's mode is WARL over the schemes the machine has, which is how
@@ -688,6 +720,92 @@ impl Cpu {
             // instruction cache to keep coherent.
             Op::Fence | Op::FenceI => {}
 
+            // ------------------------------------------------- floating point
+            Op::FpLoad { .. } | Op::FpStore { .. } | Op::Fp { .. } | Op::FpFused { .. }
+                if !self.fp_usable() =>
+            {
+                return Err(Exception::IllegalInstruction(encoding as u64));
+            }
+
+            Op::FpLoad { double } => {
+                let format = if double { F64 } else { F32 };
+                let value = self.read(a.wrapping_add(imm), format.bits as u64)?;
+                self.write_fp(rd, format, value);
+            }
+            Op::FpStore { double } => {
+                let format = if double { F64 } else { F32 };
+                let value = self.read_fp_raw(rs2, format);
+                self.write(a.wrapping_add(imm), format.bits as u64, value)?;
+            }
+
+            Op::FpFused {
+                negate_product,
+                negate_addend,
+                double,
+            } => {
+                let format = if double { F64 } else { F32 };
+                let mode = self.rounding(imm & 0x7, encoding)?;
+                let rs3 = (imm >> 3) as usize;
+                // Turning the product over is turning one of its factors over, and
+                // the addend is its own term, so the four instructions are two bits.
+                let flip = |value: u64, when: bool| value ^ (format.sign_bit() * when as u64);
+                let x = flip(self.read_fp(rs1, format), negate_product);
+                let z = flip(self.read_fp(rs3, format), negate_addend);
+                let (value, flags) = fpu::fma(format, x, self.read_fp(rs2, format), z, mode);
+                self.write_fp(rd, format, value);
+                self.accrue(flags);
+            }
+
+            Op::Fp { op, double } => {
+                let format = if double { F64 } else { F32 };
+                let other = if double { F32 } else { F64 };
+                let mode = self.rounding(imm, encoding)?;
+                let x = self.read_fp(rs1, format);
+                let y = self.read_fp(rs2, format);
+                // The comparisons, the classify and the moves out land in an integer
+                // register; everything else stays in the floating-point file.
+                let ((value, flags), integer) = match op {
+                    FpOp::Add => (fpu::add(format, x, y, mode), false),
+                    FpOp::Sub => (fpu::sub(format, x, y, mode), false),
+                    FpOp::Mul => (fpu::mul(format, x, y, mode), false),
+                    FpOp::Div => (fpu::div(format, x, y, mode), false),
+                    FpOp::Sqrt => (fpu::sqrt(format, x, mode), false),
+                    FpOp::Min => (fpu::min_max(format, x, y, false), false),
+                    FpOp::Max => (fpu::min_max(format, x, y, true), false),
+                    FpOp::SignJoin { negate, xor } => {
+                        ((fpu::sign_inject(format, x, y, negate, xor), 0), false)
+                    }
+                    FpOp::Equal => (fpu::eq(format, x, y), true),
+                    FpOp::Less => (fpu::less(format, x, y, false), true),
+                    FpOp::LessEqual => (fpu::less(format, x, y, true), true),
+                    FpOp::Classify => ((fpu::classify(format, x), 0), true),
+                    FpOp::Convert => (
+                        fpu::convert(other, format, self.read_fp(rs1, other), mode),
+                        false,
+                    ),
+                    FpOp::ToInteger { bits, signed } => {
+                        (fpu::to_integer(format, x, bits, signed, mode), true)
+                    }
+                    FpOp::FromInteger { bits, signed } => (
+                        fpu::from_integer(format, self.regs[rs1], bits, signed, mode),
+                        false,
+                    ),
+                    // Moving the bits does not interpret them, so a single is
+                    // sign-extended out of the register and boxed back into it.
+                    FpOp::MoveOut => {
+                        let bits = self.read_fp_raw(rs1, format);
+                        ((Self::sext(bits, format.bits as u64), 0), true)
+                    }
+                    FpOp::MoveIn => ((self.regs[rs1], 0), false),
+                };
+                if integer {
+                    self.regs[rd] = value;
+                } else {
+                    self.write_fp(rd, format, value);
+                }
+                self.accrue(flags);
+            }
+
             // ---------------------------------------------------------- atomics
             // Compare-and-swap: load, compare against what `rd` holds, and store only
             // if they match. `rd` takes the value that was there either way, so a
@@ -817,6 +935,64 @@ impl Cpu {
             32 => value as i32 as i64 as u64,
             _ => value,
         }
+    }
+
+    /// Read a floating-point register at `f`'s width. A single that is not held with
+    /// every bit above it set is not a single at all, and reads as the one NaN this
+    /// machine makes. The RISC-V Instruction Set Manual Volume I, 21.2.
+    fn read_fp(&self, reg: usize, format: Format) -> u64 {
+        let bits = self.fregs[reg];
+        match format {
+            F64 => bits,
+            _ if bits >> 32 == u32::MAX as u64 => bits & 0xffff_ffff,
+            _ => F32.canonical_nan(),
+        }
+    }
+
+    /// The bits of a floating-point register, without asking whether they are a
+    /// number. A store and a move are not interpreting the value, so a register
+    /// holding a double is not turned into a NaN on its way past them.
+    fn read_fp_raw(&self, reg: usize, format: Format) -> u64 {
+        format.trim(self.fregs[reg])
+    }
+
+    /// Write one, boxing a narrow value and recording that the registers now hold
+    /// something worth saving.
+    fn write_fp(&mut self, reg: usize, format: Format, value: u64) {
+        self.fregs[reg] = match format {
+            F64 => value,
+            _ => value | 0xffff_ffff_0000_0000,
+        };
+        self.dirty_fp();
+    }
+
+    fn dirty_fp(&mut self) {
+        self.csrs[MSTATUS] |= MSTATUS_FS_DIRTY | MSTATUS_SD;
+    }
+
+    /// What an exception the arithmetic raised accumulates into.
+    fn accrue(&mut self, flags: u64) {
+        if flags != 0 {
+            self.csrs[FCSR] |= flags;
+            self.dirty_fp();
+        }
+    }
+
+    /// The rounding an instruction asked for. Seven means whatever `frm` says, and the
+    /// three encodings that name nothing make the instruction illegal rather than
+    /// rounding it some other way.
+    fn rounding(&self, asked: u64, encoding: u32) -> Result<Round, Exception> {
+        let bits = match asked {
+            7 => (self.csrs[FCSR] >> FRM_SHIFT) & 0x7,
+            other => other,
+        };
+        Round::from_bits(bits).ok_or(Exception::IllegalInstruction(encoding as u64))
+    }
+
+    /// Whether the floating-point registers are there at all. Turning them off is how
+    /// a supervisor says it is not going to save them.
+    fn fp_usable(&self) -> bool {
+        self.csrs[MSTATUS] & MSTATUS_FS != 0
     }
 
     /// The read-modify-write an atomic performs, at the width it performs it.

@@ -79,6 +79,41 @@ impl CasWidth {
     }
 }
 
+/// What a floating-point instruction does, with the format it does it in carried
+/// beside it rather than doubling this list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+    Min,
+    Max,
+    /// The sign of one operand on the rest of another.
+    SignJoin {
+        negate: bool,
+        xor: bool,
+    },
+    Equal,
+    Less,
+    LessEqual,
+    Classify,
+    /// To the other floating format.
+    Convert,
+    ToInteger {
+        bits: u32,
+        signed: bool,
+    },
+    FromInteger {
+        bits: u32,
+        signed: bool,
+    },
+    /// The bits themselves, between register files, uninterpreted.
+    MoveOut,
+    MoveIn,
+}
+
 /// What an instruction does. The operands live in [`Inst`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -128,19 +163,32 @@ pub enum Op {
     CzeroEqz,
     CzeroNez,
     // memory
-    Load { width: Width, signed: bool },
-    Store { width: Width },
+    Load {
+        width: Width,
+        signed: bool,
+    },
+    Store {
+        width: Width,
+    },
     // control transfer
     Lui,
     Auipc,
     Jal,
     Jalr,
-    Branch { cond: Cond },
+    Branch {
+        cond: Cond,
+    },
     // control and status registers. The immediate forms take their source from the
     // rs1 field as a five-bit unsigned value rather than from the register.
-    Csrrw { immediate: bool },
-    Csrrs { immediate: bool },
-    Csrrc { immediate: bool },
+    Csrrw {
+        immediate: bool,
+    },
+    Csrrs {
+        immediate: bool,
+    },
+    Csrrc {
+        immediate: bool,
+    },
     // ordering. A single in-order hart with no caches is already ordered, so both
     // retire without doing anything.
     Fence,
@@ -150,18 +198,48 @@ pub enum Op {
     Ebreak,
     Mret,
     Sret,
-    Wrs { timeout: bool },
+    Wrs {
+        timeout: bool,
+    },
     SfenceVma,
     Wfi,
     // atomics
-    Lr { width: Width },
-    Sc { width: Width },
-    Amo { op: AmoOp, width: Width },
-    AmoCas { width: CasWidth },
+    Lr {
+        width: Width,
+    },
+    Sc {
+        width: Width,
+    },
+    Amo {
+        op: AmoOp,
+        width: Width,
+    },
+    AmoCas {
+        width: CasWidth,
+    },
+    FpLoad {
+        double: bool,
+    },
+    FpStore {
+        double: bool,
+    },
+    Fp {
+        op: FpOp,
+        double: bool,
+    },
+    /// `rs1 * rs2 + rs3`, rounded once, with either term optionally turned over: the
+    /// four instructions are one operation and two bits of the opcode.
+    FpFused {
+        negate_product: bool,
+        negate_addend: bool,
+        double: bool,
+    },
 }
 
 /// A decoded instruction. Which of the operands mean anything depends on `op`: `imm`
-/// carries a sign-extended immediate, a shift amount, or a csr number as appropriate.
+/// carries a sign-extended immediate, a shift amount, a csr number, or for a
+/// floating-point instruction its rounding mode and, for a fused one, `rs3` above
+/// that, since only those three instructions have a third source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inst {
     pub op: Op,
@@ -213,6 +291,12 @@ const fn amo_width(funct3: u32) -> Option<Width> {
         0x3 => Some(Width::Double),
         _ => None,
     }
+}
+
+/// The rounding an instruction asks for, which is its `funct3` unless that names one
+/// of the three reserved encodings. Seven means whatever `frm` currently says.
+const fn rounding(inst: u32) -> u64 {
+    ((inst >> 12) & 0x7) as u64
 }
 
 /// How many bytes the instruction beginning with `half` occupies. Everything with its
@@ -378,6 +462,101 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
                 _ => return Err(illegal),
             };
             (op, csr)
+        }
+        // The floating-point loads and stores are their own opcodes rather than a
+        // width of the integer ones, because they name a different register file.
+        0x07 | 0x27 => {
+            let double = match funct3 {
+                0x2 => false,
+                0x3 => true,
+                _ => return Err(illegal),
+            };
+            match opcode {
+                0x07 => (Op::FpLoad { double }, i_imm(inst)),
+                _ => (Op::FpStore { double }, s_imm(inst)),
+            }
+        }
+        // The four fused forms differ only in which of the three terms is turned over.
+        0x43 | 0x47 | 0x4b | 0x4f => {
+            let double = match funct7 & 0b11 {
+                0b00 => false,
+                0b01 => true,
+                _ => return Err(illegal),
+            };
+            let op = Op::FpFused {
+                negate_product: opcode & 0b1000 != 0,
+                negate_addend: opcode & 0b0100 != 0,
+                double,
+            };
+            (op, rounding(inst) | ((funct7 as u64 >> 2) << 3))
+        }
+        0x53 => {
+            let double = match funct7 & 0b11 {
+                0b00 => false,
+                0b01 => true,
+                _ => return Err(illegal),
+            };
+            let op = match funct7 >> 2 {
+                0b00000 => FpOp::Add,
+                0b00001 => FpOp::Sub,
+                0b00010 => FpOp::Mul,
+                0b00011 => FpOp::Div,
+                0b01011 if rs2 == 0 => FpOp::Sqrt,
+                0b00100 => match funct3 {
+                    0x0 => FpOp::SignJoin {
+                        negate: false,
+                        xor: false,
+                    },
+                    0x1 => FpOp::SignJoin {
+                        negate: true,
+                        xor: false,
+                    },
+                    0x2 => FpOp::SignJoin {
+                        negate: false,
+                        xor: true,
+                    },
+                    _ => return Err(illegal),
+                },
+                0b00101 => match funct3 {
+                    0x0 => FpOp::Min,
+                    0x1 => FpOp::Max,
+                    _ => return Err(illegal),
+                },
+                0b10100 => match funct3 {
+                    0x0 => FpOp::LessEqual,
+                    0x1 => FpOp::Less,
+                    0x2 => FpOp::Equal,
+                    _ => return Err(illegal),
+                },
+                // Between the two formats. rs2 names the one being left, and naming
+                // the one being entered is not a conversion at all.
+                0b01000 => match (rs2, double) {
+                    (0b00000, true) | (0b00001, false) => FpOp::Convert,
+                    _ => return Err(illegal),
+                },
+                // rs2 names the integer: its width, and whether it is signed.
+                0b11000 | 0b11010 => {
+                    let (bits, signed) = match rs2 {
+                        0b00000 => (32, true),
+                        0b00001 => (32, false),
+                        0b00010 => (64, true),
+                        0b00011 => (64, false),
+                        _ => return Err(illegal),
+                    };
+                    match funct7 >> 2 {
+                        0b11000 => FpOp::ToInteger { bits, signed },
+                        _ => FpOp::FromInteger { bits, signed },
+                    }
+                }
+                0b11100 if rs2 == 0 => match funct3 {
+                    0x0 => FpOp::MoveOut,
+                    0x1 => FpOp::Classify,
+                    _ => return Err(illegal),
+                },
+                0b11110 if rs2 == 0 && funct3 == 0 => FpOp::MoveIn,
+                _ => return Err(illegal),
+            };
+            (Op::Fp { op, double }, rounding(inst))
         }
         0x2f => {
             // The aq and rl ordering bits, funct7[1:0], constrain nothing on a single

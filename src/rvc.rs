@@ -71,6 +71,25 @@ pub fn decode(half: u16) -> Result<Inst, Exception> {
             }
             make(Op::Addi, rd_short, 2, 0, imm)
         }
+        // The floating-point forms, which name the other register file and so cannot
+        // share the integer expansion below.
+        (0b00, 0b001 | 0b101) => {
+            let imm = (bits(half, 12, 10) << 3) | (bits(half, 6, 5) << 6);
+            let double = true;
+            if funct3 == 0b001 {
+                make(Op::FpLoad { double }, rd_short, rs1_short, 0, imm)
+            } else {
+                make(Op::FpStore { double }, 0, rs1_short, rd_short, imm)
+            }
+        }
+        (0b10, 0b001) => {
+            let imm = (bit(half, 12) << 5) | (bits(half, 6, 5) << 3) | (bits(half, 4, 2) << 6);
+            make(Op::FpLoad { double: true }, wide, 2, 0, imm)
+        }
+        (0b10, 0b101) => {
+            let imm = (bits(half, 12, 10) << 3) | (bits(half, 9, 7) << 6);
+            make(Op::FpStore { double: true }, 0, 2, rs2_wide, imm)
+        }
         (0b00, 0b010 | 0b110 | 0b011 | 0b111) => {
             let width = if funct3 & 0b001 == 0 {
                 Width::Word
@@ -229,9 +248,9 @@ pub fn decode(half: u16) -> Result<Inst, Exception> {
             make(Op::Store { width }, 0, 2, rs2_wide, imm)
         }
 
-        // Everything left is a floating-point form, a reserved encoding, or the
-        // all-zero halfword the manual defines as illegal so that a jump into blank
-        // memory stops rather than wanders.
+        // Everything left is a reserved encoding, a single-precision form that only
+        // a 32-bit machine has, or the all-zero halfword the manual defines as illegal
+        // so that a jump into blank memory stops rather than wanders.
         // The RISC-V Instruction Set Manual Volume I, 27.5.4.
         _ => return Err(illegal),
     };

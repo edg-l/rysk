@@ -105,6 +105,16 @@ fn rv64uc_compressed_instructions() {
 }
 
 #[test]
+fn rv64uf_single_precision() {
+    run_group("rv64uf-p-");
+}
+
+#[test]
+fn rv64ud_double_precision() {
+    run_group("rv64ud-p-");
+}
+
+#[test]
 fn rv64si_supervisor_mode() {
     run_group("rv64si-p-");
 }

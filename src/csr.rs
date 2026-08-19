@@ -19,6 +19,15 @@ pub const MSTATUS: usize = 0x300;
 pub const MSTATUS_MIE: u64 = 3;
 pub const MSTATUS_MPIE: u64 = 7;
 pub const MSTATUS_MPP_SHIFT: u64 = 11;
+/// The floating-point unit's state: off, initial, clean or dirty. Off means the `f`
+/// registers are not there, so touching one is an illegal instruction; the rest tell
+/// an operating system whether it has to save them.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.6.6.
+pub const MSTATUS_FS_SHIFT: u64 = 13;
+pub const MSTATUS_FS: u64 = 0b11 << MSTATUS_FS_SHIFT;
+pub const MSTATUS_FS_DIRTY: u64 = 0b11 << MSTATUS_FS_SHIFT;
+/// The top bit, which says some part of the extended state is dirty.
+pub const MSTATUS_SD: u64 = 1 << 63;
 pub const MSTATUS_MPP: u64 = 0b11 << MSTATUS_MPP_SHIFT;
 /// Bit positions in `mstatus` that belong to the supervisor: its own interrupt-enable
 /// stack, the mode it trapped from, and the two controls over how it may reach user
@@ -39,15 +48,16 @@ pub const MSTATUS_MPRV: u64 = 17;
 pub const MSTATUS_TVM: u64 = 20;
 pub const MSTATUS_TW: u64 = 21;
 pub const MSTATUS_TSR: u64 = 22;
-/// The fields of `mstatus` that `sstatus` exposes. `FS`, `VS`, `XS` and the `SD` that
-/// summarises them are absent because rysk has no floating-point or vector state, so
-/// they are read-only zero, and `UXL` because a machine that implements a single width
-/// reports it rather than taking a write.
+/// The fields of `mstatus` that `sstatus` exposes. `VS` and `XS` are absent because
+/// rysk has no vector or other extended state, and `UXL` because a machine that
+/// implements a single width reports it rather than taking a write. `SD` is there on
+/// the read side only: it is what `FS` says, not a bit of its own.
 pub const SSTATUS_MASK: u64 = (1 << MSTATUS_SIE)
     | (1 << MSTATUS_SPIE)
     | (1 << MSTATUS_SPP)
     | (1 << MSTATUS_SUM)
-    | (1 << MSTATUS_MXR);
+    | (1 << MSTATUS_MXR)
+    | MSTATUS_FS;
 /// The width of the register file a supervisor and a user program see. Both are WARL
 /// over the widths the machine supports, and rysk supports one, so both read as 64 and
 /// ignore a write. The RISC-V Instruction Set Manual Volume II, 3.1.6.3.
@@ -69,6 +79,14 @@ pub const SCAUSE: usize = 0x142;
 pub const STVAL: usize = 0x143;
 pub const SIP: usize = 0x144;
 pub const SATP: usize = 0x180;
+/// The floating-point control and status register, and the two halves of it that have
+/// their own numbers: the accrued exceptions and the rounding mode.
+/// The RISC-V Instruction Set Manual Volume I, 20.2.
+pub const FFLAGS: usize = 0x001;
+pub const FRM: usize = 0x002;
+pub const FCSR: usize = 0x003;
+pub const FFLAGS_MASK: u64 = 0x1f;
+pub const FRM_SHIFT: u64 = 5;
 pub const MEDELEG: usize = 0x302;
 pub const MIDELEG: usize = 0x303;
 /// The interrupt bits of `mip` and `mie`, which share their layout with `mcause`'s
@@ -146,6 +164,7 @@ pub fn exists(addr: usize) -> bool {
         SSTATUS | SIE | STVEC | SCOUNTEREN | SENVCFG => true,
         SSCRATCH | SEPC | SCAUSE | STVAL | SIP | SATP => true,
         CYCLE | TIME | INSTRET => true,
+        FFLAGS | FRM | FCSR => true,
         _ => false,
     }
 }
