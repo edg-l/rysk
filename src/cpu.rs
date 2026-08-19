@@ -430,6 +430,21 @@ impl Cpu {
         }
     }
 
+    /// What a read-modify-write of `addr` modifies, which is not always what a read of
+    /// it returns.
+    ///
+    /// `SEIP` is the one place the two differ: a read gives the interrupt controller's
+    /// signal and the bit machine mode owns together, and only the bit machine mode
+    /// owns takes part in the sequence. A `csrrs` that read the signal back and wrote
+    /// it would leave that bit set for good, and the interrupt would never end.
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.9.
+    fn modified(&self, addr: usize, read: u64) -> u64 {
+        match addr {
+            MIP => (read & !SEIP) | (self.csrs[MVIP] & SEIP),
+            _ => read,
+        }
+    }
+
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
     fn store_csr(&mut self, addr: usize, value: u64) {
         // misa is writable in principle, to turn extensions off. rysk cannot, and the
@@ -856,9 +871,10 @@ impl Cpu {
                 // A source of x0, or of zero for the immediate forms, names no bits to
                 // change, and then the csr is not written at all.
                 if rs1 != 0 {
+                    let held = self.modified(imm as usize, csr);
                     let value = match op {
-                        Op::Csrrs { .. } => csr | source,
-                        _ => csr & !source,
+                        Op::Csrrs { .. } => held | source,
+                        _ => held & !source,
                     };
                     self.store_csr(imm as usize, value);
                 }

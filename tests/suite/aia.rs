@@ -565,3 +565,37 @@ fn a_message_wakes_the_hart_it_was_sent_to() {
         "hart one went past the wait, so the message reached it"
     );
 }
+
+#[test]
+fn reading_the_external_interrupt_back_into_itself_does_not_latch_it() {
+    // A read of `mip` gives the controller's signal and the bit machine mode owns
+    // together, so a read-modify-write that wrote the read value back would leave that
+    // bit set for good and the interrupt would repeat until the machine gave up.
+    let imsic = Imsic::new(1);
+    imsic.deliver(0, Level::Supervisor, 1);
+    imsic.write(0, Level::Supervisor, imsic::EIE0, 1 << 1);
+    imsic.write(0, Level::Supervisor, imsic::EIDELIVERY, 1);
+    let machine = prog(&[
+        csrrs(A0, MIP as u32, T0),
+        // Then take the interrupt away at its source.
+        csrrw(ZERO, SISELECT_N, S0),
+        csrrw(ZERO, SIREG_N, ZERO),
+        csrrs(A1, MIP as u32, ZERO),
+    ])
+    .imsic(imsic)
+    .reg(T0, SSIP)
+    .reg(S0, imsic::EIDELIVERY)
+    .run();
+    assert_eq!(machine.reg(A0) & SEIP, SEIP, "the signal was asserted");
+    assert_eq!(
+        machine.reg(A0) & SSIP,
+        0,
+        "and the write had not happened yet"
+    );
+    assert_eq!(
+        machine.reg(A1) & SEIP,
+        0,
+        "and it goes away with the signal rather than staying behind"
+    );
+    assert_eq!(machine.reg(A1) & SSIP, SSIP, "while what was written stays");
+}
