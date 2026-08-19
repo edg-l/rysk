@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    device::{Device, Line},
+    device::{Device, Line, Msi},
     trap::Exception,
 };
 
@@ -54,8 +54,42 @@ const BAR0: u64 = 0x10;
 const SUBSYSTEM: u64 = 0x2c;
 const CAPABILITIES: u64 = 0x34;
 const INTERRUPT: u64 = 0x3c;
-/// One past the last register a type 0 header defines.
+/// One past the last register a type 0 header defines, which is where the capability
+/// list begins because there is nowhere else for it to go.
 const HEADER_END: u64 = 0x40;
+
+/// The capability every function here that interrupts by message has, and the three
+/// registers it is made of: what it is and how big, and where in the function's own
+/// windows the vector table and the pending array were put.
+/// PCI Local Bus Specification 3.0, 6.8.2.
+const MSIX: u64 = HEADER_END;
+const MSIX_ID: u32 = 0x11;
+const MSIX_CONTROL: u64 = MSIX;
+const MSIX_TABLE: u64 = MSIX + 4;
+const MSIX_PBA: u64 = MSIX + 8;
+const MSIX_END: u64 = MSIX + 12;
+/// Message control: how many vectors there are, one less than the number, and the two
+/// bits software turns the whole thing on and off with.
+const MSIX_SIZE: u32 = 0x7ff;
+const MSIX_MASK: u32 = 1 << 30;
+const MSIX_ENABLE: u32 = 1 << 31;
+/// The bits of it a write may change.
+const MSIX_WRITABLE: u32 = MSIX_ENABLE | MSIX_MASK;
+/// A vector table entry: where to write, what to write, and whether to write it.
+/// PCI Local Bus Specification 3.0, 6.8.2.9.
+const VECTOR: u64 = 16;
+const VECTOR_ADDRESS: usize = 0;
+const VECTOR_ADDRESS_HIGH: usize = 1;
+const VECTOR_DATA: usize = 2;
+const VECTOR_CONTROL: usize = 3;
+const VECTOR_MASKED: u32 = 1;
+
+/// How many bytes the array of vectors raised while masked takes. It is defined in
+/// doublewords however few vectors there are.
+/// PCI Local Bus Specification 3.0, 6.8.2.6.
+const fn pending_bytes(vectors: usize) -> u64 {
+    (vectors as u64).div_ceil(64) * 8
+}
 
 /// `command`'s memory space enable: a base address register answers for nothing until
 /// software has said it may. PCI Local Bus Specification 3.0, 6.2.2.
@@ -64,8 +98,9 @@ const COMMAND_MEMORY: u16 = 1 << 1;
 /// behaviours this root complex does not have.
 const COMMAND_MASK: u16 = COMMAND_MEMORY | (1 << 0) | (1 << 2) | (1 << 10);
 
-/// `status`, which is read-only here and says only that there is no capability list.
-const STATUS: u32 = 0;
+/// `status`, which is read-only here and says only whether there is a capability list
+/// to follow. PCI Local Bus Specification 3.0, 6.2.3.
+const STATUS_CAPABILITIES: u32 = 1 << 4;
 
 /// What a function's base address register asks for.
 /// PCI Local Bus Specification 3.0, 6.2.5.1.
@@ -113,6 +148,21 @@ pub struct Header {
     /// Which of the four wires this function pulls, counting from one, or zero for a
     /// function that never interrupts.
     pub pin: u8,
+    /// The messages it can send instead, if it can send any.
+    pub msix: Option<MsiX>,
+}
+
+/// What a function's message-signalled interrupts look like: how many there are, and
+/// where in its own windows the table of them and the array of the ones it could not
+/// send are. Both are storage the root complex keeps, since every function that has
+/// them has the same ones; what a function decides is only which vector to raise.
+/// PCI Local Bus Specification 3.0, 6.8.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsiX {
+    pub vectors: usize,
+    /// The window each lives in, and where in it.
+    pub table: (usize, u64),
+    pub pending: (usize, u64),
 }
 
 impl Default for Header {
@@ -125,6 +175,7 @@ impl Default for Header {
             subsystem: 0,
             bars: [Bar::None; 6],
             pin: 0,
+            msix: None,
         }
     }
 }
@@ -156,9 +207,31 @@ struct Slot {
     /// Which interrupt the function was told it is on. Nothing here reads it: it is
     /// storage software uses to remember what the device tree already said.
     interrupt_line: u8,
+    /// What software wrote in the function's message control register: whether it may
+    /// send messages at all, and whether every one of them is masked.
+    msix_control: u32,
+    /// One entry per vector, four words each, and a bit per vector for the ones that
+    /// were raised while masked.
+    vectors: Vec<[u32; 4]>,
+    blocked: Vec<bool>,
 }
 
 impl Slot {
+    /// Whether an access to `bar` at `offset` lands in the vector table or the array
+    /// of blocked vectors rather than in the function, and which vector it names.
+    /// Both are storage here, so a function never sees an access to either.
+    fn msix(&self, bar: usize, offset: u64, size: u64) -> Option<Region> {
+        let msix = self.header.msix?;
+        let within = |(at, from): (usize, u64), bytes: u64| {
+            (at == bar && offset >= from && offset + size / 8 <= from + bytes)
+                .then(|| offset - from)
+        };
+        if let Some(at) = within(msix.table, msix.vectors as u64 * VECTOR) {
+            return Some(Region::Table((at / VECTOR) as usize, at % VECTOR));
+        }
+        within(msix.pending, pending_bytes(msix.vectors)).map(Region::Pending)
+    }
+
     /// The window register `bar` answers for, if it has one and it is turned on.
     fn window(&self, bar: usize) -> Option<(u64, u64)> {
         let Bar::Memory { size, .. } = self.header.bars[bar] else {
@@ -168,19 +241,76 @@ impl Slot {
     }
 }
 
+/// What an access inside a function's window is really reaching, when it is not
+/// reaching the function.
+#[derive(Debug, Clone, Copy)]
+enum Region {
+    /// A word of one vector's entry in the table.
+    Table(usize, u64),
+    /// A byte of the array saying which vectors were raised while masked.
+    Pending(u64),
+}
+
+/// The register a capability reports a table or an array in, which is the window's
+/// number in the low three bits and the offset into it above them.
+/// PCI Local Bus Specification 3.0, 6.8.2.
+fn place((bar, offset): (usize, u64)) -> u32 {
+    offset as u32 | bar as u32
+}
+
 /// The root complex, and everything below it.
 #[derive(Debug)]
 pub struct Complex {
     slots: Vec<Option<Slot>>,
     /// The four wires, which every function's pin is swizzled onto.
     lines: [Line; PINS],
+    /// Where a message a function sends is posted.
+    msi: Msi,
 }
 
 impl Complex {
-    fn new(lines: [Line; PINS]) -> Self {
+    fn new(lines: [Line; PINS], msi: Msi) -> Self {
         Self {
             slots: (0..DEVICES).map(|_| None).collect(),
             lines,
+            msi,
+        }
+    }
+
+    /// Raise vector `vector` of the function at `device`.
+    ///
+    /// A message goes out if the function has been turned on and neither the function
+    /// nor the vector is masked. One that cannot go out is remembered rather than
+    /// dropped, and goes as soon as whatever masked it stops.
+    /// PCI Local Bus Specification 3.0, 6.8.2.9.
+    fn message(&mut self, device: usize, vector: usize) {
+        let Some(slot) = self.slots.get_mut(device).and_then(Option::as_mut) else {
+            return;
+        };
+        if slot.msix_control & MSIX_ENABLE == 0 || vector >= slot.vectors.len() {
+            return;
+        }
+        let entry = slot.vectors[vector];
+        if slot.msix_control & MSIX_MASK != 0 || entry[VECTOR_CONTROL] & VECTOR_MASKED != 0 {
+            slot.blocked[vector] = true;
+            return;
+        }
+        slot.blocked[vector] = false;
+        let address = ((entry[VECTOR_ADDRESS_HIGH] as u64) << 32) | entry[VECTOR_ADDRESS] as u64;
+        self.msi.send(address, entry[VECTOR_DATA]);
+    }
+
+    /// Send whatever a function was holding because it was masked, which is what
+    /// unmasking either the function or one of its vectors has to do.
+    fn release(&mut self, device: usize) {
+        let Some(slot) = self.slots.get(device).and_then(Option::as_ref) else {
+            return;
+        };
+        let blocked: Vec<usize> = (0..slot.blocked.len())
+            .filter(|&vector| slot.blocked[vector])
+            .collect();
+        for vector in blocked {
+            self.message(device, vector);
         }
     }
 
@@ -208,12 +338,37 @@ impl Complex {
             }),
             "device {device} asks for a window it cannot describe"
         );
+        assert!(
+            header.msix.is_none_or(|msix| {
+                // A table and an array have to be inside windows that exist, and there
+                // has to be at least one vector for the size field to describe.
+                let fits = |(bar, offset): (usize, u64), bytes: u64| match header.bars.get(bar) {
+                    Some(Bar::Memory { size, .. }) => offset + bytes <= *size,
+                    _ => false,
+                };
+                (1..=MSIX_SIZE as usize + 1).contains(&msix.vectors)
+                    // The low three bits of each register hold the window's number,
+                    // so neither offset can reach into them.
+                    && msix.table.1.is_multiple_of(8)
+                    && msix.pending.1.is_multiple_of(8)
+                    && fits(msix.table, msix.vectors as u64 * VECTOR)
+                    && fits(msix.pending, pending_bytes(msix.vectors))
+            }),
+            "device {device} puts its vector table somewhere it does not have"
+        );
+        let vectors = header.msix.map_or(0, |msix| msix.vectors);
         self.slots[device] = Some(Slot {
             function,
             header,
             bars: [0; 6],
             command: 0,
             interrupt_line: 0,
+            msix_control: 0,
+            // A vector starts masked, which is what stops a function interrupting
+            // before software has said where to send it.
+            // PCI Local Bus Specification 3.0, 6.8.2.9.
+            vectors: vec![[0, 0, 0, VECTOR_MASKED]; vectors],
+            blocked: vec![false; vectors],
         });
     }
 
@@ -229,14 +384,24 @@ impl Complex {
         let header = &slot.header;
         match reg {
             VENDOR => (header.vendor as u32) | ((header.device as u32) << 16),
-            COMMAND => (slot.command as u32) | (STATUS << 16),
+            COMMAND => {
+                let status = match header.msix {
+                    Some(_) => STATUS_CAPABILITIES,
+                    None => 0,
+                };
+                (slot.command as u32) | (status << 16)
+            }
             CLASS => header.class,
             // A single-function device with a type 0 header, and no built-in self test.
             HEADER_TYPE => 0,
             SUBSYSTEM => (header.subsystem_vendor as u32) | ((header.subsystem as u32) << 16),
-            // No capability list. The status register says so too, and the two have to
-            // agree or software follows a pointer into nothing.
-            CAPABILITIES => 0,
+            // Where the capability list starts, or nothing. The status register says
+            // the same thing, and the two have to agree or software follows a pointer
+            // into nothing.
+            CAPABILITIES => match header.msix {
+                Some(_) => MSIX as u32,
+                None => 0,
+            },
             INTERRUPT => (slot.interrupt_line as u32) | ((header.pin as u32) << 8),
             _ if (BAR0..BAR0 + 24).contains(&reg) => {
                 let n = ((reg - BAR0) / 4) as usize;
@@ -247,7 +412,23 @@ impl Complex {
                 }
             }
             _ if reg < HEADER_END => 0,
-            // Beyond the header is where capabilities would live, and there are none.
+            // Beyond the header is the capability list, which is one capability long
+            // and only exists for a function that has messages to send.
+            MSIX..MSIX_END => match header.msix {
+                Some(msix) => match reg {
+                    // The identity, no next capability, and how many vectors there are,
+                    // reported one less than there are.
+                    MSIX_CONTROL => {
+                        MSIX_ID
+                            | ((msix.vectors as u32 - 1) << 16)
+                            | (slot.msix_control & MSIX_WRITABLE)
+                    }
+                    MSIX_TABLE => place(msix.table),
+                    MSIX_PBA => place(msix.pending),
+                    _ => 0,
+                },
+                None => 0,
+            },
             _ => 0,
         }
     }
@@ -261,6 +442,12 @@ impl Complex {
         let merge = |old: u32| (old & !mask) | (value & mask);
         match reg {
             COMMAND => slot.command = merge(slot.command as u32) as u16 & COMMAND_MASK,
+            // Only the two bits that turn messages on and off are software's; the rest
+            // of the capability describes what the function is.
+            MSIX_CONTROL if slot.header.msix.is_some() => {
+                slot.msix_control = merge(slot.msix_control) & MSIX_WRITABLE;
+                self.release(device);
+            }
             INTERRUPT => slot.interrupt_line = merge(slot.interrupt_line as u32) as u8,
             _ if (BAR0..BAR0 + 24).contains(&reg) => {
                 let n = ((reg - BAR0) / 4) as usize;
@@ -313,17 +500,16 @@ impl Complex {
     /// Found by address rather than by which window asked, since a base address
     /// register holds an address and it is software that decided which window that
     /// address is in.
-    fn route(&mut self, addr: u64, size: u64) -> Option<(&mut Slot, usize, u64)> {
+    fn route(&self, addr: u64, size: u64) -> Option<(usize, usize, u64)> {
         let end = addr.checked_add(size / 8)?;
-        let (device, bar, offset) = self.slots.iter().enumerate().find_map(|(device, slot)| {
+        self.slots.iter().enumerate().find_map(|(device, slot)| {
             let slot = slot.as_ref()?;
             (0..6).find_map(|bar| {
                 let (base, len) = slot.window(bar)?;
                 let offset = addr.checked_sub(base)?;
                 (end <= base.checked_add(len)?).then_some((device, bar, offset))
             })
-        })?;
-        Some((self.slots[device].as_mut()?, bar, offset))
+        })
     }
 }
 
@@ -347,9 +533,10 @@ pub struct Root(Arc<Mutex<Complex>>);
 
 impl Root {
     /// A root complex driving `lines`, which are the four wires its functions
-    /// interrupt on.
-    pub fn new(lines: [Line; PINS]) -> Self {
-        Self(Arc::new(Mutex::new(Complex::new(lines))))
+    /// interrupt on, and posting through `msi`, which is where the ones that send
+    /// messages instead send them.
+    pub fn new(lines: [Line; PINS], msi: Msi) -> Self {
+        Self(Arc::new(Mutex::new(Complex::new(lines, msi))))
     }
 
     /// Put `function` at `device` on bus zero.
@@ -361,6 +548,12 @@ impl Root {
     pub fn interrupt(&self, device: usize, pin: u8, raised: bool) {
         let complex = self.0.lock().unwrap();
         complex.lines[swizzle(device, pin)].set(raised);
+    }
+
+    /// Raise vector `vector` of the function at `device`, which is what a function
+    /// that sends messages does instead of pulling a wire.
+    pub fn message(&self, device: usize, vector: usize) {
+        self.0.lock().unwrap().message(device, vector);
     }
 
     /// Config space, as a device on the bus above.
@@ -444,23 +637,63 @@ impl Device for Window {
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {
         let addr = self.base + offset;
         let mut complex = self.root.0.lock().unwrap();
-        match complex.route(addr, size) {
-            Some((slot, bar, at)) => slot.function.load(bar, at, size),
+        let Some((device, bar, at)) = complex.route(addr, size) else {
             // Nothing is mapped here. A read of all ones is what a bus with no
             // responder gives, and it is what a driver reads when it looks at a
             // window it has not been given.
-            None => Ok(u64::MAX >> (64 - size)),
+            return Ok(u64::MAX >> (64 - size));
+        };
+        let slot = complex.slots[device].as_mut().expect("routed to a slot");
+        match slot.msix(bar, at, size) {
+            Some(Region::Table(vector, word)) => Ok(read(&slot.vectors[vector], word, size)),
+            Some(Region::Pending(byte)) => Ok(blocked(&slot.blocked, byte, size)),
+            None => slot.function.load(bar, at, size),
         }
     }
 
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception> {
         let addr = self.base + offset;
         let mut complex = self.root.0.lock().unwrap();
-        match complex.route(addr, size) {
-            Some((slot, bar, at)) => slot.function.store(bar, at, size, value),
-            None => Ok(()),
+        let Some((device, bar, at)) = complex.route(addr, size) else {
+            return Ok(());
+        };
+        let slot = complex.slots[device].as_mut().expect("routed to a slot");
+        match slot.msix(bar, at, size) {
+            Some(Region::Table(vector, word)) => {
+                write(&mut slot.vectors[vector], word, size, value);
+                // Unmasking is what lets a message raised while masked finally go.
+                complex.release(device);
+                Ok(())
+            }
+            // Which vectors are waiting is the root complex's to say, not software's.
+            Some(Region::Pending(_)) => Ok(()),
+            None => slot.function.store(bar, at, size, value),
         }
     }
+}
+
+/// A word or part of one out of a vector's four, since a table is defined in words and
+/// software may read it more narrowly.
+fn read(entry: &[u32; 4], offset: u64, size: u64) -> u64 {
+    let word = entry[(offset / 4) as usize] as u64;
+    (word >> ((offset % 4) * 8)) & (u64::MAX >> (64 - size))
+}
+
+fn write(entry: &mut [u32; 4], offset: u64, size: u64, value: u64) {
+    let shift = (offset % 4) * 8;
+    let mask = ((u64::MAX >> (64 - size)) << shift) as u32;
+    let word = &mut entry[(offset / 4) as usize];
+    *word = (*word & !mask) | ((value << shift) as u32 & mask);
+}
+
+/// The array of vectors raised while masked, as the bits an access at `byte` covers.
+fn blocked(vectors: &[bool], byte: u64, size: u64) -> u64 {
+    (0..size)
+        .filter(|bit| {
+            let vector = (byte * 8 + bit) as usize;
+            vectors.get(vector).copied().unwrap_or(false)
+        })
+        .fold(0, |bits, bit| bits | 1 << bit)
 }
 
 /// The port window, which exists to be mapped. Nothing on this machine has a port

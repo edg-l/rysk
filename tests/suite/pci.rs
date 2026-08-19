@@ -3,8 +3,8 @@
 
 use crate::common::*;
 use rysk::{
-    device::Line,
-    pci::{self, Bar, Function, Header, HostBridge, Root},
+    device::{Device, Line, Msi},
+    pci::{self, Bar, Function, Header, HostBridge, MsiX, Root},
     trap::Exception,
 };
 
@@ -79,10 +79,17 @@ impl Function for Probe {
 /// device one. `t0` is device zero's config space, `t1` device one's, `t2` the 32-bit
 /// window and `t3` all ones.
 fn pcie(code: &[u32]) -> Program {
-    let root = Root::new(std::array::from_fn(|_| Line::default()));
+    posted(code, Msi::default()).0
+}
+
+/// The same, with somewhere for a message to go and the root complex handed back so a
+/// test can make a function raise one.
+fn posted(code: &[u32], msi: Msi) -> (Program, Root) {
+    let root = Root::new(std::array::from_fn(|_| Line::default()), msi);
     root.plug(0, Box::new(HostBridge));
     root.plug(1, Box::new(Probe::default()));
-    prog(code)
+    root.plug(MESSENGER, Box::new(Messenger));
+    let program = prog(code)
         .device(pci::ECAM, pci::ECAM_SIZE, Box::new(root.config()))
         .device(pci::MMIO, pci::MMIO_SIZE, Box::new(root.window(pci::MMIO)))
         .device(
@@ -93,7 +100,60 @@ fn pcie(code: &[u32]) -> Program {
         .reg(T0, config(0))
         .reg(T1, config(1))
         .reg(T2, pci::MMIO)
-        .reg(T3, u64::MAX)
+        .reg(T3, u64::MAX);
+    (program, root)
+}
+
+/// A function that interrupts by message rather than by wire, with room in its one
+/// window for a table of two vectors and the array that goes with them.
+const MESSENGER: usize = 3;
+const VECTORS: usize = 2;
+const TABLE: u64 = 0;
+const PENDING: u64 = 0x800;
+
+#[derive(Debug)]
+struct Messenger;
+
+impl Function for Messenger {
+    fn header(&self) -> Header {
+        Header {
+            vendor: 0x1af4,
+            device: 0x1052,
+            class: 0x00ff_0000,
+            bars: [
+                Bar::Memory {
+                    size: 0x1000,
+                    prefetchable: false,
+                    wide: false,
+                },
+                Bar::None,
+                Bar::None,
+                Bar::None,
+                Bar::None,
+                Bar::None,
+            ],
+            msix: Some(MsiX {
+                vectors: VECTORS,
+                table: (0, TABLE),
+                pending: (0, PENDING),
+            }),
+            ..Header::default()
+        }
+    }
+
+    fn load(&mut self, _bar: usize, offset: u64, _size: u64) -> Result<u64, Exception> {
+        Err(Exception::LoadAccessFault(offset))
+    }
+
+    fn store(
+        &mut self,
+        _bar: usize,
+        offset: u64,
+        _size: u64,
+        _value: u64,
+    ) -> Result<(), Exception> {
+        Err(Exception::StoreAmoAccessFault(offset))
+    }
 }
 
 #[test]
@@ -286,5 +346,194 @@ fn a_pin_is_swizzled_so_that_four_devices_do_not_share_one_wire() {
         pins,
         [1, 2, 3, 0],
         "and one device's four pins over all of them"
+    );
+}
+
+// ---------------------------------------------------------------- messages
+
+/// The capability's registers, from the specification rather than from the model.
+/// PCI Local Bus Specification 3.0, 6.8.2.
+const STATUS: i32 = 0x06;
+const CAPABILITIES: i32 = 0x34;
+const MSIX_CONTROL: i32 = 0x40;
+const MSIX_TABLE: i32 = 0x44;
+const MSIX_PBA: i32 = 0x48;
+const MSIX_ENABLE: u64 = 1 << 31;
+const MSIX_FUNCTION_MASK: u64 = 1 << 30;
+/// How big one entry is, which is four words.
+const VECTOR_SIZE: u64 = 16;
+
+/// Where a test points a vector, and what it has it say when it gets there.
+const SINK: u64 = 0x1234_5000;
+const IDENTITY: u32 = 42;
+
+/// Every message that reached the sink, as the address it was posted to and what was
+/// posted there.
+type Posted = std::sync::Arc<std::sync::Mutex<Vec<(u64, u32)>>>;
+
+/// A place to post to, and the messages that arrived there.
+fn recorder() -> (Msi, Posted) {
+    let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = posted.clone();
+    (
+        Msi::new(move |addr, identity| kept.lock().unwrap().push((addr, identity))),
+        posted,
+    )
+}
+
+#[test]
+fn a_function_that_sends_messages_says_so_in_its_capability_list() {
+    let machine = pcie(&[
+        lhu(A0, T4, STATUS),
+        lbu(A1, T4, CAPABILITIES),
+        lwu(A2, T4, MSIX_CONTROL),
+        lwu(A3, T4, MSIX_TABLE),
+        lwu(A4, T4, MSIX_PBA),
+        lhu(A5, T1, STATUS),
+    ])
+    .reg(T4, config(MESSENGER))
+    .run();
+    assert_eq!(machine.reg(A0) & (1 << 4), 1 << 4, "there is a list");
+    assert_eq!(
+        machine.reg(A1),
+        MSIX_CONTROL as u64,
+        "and the pointer names where it starts"
+    );
+    assert_eq!(
+        machine.reg(A2),
+        0x11 | ((VECTORS as u64 - 1) << 16),
+        "the capability is msi-x, ends the list, and has two vectors"
+    );
+    assert_eq!(machine.reg(A3), TABLE, "the table is in window zero");
+    assert_eq!(machine.reg(A4), PENDING, "and so is the array");
+    assert_eq!(
+        machine.reg(A5) & (1 << 4),
+        0,
+        "a function with no capabilities says it has none"
+    );
+}
+
+/// Place the messenger's window at `WINDOW`, turn its memory space on, and point
+/// vector zero at the sink. `t5` is the window and `t6` the messenger's config space.
+const WINDOW: u64 = pci::MMIO + 0x8000;
+
+fn armed() -> Vec<u32> {
+    vec![
+        sw(S0, T6, BAR0),
+        sw(S1, T6, COMMAND),
+        // Where to write, and what to write there.
+        sw(A5, T5, TABLE as i32),
+        sw(ZERO, T5, TABLE as i32 + 4),
+        sw(A4, T5, TABLE as i32 + 8),
+    ]
+}
+
+fn messenger(code: &[u32], msi: Msi) -> (Program, Root) {
+    let (program, root) = posted(code, msi);
+    let program = program
+        .reg(T5, WINDOW)
+        .reg(T6, config(MESSENGER))
+        .reg(S0, WINDOW)
+        .reg(S1, MEMORY)
+        .reg(A4, IDENTITY as u64)
+        .reg(A5, SINK);
+    (program, root)
+}
+
+#[test]
+fn a_vector_is_posted_where_its_entry_points() {
+    let (msi, posted) = recorder();
+    let mut code = armed();
+    code.extend([
+        // Unmask the vector, then the function.
+        sw(ZERO, T5, TABLE as i32 + 12),
+        sw(A3, T6, MSIX_CONTROL),
+    ]);
+    let (program, root) = messenger(&code, msi);
+    let machine = program.reg(A3, MSIX_ENABLE).run();
+    let _ = machine;
+
+    root.message(MESSENGER, 0);
+    assert_eq!(
+        *posted.lock().unwrap(),
+        [(SINK, IDENTITY)],
+        "the address and the data the entry was given"
+    );
+}
+
+#[test]
+fn a_function_that_has_not_been_turned_on_sends_nothing() {
+    let (msi, posted) = recorder();
+    let mut code = armed();
+    code.push(sw(ZERO, T5, TABLE as i32 + 12));
+    let (program, root) = messenger(&code, msi);
+    program.run();
+
+    root.message(MESSENGER, 0);
+    assert!(
+        posted.lock().unwrap().is_empty(),
+        "a message needs the capability enabled, whatever the entry says"
+    );
+}
+
+#[test]
+fn a_masked_vector_waits_rather_than_being_dropped() {
+    let (msi, posted) = recorder();
+    let mut code = armed();
+    // Enabled, but with every vector masked at the function.
+    code.push(sw(A3, T6, MSIX_CONTROL));
+    code.push(sw(ZERO, T5, TABLE as i32 + 12));
+    let (program, root) = messenger(&code, msi);
+    let machine = program.reg(A3, MSIX_ENABLE | MSIX_FUNCTION_MASK).run();
+    let _ = machine;
+
+    root.message(MESSENGER, 0);
+    assert!(posted.lock().unwrap().is_empty(), "masked, so nothing goes");
+}
+
+#[test]
+fn a_vector_raised_while_masked_waits_and_goes_when_it_is_unmasked() {
+    let (msi, posted) = recorder();
+    let root = Root::new(std::array::from_fn(|_| Line::default()), msi);
+    root.plug(MESSENGER, Box::new(Messenger));
+    let mut config = root.config();
+    let mut window = root.window(pci::MMIO);
+    // Config space and the window are reached where the bus reaches them, which is at
+    // an offset from each one's own base.
+    let register = |reg: i32| ((MESSENGER as u64) << 15) + reg as u64;
+    let entry = WINDOW - pci::MMIO + TABLE + VECTOR_SIZE;
+    let array = WINDOW - pci::MMIO + PENDING;
+
+    // Place the window, turn its memory space on, point vector one at the sink, and
+    // enable the capability while leaving the vector itself masked.
+    config.store(register(BAR0), 32, WINDOW).unwrap();
+    config.store(register(COMMAND), 32, MEMORY).unwrap();
+    window.store(entry, 32, SINK).unwrap();
+    window.store(entry + 8, 32, IDENTITY as u64).unwrap();
+    config
+        .store(register(MSIX_CONTROL), 32, MSIX_ENABLE)
+        .unwrap();
+
+    root.message(MESSENGER, 1);
+    assert!(
+        posted.lock().unwrap().is_empty(),
+        "a vector comes out of reset masked"
+    );
+    assert_eq!(
+        window.load(array, 32).unwrap(),
+        1 << 1,
+        "and the array says which one is waiting"
+    );
+
+    window.store(entry + 12, 32, 0).unwrap();
+    assert_eq!(
+        *posted.lock().unwrap(),
+        [(SINK, IDENTITY)],
+        "unmasking sends what was waiting"
+    );
+    assert_eq!(
+        window.load(array, 32).unwrap(),
+        0,
+        "and it is not waiting now"
     );
 }
