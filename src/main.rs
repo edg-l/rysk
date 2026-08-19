@@ -111,8 +111,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.initrd = Some((at, at + bytes.len() as u64));
     }
 
-    machine::boot(&mut cpu, rysk::ISA, &options);
+    let keyboard = machine::boot(&mut cpu, rysk::ISA, &options);
     handoff(&mut cpu);
+
+    // Whatever is typed reaches the port from its own thread, since the hart is busy
+    // being a hart. The terminal is still in its usual line-buffered mode, so a line
+    // arrives when it is finished rather than a key at a time: making it raw is the
+    // frontend's job and the frontend is not written yet.
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        while std::io::stdin().read_exact(&mut byte).is_ok() {
+            keyboard.typed(&byte);
+        }
+    });
 
     let stopped = match tohost {
         Some(tohost) => htif::run(&mut cpu, tohost, MAX_STEPS).to_string(),

@@ -14,7 +14,7 @@ use crate::{
     device::Line,
     fdt::Fdt,
     plic::{self, Plic},
-    uart::{self, Uart},
+    uart::{self, Keyboard, Uart},
 };
 
 /// The interrupt source the first serial port drives, as the `virt` machine wires it.
@@ -45,8 +45,8 @@ pub struct Boot {
     pub initrd: Option<(u64, u64)>,
 }
 
-pub fn boot(cpu: &mut Cpu, isa: &str, options: &Boot) {
-    virt(&mut cpu.bus);
+pub fn boot(cpu: &mut Cpu, isa: &str, options: &Boot) -> Keyboard {
+    let keyboard = virt(&mut cpu.bus);
     let memory = cpu.bus.dram.size();
     let at = fdt_base(memory);
     let tree = describe(isa, memory, options);
@@ -56,10 +56,14 @@ pub fn boot(cpu: &mut Cpu, isa: &str, options: &Boot) {
     );
     cpu.regs[10] = 0;
     cpu.regs[11] = at;
+    keyboard
 }
 
-pub fn virt(bus: &mut Bus) {
+/// Attach what a `virt` machine has, and hand back the end of the serial port that
+/// faces the world, so whatever is doing the typing can reach it.
+pub fn virt(bus: &mut Bus) -> Keyboard {
     let serial = Line::default();
+    let keyboard = Keyboard::default();
     let mut plic = Plic::new();
     plic.connect(UART_IRQ, serial.clone());
 
@@ -68,8 +72,9 @@ pub fn virt(bus: &mut Bus) {
     bus.attach(
         uart::BASE,
         uart::SIZE,
-        Box::new(Uart::new(serial, Box::new(io::stdout()))),
+        Box::new(Uart::new(serial, keyboard.clone(), Box::new(io::stdout()))),
     );
+    keyboard
 }
 
 /// The same machine, described. Firmware and a kernel read this to find what `virt`

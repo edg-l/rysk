@@ -5,7 +5,7 @@ use rysk::{
     device::Line,
     plic::{self, Plic},
     trap::{Exception, INTERRUPT, Interrupt},
-    uart::{self, Uart},
+    uart::{self, Keyboard, Uart},
 };
 use std::{
     io::{self, Write},
@@ -39,10 +39,11 @@ impl Printed {
 /// A machine with a serial port, its output captured, and `t0` pointing at it.
 fn serial(code: &[u32], typed: Option<u8>) -> (Program, Printed) {
     let printed = Printed::default();
-    let mut port = Uart::new(Line::default(), Box::new(printed.clone()));
+    let keyboard = Keyboard::default();
     if let Some(byte) = typed {
-        port.receive(byte);
+        keyboard.typed(&[byte]);
     }
+    let port = Uart::new(Line::default(), keyboard, Box::new(printed.clone()));
     let program = prog(code)
         .device(uart::BASE, uart::SIZE, Box::new(port))
         .reg(T0, uart::BASE);
@@ -127,10 +128,11 @@ fn wired(code: &[u32], typed: Option<u8>) -> Program {
     let line = Line::default();
     let mut controller = Plic::new();
     controller.connect(UART_IRQ as usize, line.clone());
-    let mut port = Uart::new(line, Box::new(io::sink()));
+    let keyboard = Keyboard::default();
     if let Some(byte) = typed {
-        port.receive(byte);
+        keyboard.typed(&[byte]);
     }
+    let port = Uart::new(line, keyboard, Box::new(io::sink()));
     prog(code)
         .device(uart::BASE, uart::SIZE, Box::new(port))
         .device(plic::BASE, plic::SIZE, Box::new(controller))

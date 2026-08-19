@@ -5,12 +5,40 @@
 //! What a 16550 is is not written down in a RISC-V specification; this follows the
 //! part, which every operating system already has a driver for.
 
-use std::io::Write;
+use std::{
+    collections::VecDeque,
+    io::Write,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     device::{Device, Line},
     trap::Exception,
 };
+
+/// What has been typed and not yet read.
+///
+/// Shared, because whatever is doing the typing is not the hart: a terminal on another
+/// thread, a window, or a test handing over a line at a time. The port is the model
+/// and this is the end of it that faces the world, which is the same split as the
+/// `Write` it sends to.
+#[derive(Debug, Clone, Default)]
+pub struct Keyboard(Arc<Mutex<VecDeque<u8>>>);
+
+impl Keyboard {
+    /// Hand the port some bytes, as typing them would.
+    pub fn typed(&self, bytes: &[u8]) {
+        self.0.lock().unwrap().extend(bytes);
+    }
+
+    fn take(&self) -> Option<u8> {
+        self.0.lock().unwrap().pop_front()
+    }
+
+    fn waiting(&self) -> bool {
+        !self.0.lock().unwrap().is_empty()
+    }
+}
 
 pub const BASE: u64 = 0x1000_0000;
 pub const SIZE: u64 = 0x100;
@@ -50,9 +78,7 @@ const IIR_RX: u8 = 0b0100;
 pub struct Uart {
     out: Box<dyn Write + Send>,
     line: Line,
-    /// What has been typed and not yet read. One byte, which is what a 16550 without
-    /// its fifo enabled holds.
-    rx: Option<u8>,
+    keyboard: Keyboard,
     ier: u8,
     lcr: u8,
     mcr: u8,
@@ -62,16 +88,18 @@ pub struct Uart {
 
 impl std::fmt::Debug for Uart {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Uart").field("rx", &self.rx).finish()
+        f.debug_struct("Uart")
+            .field("waiting", &self.keyboard.waiting())
+            .finish()
     }
 }
 
 impl Uart {
-    pub fn new(line: Line, out: Box<dyn Write + Send>) -> Self {
+    pub fn new(line: Line, keyboard: Keyboard, out: Box<dyn Write + Send>) -> Self {
         Self {
             out,
             line,
-            rx: None,
+            keyboard,
             ier: 0,
             lcr: 0,
             mcr: 0,
@@ -80,20 +108,10 @@ impl Uart {
         }
     }
 
-    /// Hand the port a byte, as typing one would. It is dropped if the last has not
-    /// been read yet, which is the overrun a real port reports and a guest that is not
-    /// keeping up deserves.
-    pub fn receive(&mut self, byte: u8) {
-        if self.rx.is_none() {
-            self.rx = Some(byte);
-        }
-        self.update();
-    }
-
     /// Which interrupt the port is reporting, if any. The transmitter is always idle,
     /// so an enabled transmit interrupt is always asserted.
     fn interrupt(&self) -> u8 {
-        if self.ier & IER_RX != 0 && self.rx.is_some() {
+        if self.ier & IER_RX != 0 && self.keyboard.waiting() {
             IIR_RX
         } else if self.ier & IER_TX != 0 {
             IIR_TX
@@ -102,13 +120,13 @@ impl Uart {
         }
     }
 
-    fn update(&mut self) {
+    fn update(&self) {
         self.line.set(self.interrupt() != IIR_NONE);
     }
 
     fn status(&self) -> u8 {
         let mut lsr = LSR_TX_EMPTY | LSR_IDLE;
-        if self.rx.is_some() {
+        if self.keyboard.waiting() {
             lsr |= LSR_RX;
         }
         lsr
@@ -120,7 +138,7 @@ impl Device for Uart {
         let latched = self.lcr & LCR_DLAB != 0;
         let value = match offset {
             RBR if latched => self.divisor as u8,
-            RBR => self.rx.take().unwrap_or(0),
+            RBR => self.keyboard.take().unwrap_or(0),
             IER if latched => (self.divisor >> 8) as u8,
             IER => self.ier,
             IIR => self.interrupt(),
@@ -135,6 +153,15 @@ impl Device for Uart {
         };
         self.update();
         Ok(value as u64)
+    }
+
+    /// Nothing in `mip` is the port's to drive: its line runs to a controller, which
+    /// is what drives one. What it does here is notice that a byte has arrived while
+    /// nothing was reading it, since the hart is otherwise only told at an access and
+    /// may be waiting rather than making one.
+    fn interrupts(&self) -> u64 {
+        self.update();
+        0
     }
 
     fn store(&mut self, offset: u64, _size: u64, value: u64) -> Result<(), Exception> {
