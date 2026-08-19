@@ -1,6 +1,8 @@
 use crate::bus::DRAM_BASE;
 
-pub const DRAM_SIZE: u64 = 1024 * 1024 * 128; // 128MiB
+/// How much memory a machine has when nothing says otherwise. Enough for a kernel and
+/// the room it wants after itself, and small enough to allocate without thinking.
+pub const DRAM_SIZE: u64 = 1024 * 1024 * 128;
 
 #[derive(Debug, Clone)]
 pub struct Dram {
@@ -9,10 +11,22 @@ pub struct Dram {
 
 impl Dram {
     pub fn new(code: Vec<u8>) -> Dram {
-        let mut dram = vec![0; DRAM_SIZE as usize];
+        Self::with_size(code, DRAM_SIZE)
+    }
+
+    /// A machine with `size` bytes of memory. How much there is is a property of the
+    /// machine rather than of the emulator, so it is asked for rather than assumed:
+    /// a kernel image is tens of megabytes before it has run an instruction.
+    pub fn with_size(code: Vec<u8>, size: u64) -> Dram {
+        let mut dram = vec![0; size as usize];
         dram.splice(..code.len(), code);
 
         Self { dram }
+    }
+
+    /// How much memory there is, in bytes.
+    pub fn size(&self) -> u64 {
+        self.dram.len() as u64
     }
 
     /// Place `bytes` at `addr` and zero `zeroes` bytes after them, as loading an image

@@ -12,7 +12,6 @@ use crate::{
     clint::{self, Clint},
     cpu::Cpu,
     device::Line,
-    dram::DRAM_SIZE,
     fdt::Fdt,
     plic::{self, Plic},
     uart::{self, Uart},
@@ -29,22 +28,26 @@ const SOURCES: u32 = UART_IRQ as u32;
 const HART_INTC: u32 = 1;
 const PLIC: u32 = 2;
 
-/// Where the tree is left for the guest to find. High in dram, out of the way of an
+/// Where the tree is left for the guest to find: high in dram, out of the way of an
 /// image loaded at the bottom of it, and page aligned because a guest will map it.
-pub const FDT_BASE: u64 = DRAM_BASE + DRAM_SIZE - 0x10_0000;
+pub fn fdt_base(memory: u64) -> u64 {
+    DRAM_BASE + memory - 0x10_0000
+}
 
 /// Attach the machine's devices, describe them, and leave the description where the
 /// guest is told to look: `a0` is the hart that is booting and `a1` is the tree, which
 /// is the handover every RISC-V kernel expects from whatever ran before it.
 pub fn boot(cpu: &mut Cpu, isa: &str) {
     virt(&mut cpu.bus);
-    let tree = describe(isa);
+    let memory = cpu.bus.dram.size();
+    let at = fdt_base(memory);
+    let tree = describe(isa, memory);
     assert!(
-        cpu.bus.dram.write(FDT_BASE, &tree, 0),
+        cpu.bus.dram.write(at, &tree, 0),
         "the device tree does not fit in dram"
     );
     cpu.regs[10] = 0;
-    cpu.regs[11] = FDT_BASE;
+    cpu.regs[11] = at;
 }
 
 pub fn virt(bus: &mut Bus) {
@@ -63,7 +66,7 @@ pub fn virt(bus: &mut Bus) {
 
 /// The same machine, described. Firmware and a kernel read this to find what `virt`
 /// attached above, so the two are written next to each other on purpose.
-pub fn describe(isa: &str) -> Vec<u8> {
+pub fn describe(isa: &str, memory: u64) -> Vec<u8> {
     let mut fdt = Fdt::new();
     fdt.begin_node("");
     fdt.cells("#address-cells", &[2]);
@@ -100,7 +103,7 @@ pub fn describe(isa: &str) -> Vec<u8> {
 
     fdt.begin_node(&format!("memory@{DRAM_BASE:x}"));
     fdt.string("device_type", "memory");
-    fdt.reg(DRAM_BASE, DRAM_SIZE);
+    fdt.reg(DRAM_BASE, memory);
     fdt.end_node();
 
     fdt.begin_node("soc");

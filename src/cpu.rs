@@ -7,7 +7,7 @@ use crate::{
     bus::{Bus, DRAM_BASE},
     clint,
     csr::{self, *},
-    dram::{DRAM_SIZE, Dram},
+    dram::Dram,
     elf::{Error as ElfError, Image},
     inst::{self, AmoOp, CasWidth, Cond, Inst, Op, Width, decode},
     mmu::{Access, Tlb},
@@ -35,11 +35,16 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new(code: Vec<u8>) -> Self {
+        Self::with_memory(code, crate::dram::DRAM_SIZE)
+    }
+
+    /// A machine with `memory` bytes of dram, its stack pointer at the top of it.
+    pub fn with_memory(code: Vec<u8>, memory: u64) -> Self {
         let mut cpu = Cpu {
             regs: Default::default(),
             pc: DRAM_BASE,
             next_pc: DRAM_BASE,
-            bus: Bus::new(Dram::new(code)),
+            bus: Bus::new(Dram::with_size(code, memory)),
             csrs: [0; 4096],
             mode: Mode::Machine,
             tlb: Tlb::default(),
@@ -47,7 +52,7 @@ impl Cpu {
         };
 
         cpu.regs[0] = 0;
-        cpu.regs[2] = DRAM_BASE + DRAM_SIZE;
+        cpu.regs[2] = DRAM_BASE + memory;
         cpu.csrs[MISA] = MISA_MXL_64
             | misa_extension(b'i')
             | misa_extension(b'm')

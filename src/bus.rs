@@ -3,11 +3,7 @@ use std::{cmp::Ordering, ops::Range};
 #[cfg(feature = "trace")]
 use tracing::instrument;
 
-use crate::{
-    device::Device,
-    dram::{DRAM_SIZE, Dram},
-    trap::Exception,
-};
+use crate::{device::Device, dram::Dram, trap::Exception};
 
 /// The address which dram starts, same as QEMU virt machine.
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -136,7 +132,7 @@ impl Bus {
     /// Whether `size` bits at `addr` fall inside dram.
     fn in_dram(&self, addr: u64, size: u64) -> bool {
         match addr.checked_add(size / 8) {
-            Some(end) => DRAM_BASE <= addr && end <= DRAM_BASE + DRAM_SIZE,
+            Some(end) => DRAM_BASE <= addr && end <= DRAM_BASE + self.dram.size(),
             None => false,
         }
     }

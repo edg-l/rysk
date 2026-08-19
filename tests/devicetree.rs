@@ -73,7 +73,7 @@ fn text(value: &[u8]) -> String {
 
 #[test]
 fn the_tree_describes_the_machine_the_bus_decodes() {
-    let blob = machine::describe("rv64imac");
+    let blob = machine::describe("rv64imac", DRAM_SIZE);
     let tree = parse(&blob);
 
     let reg = |path: &str| cells(&tree[path]);
@@ -121,7 +121,7 @@ fn the_tree_describes_the_machine_the_bus_decodes() {
 
 #[test]
 fn a_device_names_the_controller_its_line_runs_to() {
-    let tree = parse(&machine::describe("rv64imac"));
+    let tree = parse(&machine::describe("rv64imac", DRAM_SIZE));
     let intc = cells(&tree["/cpus/cpu@0/interrupt-controller/phandle"])[0];
     let plic = cells(&tree["/soc/plic@c000000/phandle"])[0];
 
