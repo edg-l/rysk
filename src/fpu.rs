@@ -743,15 +743,13 @@ pub fn to_integer(f: Format, a: u64, bits: u32, signed: bool, mode: Round) -> Ou
         Round::Up => inexact && !sign,
     };
     let magnitude = whole + up as u128;
-    let value = if sign {
-        match magnitude.checked_neg() {
-            _ if magnitude > (low.unsigned_abs()) => return invalid(low),
-            _ => -(magnitude as i128),
-        }
-    } else if magnitude > high {
-        return invalid(high as i128);
-    } else {
-        magnitude as i128
+    // Past either end there is no nearest integer to give, so the answer is the end
+    // itself and the operation says it was invalid rather than merely inexact.
+    let value = match sign {
+        true if magnitude > low.unsigned_abs() => return invalid(low),
+        true => -(magnitude as i128),
+        false if magnitude > high => return invalid(high as i128),
+        false => magnitude as i128,
     };
     (saturate(value), if inexact { NX } else { 0 })
 }
