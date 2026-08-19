@@ -28,6 +28,10 @@ struct Entry {
     decoded: Decoded,
 }
 
+/// Enough entries to hold a page of compressed instructions, and small enough that the
+/// whole table stays in the cache the host has for it.
+const SIZE: usize = 2048;
+
 /// A direct-mapped cache of them.
 ///
 /// Keyed by physical address rather than virtual, which is what lets it survive a
@@ -36,26 +40,28 @@ struct Entry {
 /// and `sfence.vma` has nothing to say about what is in here.
 #[derive(Debug)]
 pub struct Icache {
-    entries: Box<[Option<Entry>]>,
+    /// An array rather than a slice, so that masking the index to its length is a
+    /// proof the index is in range: against a slice the length is a value to be loaded
+    /// and compared against on every fetch.
+    entries: Box<[Option<Entry>; SIZE]>,
 }
 
 impl Default for Icache {
     fn default() -> Self {
         Self {
-            entries: vec![None; Self::SIZE].into_boxed_slice(),
+            entries: vec![None; SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("SIZE entries"),
         }
     }
 }
 
 impl Icache {
-    /// Enough entries to hold a page of compressed instructions, and small enough that
-    /// the whole table stays in the cache the host has for it.
-    const SIZE: usize = 2048;
-
     /// Every instruction is two-byte aligned, so the bit below that carries nothing.
     #[inline]
     const fn slot(pa: u64) -> usize {
-        (pa >> 1) as usize & (Self::SIZE - 1)
+        (pa >> 1) as usize & (SIZE - 1)
     }
 
     #[inline]
