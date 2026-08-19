@@ -6,6 +6,7 @@ mod csr;
 mod device;
 mod encoding;
 mod integer;
+mod interrupt;
 mod memory;
 mod muldiv;
 mod privilege;

@@ -59,11 +59,32 @@ pub const STVAL: usize = 0x143;
 pub const SIP: usize = 0x144;
 pub const MEDELEG: usize = 0x302;
 pub const MIDELEG: usize = 0x303;
+/// The interrupt bits of `mip` and `mie`, which share their layout with `mcause`'s
+/// interrupt causes. The RISC-V Instruction Set Manual Volume II, 3.1.9, figure 15.
+pub const SSIP: u64 = 1 << 1;
+pub const MSIP: u64 = 1 << 3;
+pub const STIP: u64 = 1 << 5;
+pub const MTIP: u64 = 1 << 7;
+pub const SEIP: u64 = 1 << 9;
+pub const MEIP: u64 = 1 << 11;
+/// The enable bits of `mie` share the pending bits' layout, so they are the same
+/// numbers under names that read correctly at a call site.
+pub const SSIE: u64 = SSIP;
+pub const MSIE: u64 = MSIP;
+pub const STIE: u64 = STIP;
+pub const MTIE: u64 = MTIP;
+pub const SEIE: u64 = SEIP;
+pub const MEIE: u64 = MEIP;
 /// The interrupts a supervisor can be given: software, timer and external at its own
 /// level. The machine-level bits are never delegatable, and the counter-overflow one
 /// belongs to `Sscofpmf`, which rysk does not implement.
 /// The RISC-V Instruction Set Manual Volume II, 12.1.3, figure 55.
-pub const S_INTERRUPTS: u64 = (1 << 1) | (1 << 5) | (1 << 9);
+pub const S_INTERRUPTS: u64 = SSIP | STIP | SEIP;
+/// The pending bits a device drives rather than software. They are read-only in `mip`
+/// and follow whatever the device is doing, so clearing one means acting on the
+/// device: moving a deadline, or completing a claim.
+/// The RISC-V Instruction Set Manual Volume II, 3.1.9.
+pub const MIP_DEVICE: u64 = MSIP | MTIP | SEIP | MEIP;
 pub const RDCYCLE: usize = 0xC00;
 pub const RDTIME: usize = 0xC01;
 pub const INSTRET: usize = 0xC02;

@@ -1,5 +1,5 @@
 use crate::common::*;
-use rysk::{bus::DRAM_BASE, csr::Mode, exception::Exception};
+use rysk::{bus::DRAM_BASE, csr::Mode, trap::Exception};
 
 // ------------------------------------------------------------------ traps
 
@@ -20,12 +20,6 @@ fn an_unknown_encoding_is_an_illegal_instruction() {
 fn ecall_and_ebreak_raise_rather_than_halt() {
     prog(&[ecall()]).expect(Exception::EnvironmentCall(Mode::Machine));
     prog(&[nop(), ebreak()]).expect(Exception::Breakpoint(DRAM_BASE + 4));
-}
-
-#[test]
-fn wfi_retires_because_no_interrupt_can_arrive() {
-    let cpu = run(&[wfi(), addi(A0, ZERO, 1)]);
-    assert_eq!(cpu.reg(A0), 1);
 }
 
 #[test]

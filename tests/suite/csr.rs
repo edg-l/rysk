@@ -1,7 +1,7 @@
 use crate::common::*;
 use rysk::csr::{
     MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE, MSTATUS_SXL,
-    MSTATUS_UXL, MSTATUS_XL_64, Mode, S_INTERRUPTS, misa_extension,
+    MSTATUS_UXL, MSTATUS_XL_64, MTIP, Mode, S_INTERRUPTS, SSIP, STIP, misa_extension,
 };
 
 // ------------------------------------------------------------------ zicsr
@@ -89,11 +89,6 @@ const MIP: u32 = 0x344;
 const SIP: u32 = 0x144;
 const MIDELEG: u32 = 0x303;
 
-const SSIP: u64 = 1 << 1;
-const STIP: u64 = 1 << 5;
-const MSIP: u64 = 1 << 3;
-const MTIP: u64 = 1 << 7;
-
 #[test]
 fn mideleg_holds_only_the_interrupts_that_can_be_delegated() {
     let cpu = prog(&[csrrw(ZERO, MIDELEG, T0), csrrs(A0, MIDELEG, ZERO)])
@@ -147,7 +142,7 @@ fn sip_is_a_window_onto_mip_and_not_a_register_of_its_own() {
         csrrs(A1, MIP, ZERO),
     ])
     .reg(T0, SSIP)
-    .reg(T1, SSIP | MSIP)
+    .reg(T1, SSIP | STIP)
     .run();
     assert_eq!(
         cpu.reg(A0),
@@ -156,7 +151,7 @@ fn sip_is_a_window_onto_mip_and_not_a_register_of_its_own() {
     );
     assert_eq!(
         cpu.reg(A1),
-        MSIP,
+        STIP,
         "clearing sip cleared it in mip, not in storage of its own"
     );
 }

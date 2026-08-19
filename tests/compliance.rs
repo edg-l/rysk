@@ -5,7 +5,7 @@
 
 use std::{fs, path::PathBuf};
 
-use rysk::{cpu::Cpu, elf, htif};
+use rysk::{cpu::Cpu, elf, htif, machine};
 
 /// Generous for a corpus test, which is a few thousand instructions, and short enough
 /// that a program which will never finish says so quickly.
@@ -25,7 +25,7 @@ const WAITING: &[(&str, &str)] = &[
     ("rv64mi-p-breakpoint", "debug triggers"),
     (
         "rv64mi-p-illegal",
-        "an interrupt, and nothing can raise one yet",
+        "sfence.vma, satp, and the trap-enable bits of mstatus",
     ),
     ("rv64si-p-dirty", "sv39, and the accessed and dirty bits"),
     ("rv64si-p-icache-alias", "sv39"),
@@ -66,6 +66,7 @@ fn run_group(group: &str) {
         let tohost = htif::tohost(&image)
             .unwrap_or_else(|| panic!("{name} has no tohost symbol, so it cannot report"));
         let mut cpu = Cpu::from_elf(&image).unwrap_or_else(|e| panic!("{name}: {e}"));
+        machine::virt(&mut cpu.bus);
 
         let waiting = WAITING
             .iter()

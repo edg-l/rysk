@@ -6,9 +6,7 @@ mod asm;
 
 pub use asm::*;
 
-use rysk::{
-    bus::DRAM_BASE, cpu::Cpu, csr::Mode, device::Device, dram::DRAM_SIZE, exception::Exception,
-};
+use rysk::{bus::DRAM_BASE, cpu::Cpu, csr::Mode, device::Device, dram::DRAM_SIZE, trap::Trap};
 
 /// An address in dram that no test program occupies, for tests that need memory.
 pub const SCRATCH: u64 = DRAM_BASE + 0x1000;
@@ -64,10 +62,11 @@ impl Program {
     }
 
     /// Run until a trap nothing handles, and check it was the expected one.
-    pub fn expect(self, expected: Exception) -> Cpu {
+    pub fn expect(self, expected: impl Into<Trap>) -> Cpu {
         let (cpu, stopped) = self.run_to_trap();
         assert_eq!(
-            stopped, expected,
+            stopped,
+            expected.into(),
             "the machine stopped for the wrong reason"
         );
         cpu
@@ -79,7 +78,7 @@ impl Program {
         self.run_to_trap().0
     }
 
-    fn run_to_trap(self) -> (Cpu, Exception) {
+    fn run_to_trap(self) -> (Cpu, Trap) {
         let mut bytes = Vec::with_capacity(self.code.len() * 4);
         for inst in &self.code {
             bytes.extend_from_slice(&inst.to_le_bytes());

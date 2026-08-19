@@ -1,6 +1,6 @@
 use std::{env, fs::File, io::Read};
 
-use rysk::{cpu::Cpu, elf, htif};
+use rysk::{cpu::Cpu, elf, htif, machine};
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -35,12 +35,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (Cpu::new(code), None)
     };
+    machine::virt(&mut cpu.bus);
 
     let stopped = match tohost {
         Some(tohost) => htif::run(&mut cpu, tohost, MAX_STEPS).to_string(),
         None => {
-            let exception = cpu.run();
-            format!("{exception}, pc {:#x}", cpu.pc)
+            let trap = cpu.run();
+            format!("{trap}, pc {:#x}", cpu.pc)
         }
     };
 

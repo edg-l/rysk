@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use crate::exception::Exception;
+use crate::trap::Exception;
 
 /// The width of a memory access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

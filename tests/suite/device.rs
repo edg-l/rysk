@@ -1,5 +1,5 @@
 use crate::common::*;
-use rysk::{device::Device, exception::Exception};
+use rysk::{device::Device, trap::Exception};
 
 // ---------------------------------------------------------- address decode
 

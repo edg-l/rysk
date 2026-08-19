@@ -4,7 +4,11 @@
 //! `1` means every case passed, and `(n << 1) | 1` that case `n` failed. Nothing else
 //! about the protocol is needed to run the corpus.
 
-use crate::{cpu::Cpu, elf::Image, exception::Exception};
+use crate::{
+    cpu::Cpu,
+    elf::Image,
+    trap::{Exception, Trap},
+};
 
 /// How a run against the corpus ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +19,7 @@ pub enum Outcome {
     /// A trap with no handler installed, which for the corpus means its own handler
     /// never got the chance to write `tohost`.
     Trapped {
-        exception: Exception,
+        trap: Trap,
         pc: u64,
     },
     /// Still running after `max_steps`, which for a corpus test means a loop it cannot
@@ -28,7 +32,7 @@ impl std::fmt::Display for Outcome {
         match self {
             Self::Passed => write!(f, "passed"),
             Self::Failed(n) => write!(f, "failed at test {n}"),
-            Self::Trapped { exception, pc } => write!(f, "{exception}, pc {pc:#x}"),
+            Self::Trapped { trap, pc } => write!(f, "{trap}, pc {pc:#x}"),
             Self::TimedOut => write!(f, "timed out"),
         }
     }
@@ -43,11 +47,18 @@ pub fn tohost(image: &Image) -> Option<u64> {
 /// longer than `max_steps`.
 pub fn run(cpu: &mut Cpu, tohost: u64, max_steps: u64) -> Outcome {
     for _ in 0..max_steps {
+        if let Some(interrupt) = cpu.interrupt() {
+            let trap = Trap::Interrupt(interrupt);
+            if !cpu.take_trap(trap) {
+                return Outcome::Trapped { trap, pc: cpu.pc };
+            }
+        }
+
         if let Err(exception) = cpu.step()
-            && !cpu.take_trap(exception)
+            && !cpu.take_trap(exception.into())
         {
             return Outcome::Trapped {
-                exception,
+                trap: exception.into(),
                 pc: cpu.pc,
             };
         }
@@ -60,7 +71,7 @@ pub fn run(cpu: &mut Cpu, tohost: u64, max_steps: u64) -> Outcome {
             Ok(status) => return Outcome::Failed(status >> 1),
             Err(_) => {
                 return Outcome::Trapped {
-                    exception: Exception::LoadAccessFault(tohost),
+                    trap: Exception::LoadAccessFault(tohost).into(),
                     pc: cpu.pc,
                 };
             }

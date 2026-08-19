@@ -5,7 +5,7 @@ use rysk::{
         MCAUSE, MEDELEG, MEPC, MSTATUS, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE,
         MSTATUS_SPIE, MSTATUS_SPP, MTVAL, MTVEC, Mode, SCAUSE, SEPC, STVAL, STVEC,
     },
-    exception::Exception,
+    trap::Exception,
 };
 
 // ------------------------------------------------------------- privilege

@@ -8,8 +8,8 @@ use crate::{
     csr::*,
     dram::{DRAM_SIZE, Dram},
     elf::{Error as ElfError, Image},
-    exception::Exception,
     inst::{AmoOp, Cond, Inst, Op, Width, decode},
+    trap::{Exception, Interrupt, Trap},
 };
 
 #[derive(Debug)]
@@ -74,14 +74,59 @@ impl Cpu {
         Ok(cpu)
     }
 
-    pub fn run(&mut self) -> Exception {
+    pub fn run(&mut self) -> Trap {
         loop {
+            if let Some(interrupt) = self.interrupt() {
+                let trap = Trap::Interrupt(interrupt);
+                if !self.take_trap(trap) {
+                    return trap;
+                }
+            }
             if let Err(exception) = self.step()
-                && !self.take_trap(exception)
+                && !self.take_trap(exception.into())
             {
-                return exception;
+                return exception.into();
             }
         }
+    }
+
+    /// Refresh the bits of `mip` that a device drives. They are not storage software
+    /// writes: each one is asserted for exactly as long as its device asserts it.
+    fn refresh_mip(&mut self) {
+        self.csrs[MIP] = (self.csrs[MIP] & !MIP_DEVICE) | self.bus.interrupts();
+    }
+
+    /// The interrupt to take before the next instruction, if there is one: the highest
+    /// priority one that is pending, enabled, and not held off by the mode it targets.
+    ///
+    /// Asking here rather than mid-instruction is what makes `mepc` right for an
+    /// interrupt with no special case, since `pc` is still the instruction that has not
+    /// run. It also satisfies the requirement to re-evaluate immediately after an
+    /// `xRET` or a write to `mip`, `mie`, `mstatus` or `mideleg`, since every one of
+    /// those retires before the next time round.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.9 and 12.1.3.
+    pub fn interrupt(&mut self) -> Option<Interrupt> {
+        self.refresh_mip();
+        let ready = self.csrs[MIP] & self.csrs[MIE];
+        if ready == 0 {
+            return None;
+        }
+        Interrupt::PRIORITY.into_iter().find(|interrupt| {
+            let bit = 1 << *interrupt as u64;
+            if ready & bit == 0 {
+                return false;
+            }
+            // An interrupt is enabled for the mode it targets when the hart is below
+            // that mode, or is in it with that mode's global enable set. A more
+            // privileged mode's interrupts are never held off by a less privileged one.
+            let (target, enable) = if self.csrs[MIDELEG] & bit == 0 {
+                (Mode::Machine, MSTATUS_MIE)
+            } else {
+                (Mode::Supervisor, MSTATUS_SIE)
+            };
+            self.mode < target || (self.mode == target && (self.csrs[MSTATUS] >> enable) & 1 == 1)
+        })
     }
 
     /// Fetch, decode and execute one instruction.
@@ -113,18 +158,31 @@ impl Cpu {
     /// caller decides what to do with a trap that has nowhere to go.
     ///
     /// The RISC-V Instruction Set Manual Volume II, 3.1.6.1, 3.1.7 and 3.1.8.
-    pub fn take_trap(&mut self, exception: Exception) -> bool {
-        let cause = exception.cause();
-        let delegated = self.mode <= Mode::Supervisor && (self.csrs[MEDELEG] >> cause) & 1 == 1;
+    pub fn take_trap(&mut self, trap: Trap) -> bool {
+        let code = trap.code();
+        let delegate = if trap.is_interrupt() {
+            self.csrs[MIDELEG]
+        } else {
+            self.csrs[MEDELEG]
+        };
+        let delegated = self.mode <= Mode::Supervisor && (delegate >> code) & 1 == 1;
         let status = self.csrs[MSTATUS];
-        if self.csrs[if delegated { STVEC } else { MTVEC }] == 0 {
+        let tvec = self.csrs[if delegated { STVEC } else { MTVEC }];
+        if tvec == 0 {
             return false;
         }
+        // Vectored mode spreads the interrupts out over one entry each; an exception
+        // enters at the base whichever mode the vector is in.
+        // The RISC-V Instruction Set Manual Volume II, 3.1.7.
+        let entry = match tvec & 0b11 {
+            1 if trap.is_interrupt() => (tvec & !0b11) + 4 * code,
+            _ => tvec & !0b11,
+        };
 
         if delegated {
             self.csrs[SEPC] = self.pc;
-            self.csrs[SCAUSE] = cause;
-            self.csrs[STVAL] = exception.value();
+            self.csrs[SCAUSE] = trap.cause();
+            self.csrs[STVAL] = trap.value();
 
             // SIE moves to SPIE and clears, and the mode we came from lands in SPP,
             // which is one bit because a supervisor can only be entered from below.
@@ -134,13 +192,13 @@ impl Cpu {
                     | (sie << MSTATUS_SPIE)
                     | ((self.mode as u64) << MSTATUS_SPP);
             self.mode = Mode::Supervisor;
-            self.pc = self.csrs[STVEC] & !0b11;
+            self.pc = entry;
             return true;
         }
 
         self.csrs[MEPC] = self.pc;
-        self.csrs[MCAUSE] = cause;
-        self.csrs[MTVAL] = exception.value();
+        self.csrs[MCAUSE] = trap.cause();
+        self.csrs[MTVAL] = trap.value();
 
         // MIE moves to MPIE and clears, and the mode we came from lands in MPP.
         let mie = (status >> MSTATUS_MIE) & 1;
@@ -149,8 +207,7 @@ impl Cpu {
             | ((self.mode as u64) << MSTATUS_MPP_SHIFT);
         self.mode = Mode::Machine;
 
-        // Vectored mode only spreads interrupts out; exceptions always enter at the base.
-        self.pc = self.csrs[MTVEC] & !0b11;
+        self.pc = entry;
         true
     }
 
@@ -199,8 +256,13 @@ impl Cpu {
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
-    fn load_csr(&self, addr: usize) -> u64 {
+    fn load_csr(&mut self, addr: usize) -> u64 {
         trace_insn!("loading csr");
+        // The device-driven bits of mip are wires, so reading them is reading the
+        // devices rather than anything software last wrote.
+        if addr == MIP || addr == SIP {
+            self.refresh_mip();
+        }
         if let Some((base, mask, readable)) = alias(addr, self.csrs[MIDELEG]) {
             return self.csrs[base] & (mask | readable);
         }
@@ -227,6 +289,9 @@ impl Cpu {
             // is read-only zero, and what it does hold is what sie and sip may reach.
             // The RISC-V Instruction Set Manual Volume II, 3.1.8.
             MIDELEG => self.csrs[MIDELEG] = value & S_INTERRUPTS,
+            // The bits a device drives are read-only here: a write cannot argue with a
+            // wire. The RISC-V Instruction Set Manual Volume II, 3.1.9.
+            MIP => self.csrs[MIP] = (self.csrs[MIP] & MIP_DEVICE) | (value & !MIP_DEVICE),
             MSTATUS => self.csrs[MSTATUS] = warl_mstatus(self.csrs[MSTATUS], value),
             _ => self.csrs[addr] = value,
         }
@@ -428,9 +493,25 @@ impl Cpu {
                 }
                 self.trap_return(mode);
             }
-            // Nothing can raise an interrupt yet, so waiting for one would never end.
-            // Retiring immediately is permitted.
-            Op::Wfi => {}
+            // Stall until something is pending and enabled, whatever `mstatus` says
+            // about taking it: the hart waits, it does not enter a handler. The wait is
+            // inside the instruction rather than a re-execution of it, because `wfi`
+            // retires either way and the trap is taken on the instruction after it, so
+            // that returning from the handler resumes past the wait. A hart waiting on
+            // an interrupt nothing can deliver waits forever, which is what the
+            // hardware does too.
+            //
+            // The devices advance with the wall clock rather than with retired
+            // instructions, so there is something to wait for.
+            //
+            // The RISC-V Instruction Set Manual Volume II, 3.3.3.
+            Op::Wfi => {
+                self.refresh_mip();
+                while self.csrs[MIP] & self.csrs[MIE] == 0 {
+                    std::hint::spin_loop();
+                    self.refresh_mip();
+                }
+            }
             // One in-order hart observes its own accesses in order, and there is no
             // instruction cache to keep coherent.
             Op::Fence | Op::FenceI => {}

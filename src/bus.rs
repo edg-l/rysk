@@ -6,7 +6,7 @@ use tracing::instrument;
 use crate::{
     device::Device,
     dram::{DRAM_SIZE, Dram},
-    exception::Exception,
+    trap::Exception,
 };
 
 /// The address which dram starts, same as QEMU virt machine.
@@ -75,9 +75,11 @@ impl Bus {
         (end <= self.devices[at].0.end).then(|| &mut self.devices[at])
     }
 
-    /// Whether any device is asserting its interrupt line.
-    pub fn pending(&self) -> bool {
-        self.devices.iter().any(|(_, device)| device.pending())
+    /// The bits the devices are asserting in `mip`, together.
+    pub fn interrupts(&self) -> u64 {
+        self.devices
+            .iter()
+            .fold(0, |bits, (_, device)| bits | device.interrupts())
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
@@ -89,7 +91,7 @@ impl Bus {
         match self.device(addr, size) {
             Some((range, device)) => {
                 let offset = addr - range.start;
-                device.load(offset, size)
+                device.load(offset, size).map_err(|e| e.at(addr))
             }
             None => Err(Exception::LoadAccessFault(addr)),
         }
@@ -102,7 +104,7 @@ impl Bus {
             return match self.device(addr, size) {
                 Some((range, device)) => {
                     let offset = addr - range.start;
-                    device.store(offset, size, value)
+                    device.store(offset, size, value).map_err(|e| e.at(addr))
                 }
                 None => Err(Exception::StoreAmoAccessFault(addr)),
             };

@@ -5,7 +5,7 @@
 //! asserting an interrupt. It never learns its own address, which controller its line
 //! runs to, or what else exists.
 
-use crate::exception::Exception;
+use crate::trap::Exception;
 
 pub trait Device: std::fmt::Debug {
     /// Read `size` bits at `offset` from the device's base.
@@ -18,9 +18,9 @@ pub trait Device: std::fmt::Debug {
     /// Write `size` bits at `offset` from the device's base.
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception>;
 
-    /// Whether the device is asserting its interrupt line. A device with no line of its
-    /// own answers by never asserting one.
-    fn pending(&self) -> bool {
-        false
+    /// The bits this device is asserting in `mip`. Only an interrupt controller drives
+    /// `mip` directly; everything else raises a line into one and answers zero here.
+    fn interrupts(&self) -> u64 {
+        0
     }
 }
