@@ -1,4 +1,8 @@
-use std::{cell::UnsafeCell, fmt, slice};
+use std::{
+    cell::UnsafeCell,
+    fmt, slice,
+    sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst},
+};
 
 use crate::bus::DRAM_BASE;
 
@@ -187,6 +191,81 @@ impl Dram {
                 .cast::<[u8; N]>()
                 .write_unaligned(bytes)
         }
+    }
+}
+
+/// The same operation at each of the four widths an atomic instruction has, because the
+/// standard library gives its four atomic integers no trait in common to be generic over.
+///
+/// Every one of them is `SeqCst`. An instruction says what it needs with its `aq` and
+/// `rl` bits and none of them asks for more than this, so ordering every one the
+/// strongest way is correct for all of them and is one thing to reason about rather than
+/// four. Volume I, 14.4.
+macro_rules! at_width {
+    ($size:expr, $at:expr, |$atom:ident| $body:expr) => {
+        match $size {
+            8 => {
+                let $atom = unsafe { AtomicU8::from_ptr($at.cast()) };
+                ($body) as u64
+            }
+            16 => {
+                let $atom = unsafe { AtomicU16::from_ptr($at.cast()) };
+                ($body) as u64
+            }
+            32 => {
+                let $atom = unsafe { AtomicU32::from_ptr($at.cast()) };
+                ($body) as u64
+            }
+            64 => {
+                let $atom = unsafe { AtomicU64::from_ptr($at.cast()) };
+                ($body) as u64
+            }
+            _ => unreachable!("an atomic of {} bits", $size),
+        }
+    };
+}
+
+impl Dram {
+    /// Where `size` bits at `addr` start, for an instruction that needs them indivisible.
+    /// Naturally aligned or the instruction would have trapped before reaching here,
+    /// which is what lets the host's own atomic answer for it.
+    #[inline]
+    fn atomically(&self, addr: u64, size: u64) -> *mut u8 {
+        let index = self.offset(addr, size);
+        debug_assert!(
+            addr.is_multiple_of(size / 8),
+            "an atomic of {size} bits at {addr:#x} is not aligned"
+        );
+        unsafe { self.base().add(index) }
+    }
+
+    /// Replace `size` bits at `addr` with what `change` makes of them, as one operation
+    /// no other hart can land inside, and answer what was there.
+    // The widening is what the other three widths need; at sixty-four bits it is the
+    // identity, and one instantiation of a macro cannot be written differently from the
+    // rest of it.
+    #[allow(clippy::useless_conversion)]
+    #[inline]
+    pub fn modify(&self, addr: u64, size: u64, mut change: impl FnMut(u64) -> u64) -> u64 {
+        let at = self.atomically(addr, size);
+        at_width!(size, at, |atom| atom
+            .fetch_update(SeqCst, SeqCst, |old| Some(change(u64::from(old)) as _))
+            .expect("a change that always answers"))
+    }
+
+    /// Put `new` in place of `size` bits at `addr` if they are `expected`, and answer
+    /// what was there either way.
+    #[inline]
+    pub fn compare_swap(&self, addr: u64, size: u64, expected: u64, new: u64) -> u64 {
+        let at = self.atomically(addr, size);
+        at_width!(size, at, |atom| match atom.compare_exchange(
+            expected as _,
+            new as _,
+            SeqCst,
+            SeqCst
+        ) {
+            Ok(was) | Err(was) => was,
+        })
     }
 }
 

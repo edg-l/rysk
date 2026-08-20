@@ -88,6 +88,13 @@ pub struct Bus {
     /// at them at all. Almost no store can: only the window between a load-reserved
     /// and its store-conditional has anything reserved.
     reserved: AtomicUsize,
+    /// Held across a quadword compare-and-swap, which is the one atomic instruction no
+    /// host primitive answers for: the standard library has no 128-bit atomic. It makes
+    /// two of them indivisible against each other and against nothing else, so a plain
+    /// store landing between the halves is still a store landing between the halves.
+    /// Naming it is the point; a guest using `amocas.q` against ordinary stores to the
+    /// same octoword has no machine to run on anyway.
+    wide: Mutex<()>,
 }
 
 impl Bus {
@@ -100,6 +107,7 @@ impl Bus {
             controllers: Vec::new(),
             reservations: (0..harts).map(|_| AtomicU64::new(UNRESERVED)).collect(),
             reserved: AtomicUsize::new(0),
+            wide: Mutex::new(()),
         }
     }
 
@@ -259,6 +267,88 @@ impl Bus {
             self.break_reservations(addr, size);
         }
         Ok(())
+    }
+
+    /// Replace `size` bits at `addr` with what `change` makes of them, as one operation
+    /// no other hart can land inside, and answer what was there. This is every atomic
+    /// memory operation: the read, the arithmetic and the write are one thing, which on
+    /// memory is the host's own atomic and on a device is the device held throughout.
+    pub fn modify(
+        &self,
+        addr: u64,
+        size: u64,
+        change: impl FnMut(u64) -> u64,
+    ) -> Result<u64, Exception> {
+        if !self.in_dram(addr, size) {
+            return self.device_modify(addr, size, change);
+        }
+        let was = self.dram.modify(addr, size, change);
+        if self.reserved.load(SeqCst) != 0 {
+            self.break_reservations(addr, size);
+        }
+        Ok(was)
+    }
+
+    /// Put `new` in place of `size` bits at `addr` if they are `expected`, and answer
+    /// what was there either way.
+    pub fn compare_swap(
+        &self,
+        addr: u64,
+        size: u64,
+        expected: u64,
+        new: u64,
+    ) -> Result<u64, Exception> {
+        if !self.in_dram(addr, size) {
+            return self.device_modify(addr, size, |was| if was == expected { new } else { was });
+        }
+        let was = self.dram.compare_swap(addr, size, expected, new);
+        if was == expected && self.reserved.load(SeqCst) != 0 {
+            self.break_reservations(addr, size);
+        }
+        Ok(was)
+    }
+
+    /// The same for the two doublewords at `addr`, which no host atomic answers for.
+    pub fn compare_swap_wide(
+        &self,
+        addr: u64,
+        expected: (u64, u64),
+        new: (u64, u64),
+    ) -> Result<(u64, u64), Exception> {
+        let _held = self.wide.lock().unwrap_or_else(|held| held.into_inner());
+        let was = (self.load(addr, 64)?, self.load(addr + 8, 64)?);
+        if was == expected {
+            self.store(addr, 64, new.0)?;
+            self.store(addr + 8, 64, new.1)?;
+        }
+        Ok(was)
+    }
+
+    /// A device read and the write that answers it, with the device held across both so
+    /// no other hart is inside it in between.
+    #[inline(never)]
+    fn device_modify(
+        &self,
+        addr: u64,
+        size: u64,
+        mut change: impl FnMut(u64) -> u64,
+    ) -> Result<u64, Exception> {
+        let answer = match self.device(addr, size) {
+            Some(at) => {
+                let offset = addr - self.devices[at].0.start;
+                let mut device = self.held(at);
+                match device.load(offset, size) {
+                    Ok(was) => device
+                        .store(offset, size, change(was))
+                        .map(|()| was)
+                        .map_err(|e| e.at(addr)),
+                    Err(e) => Err(e.at(addr)),
+                }
+            }
+            None => Err(Exception::StoreAmoAccessFault(addr)),
+        };
+        self.resample();
+        answer
     }
 
     #[inline(never)]

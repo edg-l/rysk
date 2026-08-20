@@ -1078,7 +1078,12 @@ impl Cpu {
             // instructions answer, and it speaks for this hart alone: a store meant to
             // be fetched by another needs that hart to execute its own.
             // The RISC-V Instruction Set Manual Volume I, 5.
-            Op::Fence => {}
+            // Every hart is a host thread of its own, so the ordering this asks for is
+            // ordering the host has to be told about too. `SeqCst` is stronger than any
+            // combination of the `pred` and `succ` bits asks for, which makes it correct
+            // for all of them and one thing to reason about rather than sixteen.
+            // The RISC-V Instruction Set Manual Volume I, 14.5 and chapter 17.
+            Op::Fence => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
             Op::FenceI => self.blocks.flush(),
 
             // ------------------------------------------------- floating point
@@ -1199,7 +1204,6 @@ impl Cpu {
                     // named as the destination discards the result entirely rather
                     // than writing only its odd register.
                     CasWidth::Quad => {
-                        let (low, high) = (bus.load(a, 64)?, bus.load(a + 8, 64)?);
                         let compare = if rd == 0 {
                             (0, 0)
                         } else {
@@ -1210,10 +1214,7 @@ impl Cpu {
                         } else {
                             (b, self.regs[rs2 + 1])
                         };
-                        if (low, high) == compare {
-                            bus.store(a, 64, swap.0)?;
-                            bus.store(a + 8, 64, swap.1)?;
-                        }
+                        let (low, high) = bus.compare_swap_wide(a, compare, swap)?;
                         if rd != 0 {
                             self.regs[rd] = low;
                             self.regs[rd + 1] = high;
@@ -1221,14 +1222,11 @@ impl Cpu {
                     }
                     CasWidth::Narrow(width) => {
                         let bits = width.bits();
-                        let loaded = bus.load(a, bits)?;
                         // Anything narrower looks at the low bits of rd only, and
                         // stores the low bits of rs2: what is above the width is not
                         // part of either operand.
                         let mask = u64::MAX >> (64 - bits);
-                        if loaded == self.regs[rd] & mask {
-                            bus.store(a, bits, b)?;
-                        }
+                        let loaded = bus.compare_swap(a, bits, self.regs[rd] & mask, b & mask)?;
                         self.regs[rd] = Self::sext(loaded, bits);
                     }
                 }
@@ -1263,9 +1261,10 @@ impl Cpu {
                         };
                     }
                     Op::Amo { op, .. } => {
-                        let data = bus.load(a, bits)?;
-                        let value = Self::amo(op, width, data, b);
-                        bus.store(a, bits, value)?;
+                        // One operation rather than a load, an arithmetic and a store,
+                        // because another hart is another host thread and may be between
+                        // any two of them otherwise.
+                        let data = bus.modify(a, bits, |data| Self::amo(op, width, data, b))?;
                         self.regs[rd] = Self::sext(data, bits);
                     }
                     _ => unreachable!(),

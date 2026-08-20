@@ -581,9 +581,9 @@ pub fn decode(inst: u32) -> Result<Inst, Exception> {
             (Op::Fp { op, double }, rounding(inst))
         }
         0x2f => {
-            // The aq and rl ordering bits, funct7[1:0], constrain nothing on a machine
-            // whose harts take turns at whole instructions: everything is already
-            // ordered the way an acquire or a release would ask for.
+            // The aq and rl ordering bits, funct7[1:0], are dropped rather than
+            // decoded: every atomic is carried out the strongest way the host offers,
+            // which is more ordering than any combination of the two can ask for.
             if funct7 >> 2 == 0b00101 {
                 let width = match funct3 {
                     0x4 => CasWidth::Quad,
