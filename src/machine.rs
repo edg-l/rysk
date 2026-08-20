@@ -336,6 +336,12 @@ fn ready(cpu: &mut Cpu, bus: &Bus) -> bool {
 
 /// One instruction on one hart: offer it an interrupt, then execute. Answers the trap
 /// that nothing was installed to take, which is where a run ends.
+///
+/// Left to the compiler to inline or not, and it does not: the body is large, and
+/// forcing it into the loop that runs a quantum is 3.6% slower on a Linux boot even
+/// though it removes a call frame per instruction. What the frame saves and restores
+/// is registers the body needs, so taking the boundary away does not remove that work,
+/// it spreads the spills through the loop instead.
 #[inline]
 fn tick(cpu: &mut Cpu, bus: &mut Bus) -> Option<Trap> {
     if let Some(interrupt) = cpu.interrupt(bus) {
