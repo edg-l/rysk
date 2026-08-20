@@ -300,7 +300,7 @@ impl Machine {
     /// if that is how it stopped.
     fn run_hart(&mut self, hart: usize, steps: u64) -> Option<Halt> {
         let cpu = &mut self.harts[hart];
-        let bus = &mut self.bus;
+        let bus = &self.bus;
         let mut left = steps;
         while left > 0 {
             match tick(cpu, bus, left) {
@@ -332,7 +332,7 @@ impl Machine {
         if !ready(&mut self.harts[hart], &self.bus) {
             return Ok(0);
         }
-        tick(&mut self.harts[hart], &mut self.bus, max)
+        tick(&mut self.harts[hart], &self.bus, max)
     }
 }
 
@@ -361,7 +361,7 @@ fn ready(cpu: &mut Cpu, bus: &Bus) -> bool {
 /// body needs, so taking the boundary away does not remove that work, it spreads the
 /// spills through the loop instead.
 #[inline]
-fn tick(cpu: &mut Cpu, bus: &mut Bus, max: u64) -> Result<u64, Trap> {
+fn tick(cpu: &mut Cpu, bus: &Bus, max: u64) -> Result<u64, Trap> {
     if let Some(interrupt) = cpu.interrupt(bus) {
         let trap = Trap::Interrupt(interrupt);
         if !cpu.take_trap(trap) {
@@ -762,12 +762,26 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot, aia: Aia) 
 mod tests {
     use super::*;
 
-    /// A machine has to be able to cross a thread boundary, because phase 10 puts the
-    /// window on the main thread and the harts on another. Nothing does that yet, so
-    /// this is what notices the day something on the bus stops allowing it.
+    /// A machine has to be able to cross a thread boundary, because the window belongs
+    /// on the main thread and the harts do not. This is what notices the day something
+    /// on the bus stops allowing it.
     #[test]
     fn a_machine_can_be_handed_to_another_thread() {
         fn assert_send<T: Send>() {}
         assert_send::<Machine>();
+    }
+
+    /// And the address space has to be reachable from all of them at once, which is a
+    /// stronger thing to ask than handing the whole machine over: it is what a hart per
+    /// host thread rests on, since every one of them holds the same bus while it runs.
+    /// A device that stopped being `Send`, or memory that stopped being shareable, would
+    /// take it away.
+    #[test]
+    fn every_hart_can_hold_the_bus_at_once() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<Bus>();
+        assert_sync::<Dram>();
+        fn assert_send<T: Send>() {}
+        assert_send::<Cpu>();
     }
 }

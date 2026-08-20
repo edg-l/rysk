@@ -215,14 +215,14 @@ impl Cpu {
     }
 
     /// Fetch, decode and execute one instruction.
-    pub fn step(&mut self, bus: &mut Bus) -> Result<(), Exception> {
+    pub fn step(&mut self, bus: &Bus) -> Result<(), Exception> {
         let block = self.block(bus)?;
         self.retire(bus, self.blocks.at(block.start))
     }
 
     /// Execute one instruction of a run that has already been decoded.
     #[inline]
-    pub fn retire(&mut self, bus: &mut Bus, decoded: Decoded) -> Result<(), Exception> {
+    pub fn retire(&mut self, bus: &Bus, decoded: Decoded) -> Result<(), Exception> {
         let Decoded {
             inst,
             encoding,
@@ -420,7 +420,7 @@ impl Cpu {
     }
 
     #[cfg_attr(feature = "trace", instrument(skip(self, bus)))]
-    fn load_csr(&mut self, bus: &mut Bus, addr: usize) -> u64 {
+    fn load_csr(&mut self, bus: &Bus, addr: usize) -> u64 {
         trace_insn!("loading csr");
         // The device-driven bits of mip are wires, so reading them is reading the
         // devices rather than anything software last wrote.
@@ -614,7 +614,7 @@ impl Cpu {
     /// is in, which is what a run ending at the page edge is for, so they share its
     /// permissions and its frame.
     #[inline]
-    pub fn block(&mut self, bus: &mut Bus) -> Result<Block, Exception> {
+    pub fn block(&mut self, bus: &Bus) -> Result<Block, Exception> {
         // Where the last instruction came from answers for the whole page it was in,
         // and most instructions are in the page the one before them was.
         let vpn = self.pc >> PAGE_BITS;
@@ -636,7 +636,7 @@ impl Cpu {
     /// Out of line: it runs once for as many instructions as it decodes, and letting it
     /// into the caller would spread its registers through a path that mostly hits.
     #[inline(never)]
-    fn build(&mut self, bus: &mut Bus, pa: u64) -> Result<Block, Exception> {
+    fn build(&mut self, bus: &Bus, pa: u64) -> Result<Block, Exception> {
         let mut run = [Decoded::NONE; LENGTH];
         let mut decoded = 0;
         let (mut at, mut va) = (pa, self.pc);
@@ -680,7 +680,7 @@ impl Cpu {
     /// It arrives a halfword at a time because its length is in its first two bytes: a
     /// compressed instruction can sit in the last two bytes of memory, and reading four
     /// there would fault on bytes it does not have.
-    fn decode_at(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<Decoded, Exception> {
+    fn decode_at(&mut self, bus: &Bus, pa: u64, va: u64) -> Result<Decoded, Exception> {
         // The whole word at once, where both halves are certain to be in the same page
         // and in dram. A page is the granularity of translation and of dram alike, so
         // reading the wider one there cannot fault where the two narrower ones would
@@ -717,7 +717,7 @@ impl Cpu {
     /// The instruction at `pa`, read a halfword at a time, with the second half
     /// translated on its own where the first one ends a page. A compressed instruction
     /// is answered by its own half and the one after it is never read.
-    fn halves(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<u32, Exception> {
+    fn halves(&mut self, bus: &Bus, pa: u64, va: u64) -> Result<u32, Exception> {
         let half = self.halfword(bus, pa, va)?;
         if inst::length(half) == 2 {
             return Ok(half as u32);
@@ -731,14 +731,14 @@ impl Cpu {
     }
 
     #[inline]
-    fn halfword(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<u16, Exception> {
+    fn halfword(&mut self, bus: &Bus, pa: u64, va: u64) -> Result<u16, Exception> {
         bus.load(pa, 16)
             .map(|half| half as u16)
             .map_err(|_| Exception::InstructionAccessFault(va))
     }
 
     #[inline]
-    fn word(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<u32, Exception> {
+    fn word(&mut self, bus: &Bus, pa: u64, va: u64) -> Result<u32, Exception> {
         bus.load(pa, 32)
             .map(|word| word as u32)
             .map_err(|_| Exception::InstructionAccessFault(va))
@@ -759,7 +759,7 @@ impl Cpu {
     /// Out of line because there are four of it: letting all four into the run loop
     /// costs more in what it does to the scheduling there than the folded width saves.
     #[inline(never)]
-    fn read<const BITS: u64>(&mut self, bus: &mut Bus, va: u64) -> Result<u64, Exception> {
+    fn read<const BITS: u64>(&mut self, bus: &Bus, va: u64) -> Result<u64, Exception> {
         if Self::straddles(va, BITS) && self.translating(Access::Load) {
             let mut value = 0;
             for byte in 0..BITS / 8 {
@@ -775,12 +775,7 @@ impl Cpu {
     /// Write `BITS` at a virtual address, with the same care about page boundaries and
     /// for the same reasons out of line.
     #[inline(never)]
-    fn write<const BITS: u64>(
-        &mut self,
-        bus: &mut Bus,
-        va: u64,
-        value: u64,
-    ) -> Result<(), Exception> {
+    fn write<const BITS: u64>(&mut self, bus: &Bus, va: u64, value: u64) -> Result<(), Exception> {
         if Self::straddles(va, BITS) && self.translating(Access::Store) {
             // Both halves are translated before either is written, so an access that
             // faults part way through has not half happened.
@@ -801,7 +796,7 @@ impl Cpu {
     #[inline]
     fn load_width(
         &mut self,
-        bus: &mut Bus,
+        bus: &Bus,
         va: u64,
         width: Width,
         signed: bool,
@@ -825,7 +820,7 @@ impl Cpu {
     #[inline]
     fn store_width(
         &mut self,
-        bus: &mut Bus,
+        bus: &Bus,
         va: u64,
         width: Width,
         value: u64,
@@ -845,7 +840,7 @@ impl Cpu {
     }
 
     /// Carry out one decoded instruction.
-    fn execute(&mut self, bus: &mut Bus, inst: Inst, encoding: u32) -> Result<(), Exception> {
+    fn execute(&mut self, bus: &Bus, inst: Inst, encoding: u32) -> Result<(), Exception> {
         let Inst {
             op,
             rd,

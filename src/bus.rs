@@ -1,4 +1,11 @@
-use std::{cmp::Ordering, ops::Range};
+use std::{
+    cmp::Ordering,
+    ops::Range,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
+};
 
 #[cfg(feature = "trace")]
 use tracing::instrument;
@@ -12,17 +19,28 @@ use crate::{
 /// The address which dram starts, same as QEMU virt machine.
 pub const DRAM_BASE: u64 = 0x8000_0000;
 
+/// A device and the addresses it answers for. The lock is what supplies the `&mut self`
+/// an access is given, since several harts hold the bus at once and only one of them may
+/// be inside a device at a time.
+type Attached = (Range<u64>, Mutex<Box<dyn Device>>);
+
 /// Address decode: which device owns an address, and dram.
 ///
 /// Dram is not one of the devices. It is the overwhelming majority of accesses and the
 /// only one on the fetch path, so it is answered before the search begins and pays
 /// nothing for the devices existing.
+///
+/// Nothing here needs `&mut`, so several harts on several host threads can reach the
+/// address space at once. Dram is shared without a lock, since the guest's own barriers
+/// are what order it; a device is not, because `Device` answers an access with `&mut
+/// self` for good reason and the lock is what supplies it. That lock is only ever taken
+/// for an access that was not memory, which is rare by construction.
 #[derive(Debug)]
 pub struct Bus {
     pub dram: Dram,
     /// Every device, sorted by base address and never overlapping, so an address
     /// decodes by binary search.
-    devices: Vec<(Range<u64>, Box<dyn Device>)>,
+    devices: Vec<Attached>,
     /// The word the interrupt controllers drive `mip` through, one per hart. What a
     /// hart asks before every instruction is one load from it, however many controllers
     /// the machine has and however many devices are on the bus.
@@ -39,11 +57,11 @@ pub struct Bus {
     /// the stores go through can see them all.
     ///
     /// The RISC-V Instruction Set Manual Volume I, 14.2.
-    reservations: Vec<Option<Range<u64>>>,
+    reservations: Mutex<Box<[Option<Range<u64>>]>>,
     /// How many of them are live, so that a store which cannot break one does not look
     /// at them at all. Almost no store can: only the window between a load-reserved
     /// and its store-conditional has anything reserved.
-    reserved: usize,
+    reserved: AtomicUsize,
 }
 
 impl Bus {
@@ -54,8 +72,8 @@ impl Bus {
             devices: Vec::new(),
             pending: Pending::new(harts),
             controllers: Vec::new(),
-            reservations: vec![None; harts],
-            reserved: 0,
+            reservations: Mutex::new(vec![None; harts].into_boxed_slice()),
+            reserved: AtomicUsize::new(0),
         }
     }
 
@@ -74,9 +92,7 @@ impl Bus {
         let at = self
             .devices
             .partition_point(|(existing, _)| existing.start < range.start);
-        let clashes = |other: &(Range<u64>, Box<dyn Device>)| {
-            range.start < other.0.end && other.0.start < range.end
-        };
+        let clashes = |other: &Attached| range.start < other.0.end && other.0.start < range.end;
         assert!(
             !self.devices.get(at).is_some_and(clashes)
                 && !at
@@ -97,22 +113,34 @@ impl Bus {
         if device.wire(&self.pending) {
             self.controllers.push(at);
         }
-        self.devices.insert(at, (range, device));
+        self.devices.insert(at, (range, Mutex::new(device)));
     }
 
     /// Let the controllers see what an access did to the wires. A device raises its
     /// line while it is being read or written, and the controller it runs to is not
     /// part of that access, so this is the only place the two meet.
     #[inline(never)]
-    fn resample(&mut self) {
-        for at in 0..self.controllers.len() {
-            self.devices[self.controllers[at]].1.poll();
+    fn resample(&self) {
+        for at in &self.controllers {
+            self.held(*at).poll();
         }
+    }
+
+    /// The device at `at`, held for as long as the access lasts. Nothing a device does
+    /// while it is being accessed comes back through the bus: a line is an atomic and a
+    /// message goes to an interrupt file directly, both of which say so where they are
+    /// defined, so no access is ever waiting on the one it is inside.
+    #[inline]
+    fn held(&self, at: usize) -> impl std::ops::DerefMut<Target = Box<dyn Device>> {
+        self.devices[at]
+            .1
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
     }
 
     /// The device that owns all `size` bits at `addr`, if one does. An access that
     /// runs off the end of a device is not that device's to answer.
-    fn device(&mut self, addr: u64, size: u64) -> Option<&mut (Range<u64>, Box<dyn Device>)> {
+    fn device(&self, addr: u64, size: u64) -> Option<usize> {
         let end = addr.checked_add(size / 8)?;
         let found = self.devices.binary_search_by(|(range, _)| {
             if range.end <= addr {
@@ -124,7 +152,7 @@ impl Bus {
             }
         });
         let at = found.ok()?;
-        (end <= self.devices[at].0.end).then(|| &mut self.devices[at])
+        (end <= self.devices[at].0.end).then_some(at)
     }
 
     /// Let every device notice whatever arrived without an access to notice it at.
@@ -132,10 +160,10 @@ impl Bus {
     /// The controllers go last, whatever address they were given. A byte typed at a
     /// serial port is a line raised inside that port's own poll, and a controller that
     /// had already looked would not see it until the round after.
-    pub fn poll(&mut self) {
+    pub fn poll(&self) {
         for at in 0..self.devices.len() {
             if !self.controllers.contains(&at) {
-                self.devices[at].1.poll();
+                self.held(at).poll();
             }
         }
         self.resample();
@@ -155,7 +183,7 @@ impl Bus {
     /// costs a call, which it was going to cost anyway.
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
     #[inline]
-    pub fn load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
+    pub fn load(&self, addr: u64, size: u64) -> Result<u64, Exception> {
         trace_mem!("load");
         if self.in_dram(addr, size) {
             return Ok(self.dram.load(addr, size));
@@ -164,11 +192,11 @@ impl Bus {
     }
 
     #[inline(never)]
-    fn device_load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
+    fn device_load(&self, addr: u64, size: u64) -> Result<u64, Exception> {
         let answer = match self.device(addr, size) {
-            Some((range, device)) => {
-                let offset = addr - range.start;
-                device.load(offset, size).map_err(|e| e.at(addr))
+            Some(at) => {
+                let offset = addr - self.devices[at].0.start;
+                self.held(at).load(offset, size).map_err(|e| e.at(addr))
             }
             None => Err(Exception::LoadAccessFault(addr)),
         };
@@ -179,12 +207,12 @@ impl Bus {
     /// Write the low `size` bits of `value` at `addr`, with the same split.
     #[cfg_attr(feature = "trace", instrument(skip(self)))]
     #[inline]
-    pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
+    pub fn store(&self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
         trace_mem!("store");
         if !self.in_dram(addr, size) {
             return self.device_store(addr, size, value);
         }
-        if self.reserved != 0 {
+        if self.reserved.load(Relaxed) != 0 {
             self.break_reservations(addr, size);
         }
         self.dram.store(addr, size, value);
@@ -192,11 +220,13 @@ impl Bus {
     }
 
     #[inline(never)]
-    fn device_store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
+    fn device_store(&self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
         let answer = match self.device(addr, size) {
-            Some((range, device)) => {
-                let offset = addr - range.start;
-                device.store(offset, size, value).map_err(|e| e.at(addr))
+            Some(at) => {
+                let offset = addr - self.devices[at].0.start;
+                self.held(at)
+                    .store(offset, size, value)
+                    .map_err(|e| e.at(addr))
             }
             None => Err(Exception::StoreAmoAccessFault(addr)),
         };
@@ -208,37 +238,45 @@ impl Bus {
     /// holds it, which is what makes a store-conditional fail after another hart wrote
     /// what was reserved.
     #[inline(never)]
-    fn break_reservations(&mut self, addr: u64, size: u64) {
+    fn break_reservations(&self, addr: u64, size: u64) {
         let written = addr..addr + size / 8;
-        for reservation in &mut self.reservations {
+        for reservation in self.held_reservations().iter_mut() {
             if reservation
                 .as_ref()
                 .is_some_and(|r| written.start < r.end && r.start < written.end)
             {
                 *reservation = None;
-                self.reserved -= 1;
+                self.reserved.fetch_sub(1, Relaxed);
             }
         }
     }
 
+    /// The reservations, held for as long as they are being looked at.
+    #[inline]
+    fn held_reservations(&self) -> impl std::ops::DerefMut<Target = Box<[Option<Range<u64>>]>> {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+    }
+
     /// Reserve, for `hart`, the bytes a load-reserved of `size` bits at `addr` reads.
-    pub fn reserve(&mut self, hart: usize, addr: u64, size: u64) {
-        if self.reservations[hart]
+    pub fn reserve(&self, hart: usize, addr: u64, size: u64) {
+        if self.held_reservations()[hart]
             .replace(addr..addr + size / 8)
             .is_none()
         {
-            self.reserved += 1;
+            self.reserved.fetch_add(1, Relaxed);
         }
     }
 
     /// Whether a store-conditional by `hart` of `size` bits at `addr` may write. That
     /// hart's reservation is released either way.
-    pub fn take_reservation(&mut self, hart: usize, addr: u64, size: u64) -> bool {
+    pub fn take_reservation(&self, hart: usize, addr: u64, size: u64) -> bool {
         let written = addr..addr + size / 8;
-        let Some(reserved) = self.reservations[hart].take() else {
+        let Some(reserved) = self.held_reservations()[hart].take() else {
             return false;
         };
-        self.reserved -= 1;
+        self.reserved.fetch_sub(1, Relaxed);
         reserved.start <= written.start && written.end <= reserved.end
     }
 

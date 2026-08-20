@@ -150,7 +150,7 @@ impl Cpu {
     /// this is called for every fetch and every load and store, so the question is
     /// asked far more often than a page table is walked.
     #[inline]
-    pub fn translate(&mut self, bus: &mut Bus, va: u64, access: Access) -> Result<u64, Exception> {
+    pub fn translate(&mut self, bus: &Bus, va: u64, access: Access) -> Result<u64, Exception> {
         if !self.translating(access) {
             return Ok(va);
         }
@@ -160,7 +160,7 @@ impl Cpu {
         }
     }
 
-    fn walk(&mut self, bus: &mut Bus, va: u64, access: Access) -> Result<u64, Exception> {
+    fn walk(&mut self, bus: &Bus, va: u64, access: Access) -> Result<u64, Exception> {
         if self.csrs[SATP] & MODE != SV39 {
             return Err(access.fault(va));
         }
