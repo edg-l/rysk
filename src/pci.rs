@@ -409,6 +409,11 @@ fn in_capability(header: &Header, reg: u64) -> Option<(Capability, u64, u64)> {
 #[derive(Debug)]
 pub struct Complex {
     slots: Vec<Option<Slot>>,
+    /// Which device numbers have a function, in the order they were plugged in. A bus
+    /// of thirty-two places usually holds three, and the round asks each of them what
+    /// happened; walking the places rather than the functions is twenty-nine questions
+    /// about nothing.
+    plugged: Vec<usize>,
     /// The four wires, which every function's pin is swizzled onto.
     lines: [Line; PINS],
     /// Where a message a function sends is posted.
@@ -419,6 +424,7 @@ impl Complex {
     fn new(lines: [Line; PINS], msi: Msi) -> Self {
         Self {
             slots: (0..DEVICES).map(|_| None).collect(),
+            plugged: Vec::new(),
             lines,
             msi,
         }
@@ -475,13 +481,15 @@ impl Complex {
     /// asserting. PCI Local Bus Specification 3.0, 6.2.2.
     fn wires(&self) {
         let mut raised = [false; PINS];
-        for (device, slot) in self.slots.iter().enumerate() {
-            let Some(slot) = slot else { continue };
+        for device in &self.plugged {
+            let Some(slot) = &self.slots[*device] else {
+                continue;
+            };
             if slot.command & COMMAND_INTX_DISABLE != 0 {
                 continue;
             }
             if slot.pin && slot.header.pin != 0 {
-                raised[swizzle(device, slot.header.pin)] = true;
+                raised[swizzle(*device, slot.header.pin)] = true;
             }
         }
         for (line, raised) in self.lines.iter().zip(raised) {
@@ -491,7 +499,8 @@ impl Complex {
 
     /// Let every function notice what arrived with no access to notice it at.
     fn poll(&mut self) {
-        for device in 0..self.slots.len() {
+        for at in 0..self.plugged.len() {
+            let device = self.plugged[at];
             if let Some(slot) = self.slots[device].as_mut() {
                 slot.function.poll();
                 let messaging = slot.msix_control & MSIX_ENABLE != 0;
@@ -564,6 +573,7 @@ impl Complex {
             "device {device} puts its vector table somewhere it does not have"
         );
         let vectors = header.msix.map_or(0, |msix| msix.vectors);
+        self.plugged.push(device);
         self.slots[device] = Some(Slot {
             function,
             header,
