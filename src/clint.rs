@@ -50,6 +50,14 @@ pub struct Clint {
     /// clock a guest's timeouts are really measured against, not how fast rysk gets
     /// through instructions. One counter, which every deadline is compared against.
     start: Instant,
+    /// The counter as it read the last time the machine went round the harts. A
+    /// deadline is compared against this rather than against the clock, because
+    /// `interrupts` is asked before every instruction on every hart and reading a host
+    /// clock costs more than the instruction it is asked about. Software reads the
+    /// counter itself, so `mtime` and the `time` CSR stay exact and a guest's delay
+    /// loop is unaffected; what this costs is that a deadline can be noticed up to one
+    /// round late.
+    sampled: u64,
     mtimecmp: Vec<u64>,
     msip: Vec<bool>,
 }
@@ -65,6 +73,8 @@ impl Clint {
     pub fn new(harts: usize) -> Self {
         Self {
             start: Instant::now(),
+            // The counter reads zero at the instant it starts from.
+            sampled: 0,
             // No deadline. The reset value is not specified, and zero would mean every
             // timer has already expired before firmware has had a chance to arm one.
             mtimecmp: vec![u64::MAX; harts],
@@ -101,7 +111,13 @@ impl Device for Clint {
         Ok(match self.decode(offset, size) {
             Some(Register::Msip(hart)) => self.msip[hart] as u64,
             Some(Register::Mtimecmp(hart)) => self.mtimecmp[hart],
-            Some(Register::Mtime) => self.mtime(),
+            // A read of the counter is a read of the clock, so the sample the
+            // deadlines are compared against is worth taking from it: software asking
+            // the time is exactly when it is about to arm one.
+            Some(Register::Mtime) => {
+                self.sampled = self.mtime();
+                self.sampled
+            }
             None => return Err(Exception::LoadAccessFault(offset)),
         })
     }
@@ -128,9 +144,14 @@ impl Device for Clint {
         if self.msip[hart] {
             bits |= MSIP;
         }
-        if self.mtime() >= self.mtimecmp[hart] {
+        if self.sampled >= self.mtimecmp[hart] {
             bits |= MTIP;
         }
         bits
+    }
+
+    /// Read the clock, once for the round of harts that follows.
+    fn poll(&mut self) {
+        self.sampled = self.mtime();
     }
 }
