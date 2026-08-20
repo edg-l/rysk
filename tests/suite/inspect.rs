@@ -182,6 +182,22 @@ fn a_symbol_names_the_addresses_up_to_the_next_one() {
     );
 }
 
+#[test]
+fn the_last_name_given_for_an_address_is_the_one_it_resolves_to() {
+    // Which is what lets a `--symbols` file beat the image's own table: an address that
+    // answers with two names answers with neither, so one of them has to win, and the
+    // one asked for by hand is handed over last.
+    let symbols = Symbols::new([
+        ("from_the_image".to_owned(), 0x8000_0100),
+        ("from_the_file".to_owned(), 0x8000_0100),
+    ]);
+
+    assert_eq!(symbols.nearest(0x8000_0100), Some(("from_the_file", 0)));
+    // Both are still names, so a breakpoint can be set on either.
+    assert_eq!(symbols.address("from_the_image"), Some(0x8000_0100));
+    assert_eq!(symbols.address("from_the_file"), Some(0x8000_0100));
+}
+
 // -------------------------------------------------------------- breakpoints
 
 #[test]

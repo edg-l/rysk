@@ -31,6 +31,7 @@ rysk: a RISC-V emulator. Runs a flat binary at DRAM_BASE, or an ELF at its entry
     --display none|bochs        a framebuffer and the monitor it answers for
     --usb none|hid              an xHCI controller, a keyboard and a mouse
     --disk none|<file>|<n>M     an NVMe controller with that behind it
+    --symbols <file>            names for addresses, as an ELF or a System.map
     --gui                       open a window on the display
 
 An image after the first says where it goes, which is how firmware and the kernel
@@ -77,6 +78,31 @@ fn describe(session: &Session, stop: &Stop) -> String {
         }
         _ => "asked to stop".to_owned(),
     }
+}
+
+/// Names for addresses, out of an ELF's symbol table or a `System.map`.
+///
+/// Both, because the image a machine actually boots is usually neither. A Linux kernel
+/// is a raw `Image` with no symbol table in it at all, and the names for it ship beside
+/// it in a `System.map`; a firmware or a test binary is an ELF and carries its own.
+fn symbols_from(path: &str) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    if elf::is_elf(&bytes) {
+        return Ok(elf::parse(&bytes)?.symbols.into_iter().collect());
+    }
+    // `System.map` is one symbol a line: an address in hex, the one-letter kind `nm`
+    // gives it, and the name. Anything that is not that shape is not a symbol.
+    let text = String::from_utf8(bytes)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let addr = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let _kind = parts.next()?;
+            Some((parts.next()?.to_owned(), addr))
+        })
+        .collect())
 }
 
 /// An address, and what it is called if the image said. A kernel that stopped
@@ -147,17 +173,20 @@ fn ends(frontend: &machine::Frontend) -> rysk::gui::Ends {
 
 #[cfg(feature = "gui")]
 fn window(
-    machine: &mut Machine,
+    session: Session,
     ends: rysk::gui::Ends,
-) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
-    Ok(rysk::gui::run(machine, ends)?)
+) -> Result<(Session, Option<Halt>), Box<dyn std::error::Error>> {
+    Ok(rysk::gui::run(session, ends)?)
 }
 
 #[cfg(not(feature = "gui"))]
 fn ends(_frontend: &machine::Frontend) {}
 
 #[cfg(not(feature = "gui"))]
-fn window(_machine: &mut Machine, _ends: ()) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
+fn window(
+    _session: Session,
+    _ends: (),
+) -> Result<(Session, Option<Halt>), Box<dyn std::error::Error>> {
     Err(
         "--gui: this rysk was built without a window, which is what \
          `--no-default-features` leaves out"
@@ -188,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut schedule = None;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
+    let mut named: Option<String> = None;
     let mut gui = false;
     let mut at = 0;
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -210,6 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-m" => memory = value.parse::<u64>().expect("a size in mebibytes") * 1024 * 1024,
             "-smp" => harts = value.parse::<usize>().expect("a number of harts"),
             "--initrd" => ramdisk = Some(value),
+            "--symbols" => named = Some(value.clone()),
             "--append" => options.bootargs = Some(value),
             "--aia" => aia = value.parse().unwrap_or_else(|why| panic!("--aia {why}")),
             "--display" => {
@@ -242,16 +273,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // An image that carries a `tohost` symbol is a test: it signals its result there
     // and then spins, so watching that address is the only way the run ends.
-    let (mut machine, tohost, symbols) = if elf::is_elf(&code) {
+    let (mut machine, tohost, mut symbols) = if elf::is_elf(&code) {
         let image = elf::parse(&code)?;
         (
             Machine::from_elf(&image, memory, harts)?,
             htif::tohost(&image),
-            Symbols::new(image.symbols.clone()),
+            {
+                // Sorted, because an image's table is a map and two names for one
+                // address would otherwise resolve to whichever it happened to yield.
+                let mut symbols: Vec<_> = image.symbols.clone().into_iter().collect();
+                symbols.sort();
+                symbols
+            },
         )
     } else {
-        (Machine::new(code, memory, harts), None, Symbols::default())
+        (Machine::new(code, memory, harts), None, Vec::new())
     };
+
+    // Appended after the image's, and the last name given for an address is the one it
+    // resolves to, so a file asked for by hand beats an image that was not. The usual
+    // case is that the image has no names at all: a kernel is a raw `Image`, and what
+    // names it ships beside it.
+    if let Some(path) = &named {
+        symbols.extend(symbols_from(path)?);
+    }
+    let symbols = Symbols::new(symbols);
 
     for arg in &images[1..] {
         let (path, at) = arg
@@ -327,7 +373,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stopped = match (tohost, gui) {
         (Some(tohost), _) => htif::run(session.machine_mut(), tohost, MAX_STEPS).to_string(),
         (None, true) => {
-            let halt = window(session.machine_mut(), ends)?;
+            // The window takes the machine for as long as it is open, since the harts
+            // run on a thread of their own behind it, and hands it back afterwards.
+            let (returned, halt) = window(session, ends)?;
+            session = returned;
             describe(&session, &halt.map_or(Stop::Paused, Stop::Halted))
         }
         (None, false) => {

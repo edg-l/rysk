@@ -16,18 +16,25 @@
 //! describes: a frame may be torn halfway through being drawn, which is what a real
 //! card's scanout engine sees, and the next frame fixes it.
 
-use std::{ops::Range, thread, time::Duration};
+use std::{
+    ops::Range,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use eframe::egui::{
-    CentralPanel, Color32, ColorImage, Context, Event, Image, Panel, TextureHandle, TextureOptions,
-    Ui, ViewportBuilder, load::SizedTexture,
+    CentralPanel, Color32, ColorImage, Context, Event, Image, Panel, ScrollArea, TextureHandle,
+    TextureOptions, Ui, ViewportBuilder, load::SizedTexture,
 };
 
 use crate::{
     bochs::{Dirty, Format, Mode, PAGE, Screen},
+    debug::{Session, Stop, Symbols},
     hid::{Keys, Pointer},
     input::{Keyboard, Mouse},
-    machine::{Halt, Machine, Running, State},
+    machine::{Halt, Running, State},
+    panels::{self, Action, View},
 };
 
 /// The ends of the machine a window drives it through: what a frame is read out of,
@@ -50,24 +57,47 @@ const FRAME: Duration = Duration::from_millis(16);
 const WIDTH: f32 = 1280.0;
 const HEIGHT: f32 = 800.0;
 
+/// How wide the panels open, and the narrowest they may be dragged to, which is enough
+/// for a disassembly line with a symbol beside it. A minimum rather than only a default
+/// because a panel is remembered at whatever it last rendered at, and a frame drawn
+/// with everything folded up would otherwise leave it that narrow for good.
+const PANELS: f32 = 460.0;
+
+/// How far `step to trap` looks before giving up, so that a machine which is not going
+/// to trap does not take the window with it.
+const TO_TRAP: u64 = 10_000_000;
+
 /// Pixels are pixels. A guest picture magnified into a window is nearest-neighbour and
 /// not smoothed, since a smoothed one is no longer the picture the guest drew.
 const PIXELS: TextureOptions = TextureOptions::NEAREST;
 
-/// Open a window on `screen` and run `machine` behind it, until the window is closed
-/// or the machine reaches a trap nothing handles. Answers that trap, if that is how it
-/// ended.
-pub fn run(machine: &mut Machine, ends: Ends) -> Result<Option<Halt>, eframe::Error> {
-    let running = machine.running.clone();
+/// Open a window on `session`'s machine and run it behind the panels, until the window
+/// is closed or the machine reaches a trap nothing handles. Answers the session, so
+/// that whatever opened the window can still say what became of the machine, and that
+/// trap if that is how it ended.
+///
+/// The session is shared with the thread running the harts, and that thread holds it
+/// for as long as a run lasts. That is the whole synchronisation: a window frame takes
+/// the session if it is free, which is exactly when the machine is stopped, and draws
+/// the values it read last if it is not. Nothing here ever waits on a hart.
+pub fn run(session: Session, ends: Ends) -> Result<(Session, Option<Halt>), eframe::Error> {
+    let running = session.running();
     let screen = ends.screen;
+    // Taken before the machine is shared, and never afterwards. The thread below holds
+    // the session for the whole of a run, so anything on this side that waits for it
+    // waits for the guest: a `lock` here is a window that never opens on a machine that
+    // never stops. Everything the window wants from the session later it takes with
+    // `try_lock`, and the names it wants for ever it takes now.
+    let symbols = session.symbols().clone();
     // Made here rather than by `eframe`, so that the thread watching the guest's screen
     // has something to wake the window through before there is a window.
     let ctx = Context::default();
+    let session = Arc::new(Mutex::new(session));
     let mut halt = None;
     let mut opened = Ok(());
 
     thread::scope(|scope| {
-        scope.spawn(|| halt = machine.run());
+        scope.spawn(|| halt = drive(&session, &ctx));
         let _watching = Watching(running.clone());
         scope.spawn({
             let (ctx, screen, running) = (ctx.clone(), screen.clone(), running.clone());
@@ -83,13 +113,65 @@ pub fn run(machine: &mut Machine, ends: Ends) -> Result<Option<Halt>, eframe::Er
             options,
             Some(ctx.clone()),
             Box::new(|_| {
-                let window = Window::new(screen, ends.keys, ends.pointer, running.clone());
+                let window = Window::new(
+                    screen,
+                    ends.keys,
+                    ends.pointer,
+                    running.clone(),
+                    session.clone(),
+                    symbols.clone(),
+                );
                 Ok(Box::new(window))
             }),
         );
     });
 
-    opened.map(|()| halt)
+    let session = Arc::into_inner(session)
+        .expect("the window and both threads are finished with the session")
+        .into_inner()
+        .unwrap_or_else(|held| held.into_inner());
+    opened.map(|()| (session, halt))
+}
+
+/// How long the thread running the machine waits before asking again whether a paused
+/// machine has been asked to carry on. Short enough that pressing run feels like
+/// pressing run, and it only ever waits while the machine is doing nothing anyway.
+const POLL: Duration = Duration::from_millis(2);
+
+/// Run the machine, and stop when it is asked to.
+///
+/// It holds the session for as long as a run lasts, which is what makes every read the
+/// window manages an exact one: the lock is free exactly when no hart is executing.
+fn drive(session: &Mutex<Session>, ctx: &Context) -> Option<Halt> {
+    loop {
+        let mut held = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match held.state() {
+            State::Halted => {
+                return match held.stop() {
+                    Some(Stop::Halted(halt)) => Some(*halt),
+                    _ => None,
+                };
+            }
+            // Paused, so the window has it. Let go of the lock before waiting, or the
+            // window could never take it and nothing would ever ask for a resume.
+            State::Paused => {
+                drop(held);
+                thread::sleep(POLL);
+            }
+            State::Running => {
+                let stop = held.resume();
+                drop(held);
+                // A run that just stopped has something new to say, and the watcher
+                // only wakes the window when the *guest* drew something.
+                ctx.request_repaint();
+                if let Stop::Halted(halt) = stop {
+                    return Some(halt);
+                }
+            }
+        }
+    }
 }
 
 /// Watch the guest's screen, and wake the window when there is something new on it.
@@ -132,13 +214,34 @@ impl Drop for Watching {
     }
 }
 
-/// The window: the guest's screen, and the machine it belongs to.
+/// The window: the guest's screen, the panels beside it, and the machine both are of.
 struct Window {
     /// The display card, if the machine was built with one.
     screen: Option<Screen>,
-    /// Whether the machine is still going, which is the one thing about it this
-    /// milestone can say. The panels that say the rest come later.
+    /// What the machine is doing, which is an atomic and so readable at any time,
+    /// including while the thread running the harts holds the session.
     running: Running,
+    /// The machine, shared with the thread running it. Taken with `try_lock` and never
+    /// with `lock`: the thread holds it for the whole of a run, so waiting on it would
+    /// be waiting on the guest.
+    session: Arc<Mutex<Session>>,
+    /// The names the image gave. Held here rather than asked of the session, since they
+    /// never change and a frame that cannot reach the session still has addresses to
+    /// name.
+    symbols: Arc<Symbols>,
+    /// The last exact answers there were, which is what the panels draw.
+    view: View,
+    /// What the panels asked for this frame, applied the moment the session is free.
+    pending: Vec<Action>,
+    /// Whether to keep the panels current while the machine runs, by pausing it to
+    /// read and letting it go again. Off by default: it is honest about costing the
+    /// guest something, and a machine being watched closely is one a person has
+    /// usually stopped anyway.
+    live: bool,
+    /// Which hart the panels are about.
+    hart: usize,
+    /// What is typed in the memory panel's address box.
+    at: String,
     picture: Option<Picture>,
     /// The guest's own keyboard and mouse, which the window presses and moves.
     keyboard: Keyboard,
@@ -161,14 +264,123 @@ impl Window {
         keys: Option<Keys>,
         pointer: Option<Pointer>,
         running: Running,
+        session: Arc<Mutex<Session>>,
+        symbols: Arc<Symbols>,
     ) -> Self {
         Self {
             screen,
             running,
+            symbols,
+            session,
+            view: View::default(),
+            pending: Vec::new(),
+            live: false,
+            hart: 0,
+            at: String::new(),
             picture: None,
             keyboard: Keyboard::new(keys),
             mouse: Mouse::new(pointer),
         }
+    }
+
+    /// Take the session if it is free, apply whatever the panels asked for, and read
+    /// the machine back.
+    ///
+    /// It is free exactly when no hart is executing, so everything read here is exact.
+    /// When it is not free there is nothing to do: the panels keep the last answers and
+    /// say that is what they are.
+    fn sync(&mut self) {
+        // Running and pausing move the flag the harts read between quanta, which is an
+        // atomic and reachable at any time. They must not wait for the session: the
+        // thread running the machine holds it for the whole of a run, so a pause that
+        // queued behind it would be waiting on exactly the thing it is asking to stop.
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.retain(|action| match action {
+            Action::Run => {
+                self.running.resume();
+                false
+            }
+            Action::Pause => {
+                self.running.pause();
+                false
+            }
+            _ => true,
+        });
+
+        // Asking to pause is also what makes the session free a frame or two from now,
+        // which is how the panels stay current without this thread ever waiting on a
+        // hart.
+        if self.live && self.running.state() == State::Running {
+            self.running.pause();
+        }
+        let Ok(mut session) = self.session.try_lock() else {
+            // Everything else needs the machine itself, so it waits for a frame that
+            // can reach it rather than being dropped.
+            self.pending = pending;
+            self.view.current = false;
+            return;
+        };
+        for action in pending {
+            match action {
+                // Both were applied above, where they could not be waited on.
+                Action::Run | Action::Pause => {}
+                Action::Step => {
+                    session.step(self.hart);
+                }
+                Action::StepToTrap => {
+                    session.step_to_trap(self.hart, TO_TRAP);
+                }
+                Action::ToggleBreakpoint(pc) => {
+                    if !session.clear_breakpoint(pc) {
+                        session.set_breakpoint(pc);
+                    }
+                }
+                Action::Hart(hart) => self.hart = hart,
+                Action::Goto(at) => self.view.at = at,
+                Action::Show(at) => self.view.showing = Some(at),
+                Action::Follow => self.view.showing = None,
+            }
+        }
+        // A machine that has never run has nowhere sensible for the memory panel to be
+        // looking, so it starts wherever the hart does.
+        if self.view.registers.is_none() {
+            self.view.at = session.registers(self.hart).pc;
+            self.at = format!("{:#x}", self.view.at);
+        }
+        self.view.read(&mut session, self.hart);
+        if self.live && !self.running.halted() {
+            session.running().resume();
+        }
+    }
+
+    /// The panels, down the side of the guest's picture.
+    fn panels(&mut self, ui: &mut Ui) {
+        let mut actions = Vec::new();
+        let (view, at, symbols) = (&self.view, &mut self.at, self.symbols.as_ref());
+        Panel::right("panels")
+            .default_size(PANELS)
+            .min_size(PANELS)
+            .resizable(true)
+            .show(ui, |ui| {
+                ScrollArea::vertical().id_salt("panels").show(ui, |ui| {
+                    if !view.current {
+                        stale(ui);
+                    }
+                    // The ones a person opens the window for are open; the rest are
+                    // there when they are wanted.
+                    section(ui, "registers", true, |ui| panels::registers(ui, view));
+                    section(ui, "control registers", false, |ui| panels::csrs(ui, view));
+                    section(ui, "code", true, |ui| {
+                        panels::code(ui, view, symbols, &mut actions)
+                    });
+                    section(ui, "memory", false, |ui| {
+                        panels::memory(ui, view, at, &mut actions)
+                    });
+                    section(ui, "traps", true, |ui| panels::traps(ui, view, symbols));
+                    section(ui, "devices", false, |ui| panels::devices(ui, view));
+                });
+            });
+        self.pending.append(&mut actions);
     }
 
     /// Everything that happened at the window this frame, as the guest's own devices.
@@ -246,9 +458,9 @@ impl Window {
         Some(mode)
     }
 
-    /// What the window says about the machine above the picture: the mode the guest
-    /// asked for, and whether the machine is still running.
-    fn status(&self, ui: &mut Ui, mode: Option<Mode>) {
+    /// What the window says about the machine above the picture: what to ask of it,
+    /// what it is doing, and the mode the guest asked for.
+    fn status(&mut self, ui: &mut Ui, mode: Option<Mode>) {
         let showing = match (&self.screen, mode) {
             (None, _) => "no display: the machine was built without one".to_owned(),
             (Some(_), None) => "showing nothing".to_owned(),
@@ -257,27 +469,33 @@ impl Window {
                 mode.width, mode.height, mode.format, mode.stride
             ),
         };
-        let state = match self.running.state() {
-            State::Running => "running",
-            State::Paused => "paused",
-            State::Halted => "halted",
-        };
+        let mut actions = Vec::new();
+        panels::controls(ui, &self.view, self.running.state(), &mut actions);
         ui.horizontal(|ui| {
             ui.label(showing);
             ui.separator();
-            ui.label(state);
+            ui.checkbox(&mut self.live, "live")
+                .on_hover_text("keep the panels current by pausing the machine to read it");
         });
+        self.pending.append(&mut actions);
     }
 }
 
 impl eframe::App for Window {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        // Nothing asks for the next frame here. `watch` is what does, once it has seen
-        // that there is a next frame worth having.
+        // Nothing asks for the next frame here, except while the panels are being kept
+        // current: `watch` is what asks, once it has seen that there is a next frame
+        // worth having. Live panels are the one case where there is something new
+        // without the guest having drawn anything.
         let ctx = ui.ctx().clone();
         self.input(&ctx);
+        self.sync();
+        if self.live && self.running.state() != State::Halted {
+            ctx.request_repaint_after(FRAME);
+        }
         let mode = self.refresh(&ctx);
         Panel::top("status").show(ui, |ui| self.status(ui, mode));
+        self.panels(ui);
         CentralPanel::default().show(ui, |ui| {
             let Some(picture) = &self.picture else {
                 return;
@@ -298,6 +516,23 @@ impl eframe::App for Window {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.running.halt();
     }
+}
+
+/// One folding section of the panel, open to begin with or not.
+fn section(ui: &mut Ui, name: &str, open: bool, contents: impl FnOnce(&mut Ui)) {
+    eframe::egui::CollapsingHeader::new(name)
+        .default_open(open)
+        .show(ui, contents);
+}
+
+/// What the panels say when what is in them was read at an earlier stop, which is every
+/// frame drawn while the harts are running.
+fn stale(ui: &mut Ui) {
+    ui.label(
+        eframe::egui::RichText::new("as of the last stop")
+            .weak()
+            .italics(),
+    );
 }
 
 /// The rows of the picture a frame's dirty pages fall in.

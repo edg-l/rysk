@@ -24,7 +24,10 @@
 //! and the run comes back, and a caller holding the session then holds every one of
 //! them at a boundary. There is no second, approximate way to read the same value.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::{
     csr::{self, Mode},
@@ -204,18 +207,25 @@ pub struct Symbols {
 const LAST_SPAN: u64 = 64 * 1024;
 
 impl Symbols {
-    /// Take an image's symbol table, which is names to addresses and nothing more.
+    /// Take a symbol table, which is names to addresses and nothing more.
+    ///
+    /// Every name is kept, so a breakpoint can be set on any of them. Only one name per
+    /// *address* is kept for resolving one, since an address that answers with two names
+    /// answers with neither: the last entry given for an address is the one it resolves
+    /// to. That is what makes a table given by hand beat the image's own, so long as the
+    /// image's are handed over first.
     pub fn new(symbols: impl IntoIterator<Item = (String, u64)>) -> Self {
-        let by_name: BTreeMap<String, u64> = symbols.into_iter().collect();
-        let mut by_addr: Vec<(u64, String)> = by_name
-            .iter()
-            .map(|(name, addr)| (*addr, name.clone()))
-            .collect();
-        // By address, and by name within an address, so that two names for one place
-        // resolve to the same one of them every time rather than to whichever the map
-        // happened to yield.
-        by_addr.sort();
-        Self { by_name, by_addr }
+        let mut by_name = BTreeMap::new();
+        // Sorted by address for free, and one entry per address by construction.
+        let mut naming: BTreeMap<u64, String> = BTreeMap::new();
+        for (name, addr) in symbols {
+            naming.insert(addr, name.clone());
+            by_name.insert(name, addr);
+        }
+        Self {
+            by_name,
+            by_addr: naming.into_iter().collect(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -258,11 +268,17 @@ impl Symbols {
 #[derive(Debug)]
 pub struct Session {
     machine: Machine,
-    symbols: Symbols,
+    /// Shared rather than owned, because they never change once an image is loaded and
+    /// a frontend wants to name an address whether or not it can reach the machine.
+    symbols: Arc<Symbols>,
     /// Addresses to stop before executing. A virtual address, since that is what a
     /// symbol is and what a person reading a disassembly has.
     breakpoints: BTreeSet<u64>,
     watchpoints: Vec<Watch>,
+    /// Why the machine last stopped, so that something which did not ask can still find
+    /// out. The thread running the machine is not always the one showing what happened
+    /// to it.
+    stop: Option<Stop>,
 }
 
 impl Session {
@@ -270,16 +286,17 @@ impl Session {
     pub fn new(machine: Machine) -> Self {
         Self {
             machine,
-            symbols: Symbols::default(),
+            symbols: Arc::default(),
             breakpoints: BTreeSet::new(),
             watchpoints: Vec::new(),
+            stop: None,
         }
     }
 
     /// And one that can name what it is looking at.
     pub fn with_symbols(machine: Machine, symbols: Symbols) -> Self {
         Self {
-            symbols,
+            symbols: Arc::new(symbols),
             ..Self::new(machine)
         }
     }
@@ -300,8 +317,22 @@ impl Session {
         self.machine.running.clone()
     }
 
-    pub fn symbols(&self) -> &Symbols {
+    /// The names the image gave, which a frontend may hold on to: they do not change,
+    /// and naming an address is not a question about the machine's state.
+    pub fn symbols(&self) -> &Arc<Symbols> {
         &self.symbols
+    }
+
+    /// Why it last stopped, which is not always known to whatever is asking: the thread
+    /// running the machine and the thread showing what became of it are not the same.
+    pub fn stop(&self) -> Option<&Stop> {
+        self.stop.as_ref()
+    }
+
+    /// Remember a stop and hand it back, so that every way out of a run records itself.
+    fn stopped(&mut self, stop: Stop) -> Stop {
+        self.stop = Some(stop.clone());
+        stop
     }
 
     pub fn harts(&self) -> usize {
@@ -317,10 +348,11 @@ impl Session {
     /// again, which is what makes a breakpoint in a loop steppable.
     pub fn resume(&mut self) -> Stop {
         if self.machine.running.halted() {
-            return Stop::Halted(self.last_halt());
+            let halt = self.last_halt();
+            return self.stopped(Stop::Halted(halt));
         }
         self.machine.running.resume();
-        match self.watched() {
+        let stop = match self.watched() {
             // Nothing to watch for, so the harts run at full speed and the schedule
             // the machine was built with is the one they run under.
             false => match self.machine.run() {
@@ -331,7 +363,8 @@ impl Session {
             // slow by construction and only ever as slow as debugging: a machine with
             // nothing set on it never reaches here.
             true => self.run_watching(),
-        }
+        };
+        self.stopped(stop)
     }
 
     /// Run one hart for one instruction, whatever else the machine is doing.
@@ -369,7 +402,7 @@ impl Session {
                 break;
             }
         }
-        Stop::Stepped { hart, retired }
+        self.stopped(Stop::Stepped { hart, retired })
     }
 
     /// Run one hart until it enters a trap handler, or until `limit` instructions have
@@ -394,14 +427,14 @@ impl Session {
                     .traps
                     .last()
                     .expect("a trap was just counted");
-                return Stop::Trapped { hart, taken };
+                return self.stopped(Stop::Trapped { hart, taken });
             }
             if ran == 0 {
                 break;
             }
             retired += ran;
         }
-        Stop::Stepped { hart, retired }
+        self.stopped(Stop::Stepped { hart, retired })
     }
 
     /// Ask the machine to stop where it is. It stops at the end of the quantum each

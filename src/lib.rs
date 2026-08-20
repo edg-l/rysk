@@ -50,6 +50,10 @@ pub mod inst;
 pub mod machine;
 pub mod mmu;
 pub mod nvme;
+// The panels beside the guest's picture. Behind the same feature as the window, since
+// only a window has any.
+#[cfg(feature = "gui")]
+pub mod panels;
 pub mod pci;
 pub mod plic;
 pub mod rvc;
