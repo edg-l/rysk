@@ -1,9 +1,10 @@
 use std::{env, fs::File, io::Read};
 
 use rysk::{
+    bochs,
     dram::DRAM_SIZE,
     elf, htif, machine,
-    machine::{Aia, Machine, Schedule},
+    machine::{Aia, Machine, Schedule, Video},
 };
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -57,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut memory = DRAM_SIZE;
     let mut harts = 1;
     let mut aia = Aia::default();
+    let mut video = Video::default();
     let mut schedule = None;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
@@ -69,6 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--initrd" => ramdisk = Some(value),
             "--append" => options.bootargs = Some(value),
             "--aia" => aia = value.parse().unwrap_or_else(|why| panic!("--aia {why}")),
+            "--display" => {
+                video = value
+                    .parse()
+                    .unwrap_or_else(|why| panic!("--display {why}"))
+            }
             "--schedule" => {
                 schedule = Some(
                     value
@@ -85,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!(
             "Usage: rysk [-m <mebibytes>] [-smp <harts>] [--initrd <file>] \
              [--append <args>] [--aia none|aplic|aplic-imsic] \
+             [--display none|bochs] \
              [--schedule turns|threads] \
              <image> [image@address ...]"
         );
@@ -134,11 +142,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.initrd = Some((at, at + bytes.len() as u64));
     }
 
-    let keyboard = machine::boot(
+    let frontend = machine::boot(
         &mut machine,
         &format!("{}{}", rysk::ISA, aia.isa()),
         &options,
         aia,
+        video,
     );
     handoff(&mut machine);
 
@@ -146,6 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // being a hart. The terminal is still in its usual line-buffered mode, so a line
     // arrives when it is finished rather than a key at a time: making it raw is the
     // frontend's job and the frontend is not written yet.
+    let keyboard = frontend.keyboard;
     std::thread::spawn(move || {
         let mut byte = [0u8; 1];
         while std::io::stdin().read_exact(&mut byte).is_ok() {
@@ -173,6 +183,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for hart in &machine.harts {
         hart.dump_registers();
         hart.dump_csr();
+    }
+    // What the display was showing when it stopped. Presenting it is the frontend's
+    // job and the frontend is not written yet, so this says what there was to present:
+    // the mode the guest asked for, and how much of video memory it had drawn into.
+    if let Some(screen) = &frontend.screen {
+        match screen.mode() {
+            Some(mode) => {
+                let drawn = screen.vram().take_dirty().pages().count() as u64 * bochs::PAGE;
+                println!(
+                    "display: {}x{} at {} bytes a pixel, {} KiB of a {} KiB picture drawn",
+                    mode.width,
+                    mode.height,
+                    mode.depth,
+                    drawn / 1024,
+                    mode.size / 1024,
+                );
+            }
+            None => println!("display: showing nothing"),
+        }
     }
     println!("stopped: {stopped}");
 

@@ -2,6 +2,7 @@
 
 mod aia;
 mod atomic;
+mod bochs;
 mod compressed;
 mod control;
 mod csr;

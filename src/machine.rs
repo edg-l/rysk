@@ -20,6 +20,7 @@ use std::{
 
 use crate::{
     aplic::{self, Aplic},
+    bochs::{self, Bochs, Screen},
     bus::{Bus, DRAM_BASE},
     clint::{self, Clint},
     cpu::Cpu,
@@ -79,6 +80,44 @@ impl Aia {
     }
 }
 
+/// Which display the machine has, if it has one.
+///
+/// Named the way QEMU names the device rather than the way it names the option, since
+/// what this picks is a card on the PCI bus and not a way of showing what is on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Video {
+    /// No display at all, which is what a machine being driven through its serial port
+    /// wants: sixteen mebibytes of video memory nothing will ever read is waste.
+    #[default]
+    None,
+    /// A bochs display, which `drm/tiny/bochs.c` binds to.
+    Bochs,
+}
+
+impl std::str::FromStr for Video {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "none" => Ok(Self::None),
+            "bochs" => Ok(Self::Bochs),
+            _ => Err(format!("{name}: not none or bochs")),
+        }
+    }
+}
+
+/// The ends of the machine that face the world rather than the guest: what a keystroke
+/// is typed into, and what a frame is read out of.
+///
+/// Everything here is a handle on something the machine owns, so a frontend holding one
+/// does not hold the machine and can be on a thread of its own. There is no display
+/// unless the machine was built with one.
+#[derive(Debug)]
+pub struct Frontend {
+    pub keyboard: Keyboard,
+    pub screen: Option<Screen>,
+}
+
 /// The interrupt source the first serial port drives, as the `virt` machine wires it.
 const UART_IRQ: usize = 10;
 /// The first of the four the root complex's functions are swizzled onto.
@@ -89,6 +128,9 @@ const SOURCES: u32 = (PCI_IRQ + pci::PINS - 1) as u32;
 
 /// Which device number the host bridge is, which is where enumeration looks first.
 const HOST_BRIDGE: usize = 0;
+/// And which the display takes, when there is one. Any number would do, since a card
+/// that never interrupts is never swizzled onto a wire.
+const DISPLAY: usize = 1;
 
 /// The phandles the tree refers to its interrupt controllers by. A device says which
 /// controller its line runs to, so the controllers need names, and each hart has a
@@ -183,9 +225,9 @@ pub struct Boot {
 ///
 /// Every hart is handed the same tree and its own id, because every hart comes out of
 /// reset at the same address: firmware is what picks one to boot and parks the others.
-pub fn boot(machine: &mut Machine, isa: &str, options: &Boot, aia: Aia) -> Keyboard {
+pub fn boot(machine: &mut Machine, isa: &str, options: &Boot, aia: Aia, video: Video) -> Frontend {
     let harts = machine.harts.len();
-    let keyboard = virt(machine, aia);
+    let frontend = virt(machine, aia, video);
     let memory = machine.bus.dram.size();
     let at = fdt_base(memory);
     let tree = describe(isa, memory, harts, options, aia);
@@ -197,7 +239,7 @@ pub fn boot(machine: &mut Machine, isa: &str, options: &Boot, aia: Aia) -> Keybo
         hart.regs[10] = hart.hart as u64;
         hart.regs[11] = at;
     }
-    keyboard
+    frontend
 }
 
 /// How a run ended: a trap that nothing was installed to take, and the hart it
@@ -567,7 +609,7 @@ fn tick(cpu: &mut Cpu, bus: &Bus, max: u64) -> Result<u64, Trap> {
 /// attaches is not only on the bus: an interrupt file is a hart's own, reached by that
 /// hart's CSRs, and the page a message arrives at is the same registers seen from the
 /// other side.
-pub fn virt(machine: &mut Machine, aia: Aia) -> Keyboard {
+pub fn virt(machine: &mut Machine, aia: Aia, video: Video) -> Frontend {
     let harts = machine.harts.len();
     let bus = &mut machine.bus;
     let serial = Line::default();
@@ -638,6 +680,18 @@ pub fn virt(machine: &mut Machine, aia: Aia) -> Keyboard {
     let root = Root::new(pins, msi);
     root.plug(HOST_BRIDGE, Box::new(HostBridge));
 
+    // A card is plugged in, and nothing else: where its windows go is the guest's to
+    // decide, and the device tree already says where the windows it decides from are.
+    let screen = match video {
+        Video::None => None,
+        Video::Bochs => {
+            let card = Bochs::new(bochs::VGAMEM);
+            let screen = card.screen();
+            root.plug(DISPLAY, Box::new(card));
+            Some(screen)
+        }
+    };
+
     bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::new(harts)));
     bus.attach(
         uart::BASE,
@@ -652,7 +706,7 @@ pub fn virt(machine: &mut Machine, aia: Aia) -> Keyboard {
         Box::new(root.window(pci::MMIO64)),
     );
     bus.attach(pci::PIO, pci::PIO_SIZE, Box::new(Ports));
-    keyboard
+    Frontend { keyboard, screen }
 }
 
 /// The `interrupt-map` of the root complex: for each of the four device numbers the
