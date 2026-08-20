@@ -19,6 +19,11 @@ pub struct Decoded {
     pub inst: Inst,
     pub encoding: u32,
     pub length: u8,
+    /// Whether this instruction names the retired-instruction counter, and so says
+    /// what it holds rather than counting itself. It is a property of the encoding, so
+    /// it is answered once here rather than asked of every instruction that retires.
+    /// The RISC-V Instruction Set Manual Volume II, 3.3.1.
+    pub writes_instret: bool,
 }
 
 /// One of them, and the physical address whose bytes it came from.

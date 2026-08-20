@@ -49,6 +49,11 @@ pub struct Cpu {
     /// because on a machine with more than one hart the interrupt that ends the wait
     /// is usually one another hart has to send.
     pub waiting: bool,
+    /// What the controllers and `mvip` were last seen driving into `mip`. The
+    /// controllers publish rather than being asked, so the usual answer before an
+    /// instruction is the same one as before the last, and writing it into `mip` again
+    /// changes nothing.
+    driven: u64,
 }
 
 impl Cpu {
@@ -67,6 +72,7 @@ impl Cpu {
             hart,
             imsic: None,
             waiting: false,
+            driven: 0,
         };
 
         // Read-only, and the only piece of machine information that says anything. No
@@ -110,13 +116,27 @@ impl Cpu {
     /// register reads at the call site, whether or not any device drives one.
     #[inline(never)]
     fn refresh_mip(&mut self, bus: &Bus) {
-        // `SEIP` is the one pending bit with two sources: the controller's wire, and a
-        // bit machine mode may set by hand to post a supervisor external interrupt no
-        // device raised. What `mip` reports is the two together, and the bit software
-        // owns is the one `mvip` exposes on its own.
-        // The RISC-V Instruction Set Manual Volume II, 3.1.9.
-        self.csrs[MIP] =
-            (self.csrs[MIP] & !MIP_DEVICE) | bus.interrupts(self.hart) | (self.csrs[MVIP] & SEIP);
+        self.drive(self.driving(bus));
+    }
+
+    /// What the machine is driving into this hart's `mip`.
+    ///
+    /// `SEIP` is the one pending bit with two sources: the controller's wire, and a bit
+    /// machine mode may set by hand to post a supervisor external interrupt no device
+    /// raised. What `mip` reports is the two together, and the bit software owns is the
+    /// one `mvip` exposes on its own.
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.9.
+    #[inline]
+    fn driving(&self, bus: &Bus) -> u64 {
+        bus.interrupts(self.hart) | (self.csrs[MVIP] & SEIP)
+    }
+
+    /// Put `driven` where `mip` reports it. Nothing else writes those bits: a software
+    /// write to `mip` keeps them, which is what lets the last value be remembered.
+    #[inline]
+    fn drive(&mut self, driven: u64) {
+        self.driven = driven;
+        self.csrs[MIP] = (self.csrs[MIP] & !MIP_DEVICE) | driven;
     }
 
     /// The interrupt to take before the next instruction, if there is one: the highest
@@ -140,7 +160,13 @@ impl Cpu {
         // question is answered out of `mip` alone. Software still sees the true value:
         // reading the register is what refreshes it.
         if self.csrs[MIE] & MIP_DEVICE != 0 {
-            self.refresh_mip(bus);
+            // Almost always the same answer as last time, since it changes only when a
+            // controller publishes, and writing it into `mip` again would be a store
+            // per instruction to say nothing.
+            let driven = self.driving(bus);
+            if driven != self.driven {
+                self.drive(driven);
+            }
         }
         let ready = self.csrs[MIP] & self.csrs[MIE];
         if ready == 0 {
@@ -176,6 +202,7 @@ impl Cpu {
             inst,
             encoding,
             length,
+            writes_instret,
         } = self.fetch(bus)?;
         trace_insn!("{:#x}  {inst}", self.pc);
 
@@ -186,19 +213,14 @@ impl Cpu {
         if inhibit & 1 == 0 {
             self.csrs[MCYCLE] = self.csrs[MCYCLE].wrapping_add(1);
         }
-        // An instruction that names the retired-instruction counter has said what it
-        // should hold, so it does not also count itself.
-        let wrote_instret = matches!(
-            inst.op,
-            Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
-        ) && matches!(inst.imm as usize, MINSTRET | MINSTRETH);
-
         self.execute(bus, inst, encoding)?;
 
         // Counted here rather than before executing, because this is where it retires:
         // one that trapped did not, and `ecall` and `ebreak` are specified as never
         // retiring at all. The RISC-V Instruction Set Manual Volume II, 3.3.1.
-        if inhibit & 0b100 == 0 && !wrote_instret {
+        // An instruction that names the retired-instruction counter has said what it
+        // should hold, so it does not also count itself.
+        if inhibit & 0b100 == 0 && !writes_instret {
             self.csrs[MINSTRET] = self.csrs[MINSTRET].wrapping_add(1);
         }
 
@@ -582,14 +604,19 @@ impl Cpu {
         // A compressed instruction is the low half alone, and the high half of what was
         // read is not part of it.
         let length = inst::length(word as u16);
+        let inst = if length == 2 {
+            rvc::decode(word as u16)?
+        } else {
+            decode(word)?
+        };
         let decoded = Decoded {
-            inst: if length == 2 {
-                rvc::decode(word as u16)?
-            } else {
-                decode(word)?
-            },
+            inst,
             encoding: if length == 2 { word & 0xffff } else { word },
             length: length as u8,
+            writes_instret: matches!(
+                inst.op,
+                Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
+            ) && matches!(inst.imm as usize, MINSTRET | MINSTRETH),
         };
         // Only what decoded. An encoding this machine refuses raises the same exception
         // every time it is fetched, and remembering it would save nothing.
