@@ -856,7 +856,19 @@ impl Cpu {
         // Widened once here, so naming a register below is an index rather than a
         // conversion.
         let (rd, rs1, rs2) = (rd as usize, rs1 as usize, rs2 as usize);
-        let (a, b) = (self.regs[rs1], self.regs[rs2]);
+        // A register is five bits of the encoding, so the file is always big enough for
+        // the one an instruction names. Nothing carries that from the decoder to here:
+        // the field is a `u8`, and an instruction is read back out of the block cache,
+        // so what the decoder proved is gone by the time it is indexed. Checking it
+        // again is 5.8% of what `bench/loop.bin` retires and 3.4% of its cycles.
+        //
+        // Both decoders keep the five bits: `inst.rs` masks with `0x1f`, and `rvc.rs`
+        // passes only `0`, `2`, a three-bit field plus eight, or a five-bit one. The
+        // fused pairs name no source at all. `debug_assert` is what says so on every
+        // instruction the suite and the corpus run, so a decoder that ever stopped
+        // holding to it is caught there rather than here.
+        debug_assert!(rs1 < 32 && rs2 < 32, "{rs1} and {rs2} name registers");
+        let (a, b) = unsafe { (*self.regs.get_unchecked(rs1), *self.regs.get_unchecked(rs2)) };
 
         match op {
             // ---------------------------------------------------------- integer
