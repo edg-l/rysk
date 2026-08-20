@@ -1,7 +1,7 @@
 use crate::common::*;
 use rysk::csr::{
     MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE, MSTATUS_SXL,
-    MSTATUS_UXL, MSTATUS_XL_64, MTIP, Mode, S_INTERRUPTS, SSIP, STIP, misa_extension,
+    MSTATUS_UXL, MSTATUS_XL_64, MTIP, Mode, S_INTERRUPTS, SEIP, SSIP, STIP, misa_extension,
 };
 
 // ------------------------------------------------------------------ zicsr
@@ -157,6 +157,37 @@ fn sip_is_a_window_onto_mip_and_not_a_register_of_its_own() {
         machine.reg(A1),
         STIP,
         "clearing sip cleared it in mip, not in storage of its own"
+    );
+}
+
+#[test]
+fn a_supervisor_cannot_write_the_pending_bits_its_environment_owns() {
+    // Delegating them is what makes them visible in `sip`, not what makes them
+    // writable there: `SEIP` is the controller's and `STIP` the timer's, and only
+    // `SSIP` is software's.
+    // The RISC-V Instruction Set Manual Volume II, 12.1.3.
+    let machine = prog(&[
+        csrrw(ZERO, MIDELEG, T0),
+        csrrw(ZERO, MIP, T1),
+        // Ask for every delegated bit at once, and get the one that is ours.
+        csrrw(ZERO, SIP, T0),
+        csrrs(A0, MIP, ZERO),
+        // And the other way: clearing all of them leaves the two that are not ours.
+        csrrw(ZERO, SIP, ZERO),
+        csrrs(A1, MIP, ZERO),
+    ])
+    .reg(T0, SSIP | STIP | SEIP)
+    .reg(T1, STIP)
+    .run();
+    assert_eq!(
+        machine.reg(A0),
+        SSIP | STIP,
+        "the software bit was written and the timer's was left where it was"
+    );
+    assert_eq!(
+        machine.reg(A1),
+        STIP,
+        "and clearing sip cleared only the software bit"
     );
 }
 

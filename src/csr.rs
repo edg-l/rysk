@@ -233,7 +233,12 @@ pub fn alias(addr: usize, mideleg: u64) -> Option<(usize, u64, u64)> {
         // any extended state worth saving.
         SSTATUS => Some((MSTATUS, SSTATUS_MASK, MSTATUS_UXL | MSTATUS_SD)),
         SIE => Some((MIE, mideleg, 0)),
-        SIP => Some((MIP, mideleg, 0)),
+        // A supervisor sees every delegated pending bit and may write one of them.
+        // `SEIP` and `STIP` are what the execution environment says they are: a
+        // controller sets and clears the first and the timer the second, and neither is
+        // software's to argue with from here.
+        // The RISC-V Instruction Set Manual Volume II, 12.1.3.
+        SIP => Some((MIP, mideleg & SSIP, mideleg)),
         _ => None,
     }
 }
