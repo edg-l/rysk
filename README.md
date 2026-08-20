@@ -6,6 +6,7 @@
 
 RV64GC with privilege modes, Sv39 paging, several harts, and a PCI bus with a
 display, a keyboard, a mouse and a disk on it that stock Linux drivers bind to.
+Boots Linux, and opens a window you can stop it in and look around.
 
 [![Rust](https://github.com/edg-l/rysk/actions/workflows/rust.yml/badge.svg)](https://github.com/edg-l/rysk/actions/workflows/rust.yml)
 
@@ -30,8 +31,9 @@ rysk -smp 4 prog.bin          # four harts, a host thread each
 rysk vmlinux                  # or an ELF, started at its entry point
 ```
 
-A run ends on a trap nothing is installed to handle, and prints the register file
-and the non-zero CSRs.
+A run ends on a trap nothing is installed to handle, and says where it stopped:
+the register file, the control registers holding something, and the last trap the
+hart took.
 
 ### Boot Linux
 
@@ -57,6 +59,25 @@ rysk --display bochs --usb hid --disk disk.img --gui ...
 device is off unless asked for, and a run stays headless without `--gui`, which is
 what CI and the benchmarks want; `--no-default-features` leaves the window out of
 the build entirely.
+
+### Look inside it
+
+The window is also the debugger. Beside the guest's picture are its registers with
+whatever just moved picked out, the control registers, the memory, a disassembly
+with `pc` on it, the traps the hart has taken, and what every device on the bus is
+doing. Run, pause, step an instruction, step to the next trap, or click a line of
+the disassembly to break on it.
+
+```bash
+rysk --symbols System.map --gui ...   # names for addresses, from an ELF or a System.map
+```
+
+A kernel is a raw image with no symbol table in it, so its names ship beside it;
+give rysk either and a `pc` reads as `<schedule_timeout+0x4c>` rather than as a
+number. Everything the window shows is read while the machine is stopped, so the
+values are the machine's rather than a snapshot torn out from under a running hart,
+and reading never touches a device: half the registers on this bus *do* something
+when read, and a panel that polled them would eat the guest's input by showing it.
 
 ### Watch it execute
 
@@ -151,10 +172,10 @@ Working, and not finished. What is missing, roughly in the order it matters:
 
 | missing | where it stands |
 |---|---|
-| **Panels** | the window shows the guest's screen and nothing about the machine behind it, so a black screen is still a mystery rather than a `pc` and a trap |
 | **A raw terminal** | the serial port's terminal is line buffered, so typing at a guest shell arrives a line at a time |
 | **A network** | there is no interface on the bus, so a guest has no way off the machine |
 | **Determinism** | no run repeats another. `--schedule turns` fixes the order the harts run in, but the devices still advance with the wall clock |
+| **A control channel** | the window can drive the machine and nothing else can: there is no socket to run it headless from, and no gdbstub |
 | **Debug triggers** | the one corpus test that does not pass, `rv64mi-p-breakpoint`, wants them |
 | **The hypervisor extension** | no H, so no VS mode and no guest interrupt files |
 
