@@ -3,7 +3,11 @@ use std::{cmp::Ordering, ops::Range};
 #[cfg(feature = "trace")]
 use tracing::instrument;
 
-use crate::{device::Device, dram::Dram, trap::Exception};
+use crate::{
+    device::{Device, Pending},
+    dram::Dram,
+    trap::Exception,
+};
 
 /// The address which dram starts, same as QEMU virt machine.
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -19,6 +23,16 @@ pub struct Bus {
     /// Every device, sorted by base address and never overlapping, so an address
     /// decodes by binary search.
     devices: Vec<(Range<u64>, Box<dyn Device>)>,
+    /// The words the interrupt controllers drive `mip` through, collected as they were
+    /// attached. There are a handful of these and ten or so devices, so what a hart
+    /// asks before every instruction is a fold over the things that can answer rather
+    /// than over everything on the bus.
+    pending: Vec<Pending>,
+    /// Where in `devices` the interrupt controllers are. A wire moves when the device
+    /// driving it is accessed, which is an access the controller on the other end
+    /// never sees, so the controllers are asked to look again after every access that
+    /// was not dram.
+    controllers: Vec<usize>,
     /// The bytes each hart reserved with its last load-reserved, invalidated by any
     /// store that overlaps them. A hart has at most one reservation, and the set of
     /// them belongs to the memory system rather than to any hart: a store has to
@@ -39,6 +53,8 @@ impl Bus {
         Self {
             dram,
             devices: Vec::new(),
+            pending: Vec::new(),
+            controllers: Vec::new(),
             reservations: vec![None; harts],
             reserved: 0,
         }
@@ -70,7 +86,33 @@ impl Bus {
                     .is_some_and(clashes),
             "a device already answers for {range:#x?}"
         );
+        // A controller says once, here, which word it drives `mip` through. One seen
+        // at two addresses names the same word both times and is kept once, though
+        // both regions are still asked to look again, since either can be the half
+        // that has something to say.
+        // Inserting ahead of a controller moves it along one.
+        for controller in &mut self.controllers {
+            if *controller >= at {
+                *controller += 1;
+            }
+        }
+        if let Some(pending) = device.pending() {
+            if !self.pending.iter().any(|kept| kept.is(&pending)) {
+                self.pending.push(pending);
+            }
+            self.controllers.push(at);
+        }
         self.devices.insert(at, (range, device));
+    }
+
+    /// Let the controllers see what an access did to the wires. A device raises its
+    /// line while it is being read or written, and the controller it runs to is not
+    /// part of that access, so this is the only place the two meet.
+    #[inline(never)]
+    fn resample(&mut self) {
+        for at in 0..self.controllers.len() {
+            self.devices[self.controllers[at]].1.poll();
+        }
     }
 
     /// The device that owns all `size` bits at `addr`, if one does. An access that
@@ -91,17 +133,25 @@ impl Bus {
     }
 
     /// Let every device notice whatever arrived without an access to notice it at.
+    ///
+    /// The controllers go last, whatever address they were given. A byte typed at a
+    /// serial port is a line raised inside that port's own poll, and a controller that
+    /// had already looked would not see it until the round after.
     pub fn poll(&mut self) {
-        for (_, device) in &mut self.devices {
-            device.poll();
+        for at in 0..self.devices.len() {
+            if !self.controllers.contains(&at) {
+                self.devices[at].1.poll();
+            }
         }
+        self.resample();
     }
 
-    /// The bits the devices are asserting in `hart`'s `mip`, together.
+    /// The bits the controllers are asserting in `hart`'s `mip`, together.
+    #[inline]
     pub fn interrupts(&self, hart: usize) -> u64 {
-        self.devices
+        self.pending
             .iter()
-            .fold(0, |bits, (_, device)| bits | device.interrupts(hart))
+            .fold(0, |bits, pending| bits | pending.get(hart))
     }
 
     /// Read `size` bits at `addr`.
@@ -122,13 +172,15 @@ impl Bus {
 
     #[inline(never)]
     fn device_load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
-        match self.device(addr, size) {
+        let answer = match self.device(addr, size) {
             Some((range, device)) => {
                 let offset = addr - range.start;
                 device.load(offset, size).map_err(|e| e.at(addr))
             }
             None => Err(Exception::LoadAccessFault(addr)),
-        }
+        };
+        self.resample();
+        answer
     }
 
     /// Write the low `size` bits of `value` at `addr`, with the same split.
@@ -148,13 +200,15 @@ impl Bus {
 
     #[inline(never)]
     fn device_store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
-        match self.device(addr, size) {
+        let answer = match self.device(addr, size) {
             Some((range, device)) => {
                 let offset = addr - range.start;
                 device.store(offset, size, value).map_err(|e| e.at(addr))
             }
             None => Err(Exception::StoreAmoAccessFault(addr)),
-        }
+        };
+        self.resample();
+        answer
     }
 
     /// Release every reservation the bytes written by a store overlap, whichever hart

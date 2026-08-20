@@ -19,7 +19,7 @@ use std::{
 };
 
 use crate::{
-    device::{Device, Level},
+    device::{Device, Level, Pending},
     trap::Exception,
 };
 
@@ -183,12 +183,22 @@ impl File {
 /// the page a message is written to, which is a device on the bus. They are the same
 /// registers seen from both sides, so they cannot be two copies.
 #[derive(Debug, Clone)]
-pub struct Imsic(Arc<Mutex<Vec<[File; 2]>>>);
+pub struct Imsic {
+    files: Arc<Mutex<Vec<[File; 2]>>>,
+    /// What the files are asserting at their harts, kept up to date by every path that
+    /// changes one. Reading it is what a hart does before an instruction; taking the
+    /// lock and asking each file was what it used to do, and that cost more than the
+    /// instruction.
+    pending: Pending,
+}
 
 impl Imsic {
     /// An IMSIC for each of `harts` harts.
     pub fn new(harts: usize) -> Self {
-        Self(Arc::new(Mutex::new(vec![Default::default(); harts])))
+        Self {
+            files: Arc::new(Mutex::new(vec![Default::default(); harts])),
+            pending: Pending::new(harts),
+        }
     }
 
     /// The pages one level's interrupt files answer at, as a device on the bus.
@@ -213,9 +223,27 @@ impl Imsic {
         harts as u64 * PAGE
     }
 
+    /// Look at one file without changing it.
+    fn peek<T>(&self, hart: usize, level: Level, f: impl FnOnce(&File) -> T) -> Option<T> {
+        let files = self.files.lock().unwrap();
+        Some(f(&files.get(hart)?[level as usize]))
+    }
+
+    /// Change one file, and say afterwards what that hart's two files are asserting.
+    /// Every path that can change what a hart should see goes through here, which is
+    /// what keeps the published word true.
     fn with<T>(&self, hart: usize, level: Level, f: impl FnOnce(&mut File) -> T) -> Option<T> {
-        let mut files = self.0.lock().unwrap();
-        Some(f(&mut files.get_mut(hart)?[level as usize]))
+        let mut files = self.files.lock().unwrap();
+        let file = files.get_mut(hart)?;
+        let answer = f(&mut file[level as usize]);
+        let mut bits = 0;
+        for at in [Level::Machine, Level::Supervisor] {
+            if file[at as usize].signalling() {
+                bits |= at.external();
+            }
+        }
+        self.pending.set(hart, bits);
+        Some(answer)
     }
 
     /// Deliver a message: the identity `id` has arrived for `hart` at `level`.
@@ -226,7 +254,7 @@ impl Imsic {
     /// Read the register `select` names in `hart`'s file at `level`, which is what
     /// `mireg` and `sireg` answer with.
     pub fn read(&self, hart: usize, level: Level, select: u64) -> u64 {
-        self.with(hart, level, |file| file.read(select))
+        self.peek(hart, level, |file| file.read(select))
             .unwrap_or(0)
     }
 
@@ -236,7 +264,7 @@ impl Imsic {
 
     /// What a read of `mtopei` or `stopei` gives.
     pub fn topei(&self, hart: usize, level: Level) -> u64 {
-        self.with(hart, level, |file| file.topei()).unwrap_or(0)
+        self.peek(hart, level, |file| file.topei()).unwrap_or(0)
     }
 
     /// Claim whatever `mtopei` reports, which clears its pending bit. The value
@@ -252,7 +280,7 @@ impl Imsic {
 
     /// Whether `hart`'s file at `level` is asserting its external interrupt.
     pub fn signalling(&self, hart: usize, level: Level) -> bool {
-        self.with(hart, level, |file| file.signalling())
+        self.peek(hart, level, |file| file.signalling())
             .unwrap_or(false)
     }
 }
@@ -298,11 +326,9 @@ impl Device for Files {
         Ok(())
     }
 
-    /// The external interrupt of this level, which is one wire out of each file.
-    fn interrupts(&self, hart: usize) -> u64 {
-        match self.imsic.signalling(hart, self.level) {
-            true => self.level.external(),
-            false => 0,
-        }
+    /// Both levels' files publish into one word per hart, so either set of pages
+    /// names the same one.
+    fn pending(&self) -> Option<Pending> {
+        Some(self.imsic.pending.clone())
     }
 }

@@ -11,7 +11,7 @@
 
 use crate::{
     csr::{MEIP, SEIP},
-    device::{Device, Line},
+    device::{Device, Line, Pending},
     trap::Exception,
 };
 
@@ -51,6 +51,7 @@ pub struct Plic {
     /// one while it is being serviced, whatever its line is doing.
     /// RISC-V Platform-Level Interrupt Controller Specification, 1.2 and 9.
     claimed: Vec<bool>,
+    pending_bits: Pending,
 }
 
 impl Plic {
@@ -63,6 +64,25 @@ impl Plic {
             enable: vec![vec![0; SOURCES / 32]; contexts],
             threshold: vec![0; contexts],
             claimed: vec![false; SOURCES],
+            pending_bits: Pending::new(harts),
+        }
+    }
+
+    /// Say what each hart's two contexts have to claim. The external-interrupt bit of
+    /// each privilege level of each hart is one wire out of this controller, asserted
+    /// for as long as that hart's context at that level has something to claim.
+    ///
+    /// RISC-V Platform-Level Interrupt Controller Specification, 4.
+    fn publish(&self) {
+        for hart in 0..self.threshold.len() / 2 {
+            let mut bits = 0;
+            if self.best(context(hart, false)).is_some() {
+                bits |= MEIP;
+            }
+            if self.best(context(hart, true)).is_some() {
+                bits |= SEIP;
+            }
+            self.pending_bits.set(hart, bits);
         }
     }
 
@@ -139,9 +159,11 @@ impl Plic {
 }
 
 impl Device for Plic {
+    /// A read is not always a question: claiming a source stops it being offered, so
+    /// every access here ends by saying again what the contexts have.
     fn load(&mut self, offset: u64, _size: u64) -> Result<u64, Exception> {
         let word = (offset / 4) as usize;
-        Ok(match offset {
+        let value = match offset {
             PRIORITY..PENDING => self.priority[word] as u64,
             PENDING..ENABLE => {
                 let base = (offset - PENDING) as usize / 4 * 32;
@@ -166,7 +188,9 @@ impl Device for Plic {
                     _ => return Err(Exception::LoadAccessFault(offset)),
                 }
             }
-        })
+        };
+        self.publish();
+        Ok(value)
     }
 
     fn store(&mut self, offset: u64, _size: u64, value: u64) -> Result<(), Exception> {
@@ -200,20 +224,17 @@ impl Device for Plic {
                 }
             }
         }
+        self.publish();
         Ok(())
     }
 
-    /// The external-interrupt bit of each privilege level of each hart is one wire out
-    /// of this controller, asserted for as long as that hart's context at that level
-    /// has something to claim.
-    fn interrupts(&self, hart: usize) -> u64 {
-        let mut bits = 0;
-        if self.best(context(hart, false)).is_some() {
-            bits |= MEIP;
-        }
-        if self.best(context(hart, true)).is_some() {
-            bits |= SEIP;
-        }
-        bits
+    fn pending(&self) -> Option<Pending> {
+        Some(self.pending_bits.clone())
+    }
+
+    /// What a source's wire is doing is not something an access notices, so this is
+    /// where a line that has moved since the last round reaches the contexts.
+    fn poll(&mut self) {
+        self.publish();
     }
 }

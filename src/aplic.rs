@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    device::{Device, Level, Line, Msi},
+    device::{Device, Level, Line, Msi, Pending},
     imsic::PAGE,
     trap::Exception,
 };
@@ -196,6 +196,10 @@ struct Controller {
     domains: [Domain; 2],
     /// Where a forwarded interrupt is posted.
     msi: Msi,
+    /// What the two domains are asserting at each hart, said again whenever anything
+    /// here changes. Working it out walks every source a domain has ready, once per
+    /// hart per level, which is not a thing to do before every instruction.
+    pending: Pending,
 }
 
 impl Controller {
@@ -208,6 +212,20 @@ impl Controller {
                 Domain::new(harts, crate::imsic::SUPERVISOR),
             ],
             msi,
+            pending: Pending::new(harts),
+        }
+    }
+
+    /// Say what both domains are asserting at every hart.
+    fn publish(&self) {
+        for hart in 0..self.domains[0].idc.len() {
+            let mut bits = 0;
+            for level in [Level::Machine, Level::Supervisor] {
+                if self.signalling(level, hart) {
+                    bits |= level.external();
+                }
+            }
+            self.pending.set(hart, bits);
         }
     }
 
@@ -707,11 +725,17 @@ impl Device for Region {
     /// Only aligned words are an access to this region. Anything else is reported as a
     /// fault, which is what the specification asks an implementation to prefer over
     /// ignoring it. The RISC-V Advanced Interrupt Architecture, 4.5.
+    ///
+    /// A read is not always a question here either: reading a claim register takes the
+    /// interrupt it reports, so this ends by saying again what the domains assert.
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {
         if size != 32 || !offset.is_multiple_of(4) {
             return Err(Exception::LoadAccessFault(offset));
         }
-        Ok(self.aplic.0.lock().unwrap().read(self.level, offset) as u64)
+        let mut controller = self.aplic.0.lock().unwrap();
+        let value = controller.read(self.level, offset) as u64;
+        controller.publish();
+        Ok(value)
     }
 
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception> {
@@ -723,14 +747,14 @@ impl Device for Region {
         // A write can be what makes a source ready, and a domain that forwards sends
         // its messages as soon as one is rather than waiting to be asked again.
         controller.forward();
+        controller.publish();
         Ok(())
     }
 
-    fn interrupts(&self, hart: usize) -> u64 {
-        match self.aplic.0.lock().unwrap().signalling(self.level, hart) {
-            true => self.level.external(),
-            false => 0,
-        }
+    /// Both domains publish into one word per hart, so either region names the same
+    /// one.
+    fn pending(&self) -> Option<Pending> {
+        Some(self.aplic.0.lock().unwrap().pending.clone())
     }
 
     /// Look at the wires. Both regions are the same controller, so the second look of
@@ -739,5 +763,6 @@ impl Device for Region {
         let mut controller = self.aplic.0.lock().unwrap();
         controller.sample();
         controller.forward();
+        controller.publish();
     }
 }

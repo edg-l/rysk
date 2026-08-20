@@ -6,13 +6,14 @@
 //! runs to, or what else exists.
 //!
 //! Interrupting comes in two shapes here, and neither of them names a controller: a
-//! `Line` a device holds up, and an `Msi` it posts.
+//! `Line` a device holds up, and an `Msi` it posts. What comes out the far end is a
+//! `Pending`, the word of `mip` bits a controller drives.
 
 use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -37,6 +38,49 @@ impl Line {
 
     pub fn is_raised(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// The `mip` bits an interrupt controller is asserting, one word per hart.
+///
+/// A controller publishes into this whenever its own state changes, and the bus reads
+/// it. That direction is the point: what a hart needs before every instruction is the
+/// answer, and working the answer out is a walk over sources, enables, priorities and
+/// thresholds that only a write, a message or a wire can change. Asking cost more than
+/// interpreting the instruction the question was asked about.
+///
+/// What it costs is that a controller which forgets to publish keeps asserting what it
+/// used to, so every path that changes what a hart should see ends in one of these.
+#[derive(Debug, Clone, Default)]
+pub struct Pending(Arc<[AtomicU64]>);
+
+impl Pending {
+    /// A word for each of `harts` harts, all clear.
+    pub fn new(harts: usize) -> Self {
+        Self((0..harts).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// Assert exactly `bits` at `hart`, replacing whatever this controller asserted
+    /// before. A controller owns its whole word, so it says what it is asserting
+    /// rather than adding to what is there.
+    pub fn set(&self, hart: usize, bits: u64) {
+        if let Some(word) = self.0.get(hart) {
+            word.store(bits, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(&self, hart: usize) -> u64 {
+        match self.0.get(hart) {
+            Some(word) => word.load(Ordering::Relaxed),
+            None => 0,
+        }
+    }
+
+    /// Whether these are the same word rather than two words that agree. A controller
+    /// seen at more than one address hands out the same one, and the bus has no use
+    /// for the second copy.
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -108,15 +152,15 @@ pub trait Device: std::fmt::Debug + Send {
     /// Write `size` bits at `offset` from the device's base.
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception>;
 
-    /// The bits this device is asserting in `mip` for `hart`. Only an interrupt
-    /// controller drives `mip` directly; everything else raises a line into one and
-    /// answers zero here.
+    /// The word this device drives `mip` through, if it drives `mip` at all. Only an
+    /// interrupt controller does; everything else raises a line into one and answers
+    /// nothing here.
     ///
-    /// It is asked per hart because the two controllers that answer it are per hart:
-    /// a clint has a timer and a software interrupt for each, and a plic a context for
-    /// each privilege level of each. Nothing else can tell them apart.
-    fn interrupts(&self, _hart: usize) -> u64 {
-        0
+    /// Asked once, when the device is attached, rather than per hart per instruction.
+    /// A controller seen at more than one address answers with the same word each
+    /// time, and the bus keeps one of them.
+    fn pending(&self) -> Option<Pending> {
+        None
     }
 
     /// Notice anything that has changed without an access to notice it at: a byte

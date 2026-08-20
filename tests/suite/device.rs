@@ -1,5 +1,9 @@
 use crate::common::*;
-use rysk::{device::Device, trap::Exception};
+use rysk::{
+    csr::{MEIP, MIP},
+    device::{Device, Line, Pending},
+    trap::Exception,
+};
 
 // ---------------------------------------------------------- address decode
 
@@ -106,4 +110,75 @@ fn two_devices_may_not_claim_the_same_address() {
         .device(BASE, 0x1000, fake())
         .device(BASE + 0x800, 0x1000, fake())
         .run();
+}
+
+// ------------------------------------------------------- controllers
+
+/// A device that raises its line when anything is written to it, which is what a
+/// serial port does when a byte arrives while the guest has interrupts armed.
+#[derive(Debug)]
+struct Wired(Line);
+
+impl Device for Wired {
+    fn load(&mut self, _offset: u64, _size: u64) -> Result<u64, Exception> {
+        Ok(0)
+    }
+
+    fn store(&mut self, _offset: u64, _size: u64, _value: u64) -> Result<(), Exception> {
+        self.0.set(true);
+        Ok(())
+    }
+}
+
+/// A controller with one source, asserting the machine external interrupt for as long
+/// as its line is up. Like the real ones, it publishes rather than being asked.
+#[derive(Debug)]
+struct Controller {
+    line: Line,
+    pending: Pending,
+}
+
+impl Device for Controller {
+    fn load(&mut self, _offset: u64, _size: u64) -> Result<u64, Exception> {
+        Ok(0)
+    }
+
+    fn store(&mut self, _offset: u64, _size: u64, _value: u64) -> Result<(), Exception> {
+        Ok(())
+    }
+
+    fn pending(&self) -> Option<Pending> {
+        Some(self.pending.clone())
+    }
+
+    fn poll(&mut self) {
+        self.pending
+            .set(0, if self.line.is_raised() { MEIP } else { 0 });
+    }
+}
+
+#[test]
+fn a_wire_raised_during_an_access_reaches_a_controller_attached_before_it() {
+    // The controller goes on first and the device driving its line goes on underneath,
+    // so the bus holds them the other way round: a controller found by where it was
+    // attached rather than by where it ended up is the wrong device to ask.
+    let line = Line::default();
+    let machine = prog(&[sw(ZERO, T0, 0), csrrs(A0, MIP as u32, ZERO)])
+        .reg(T0, 0x0200_0000)
+        .device(
+            0x0c00_0000,
+            0x1000,
+            Box::new(Controller {
+                line: line.clone(),
+                pending: Pending::new(1),
+            }),
+        )
+        .device(0x0200_0000, 0x1000, Box::new(Wired(line)))
+        .run();
+    assert_ne!(
+        machine.reg(A0) & MEIP,
+        0,
+        "the store raised the wire and the controller was asked before the next \
+         instruction"
+    );
 }

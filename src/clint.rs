@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crate::{
     csr::{MSIP, MTIP},
-    device::Device,
+    device::{Device, Pending},
     trap::Exception,
 };
 
@@ -50,16 +50,15 @@ pub struct Clint {
     /// clock a guest's timeouts are really measured against, not how fast rysk gets
     /// through instructions. One counter, which every deadline is compared against.
     start: Instant,
-    /// The counter as it read the last time the machine went round the harts. A
-    /// deadline is compared against this rather than against the clock, because
-    /// `interrupts` is asked before every instruction on every hart and reading a host
-    /// clock costs more than the instruction it is asked about. Software reads the
-    /// counter itself, so `mtime` and the `time` CSR stay exact and a guest's delay
-    /// loop is unaffected; what this costs is that a deadline can be noticed up to one
+    /// The counter as it read the last time the machine went round the harts, which is
+    /// what the deadlines are compared against. Software reads the counter itself, so
+    /// `mtime` and the `time` CSR stay exact and a guest's delay loop is unaffected;
+    /// what this costs is that a deadline no access goes near can be noticed up to one
     /// round late.
     sampled: u64,
     mtimecmp: Vec<u64>,
     msip: Vec<bool>,
+    pending: Pending,
 }
 
 impl Default for Clint {
@@ -79,6 +78,32 @@ impl Clint {
             // timer has already expired before firmware has had a chance to arm one.
             mtimecmp: vec![u64::MAX; harts],
             msip: vec![false; harts],
+            pending: Pending::new(harts),
+        }
+    }
+
+    /// Say what this hart's timer and software interrupt are doing now.
+    ///
+    /// The timer interrupt is a comparison, not an event: it is asserted for exactly
+    /// as long as `mtime` is at or past that hart's `mtimecmp`, and the only way to
+    /// clear it is to move that deadline.
+    ///
+    /// The RISC-V Instruction Set Manual Volume II, 3.1.9.
+    fn publish(&self, hart: usize) {
+        let mut bits = 0;
+        if self.msip[hart] {
+            bits |= MSIP;
+        }
+        if self.sampled >= self.mtimecmp[hart] {
+            bits |= MTIP;
+        }
+        self.pending.set(hart, bits);
+    }
+
+    /// Say it for every hart, which is what a clock that has moved changes.
+    fn publish_all(&self) {
+        for hart in 0..self.msip.len() {
+            self.publish(hart);
         }
     }
 
@@ -116,6 +141,7 @@ impl Device for Clint {
             // the time is exactly when it is about to arm one.
             Some(Register::Mtime) => {
                 self.sampled = self.mtime();
+                self.publish_all();
                 self.sampled
             }
             None => return Err(Exception::LoadAccessFault(offset)),
@@ -125,8 +151,14 @@ impl Device for Clint {
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception> {
         match self.decode(offset, size) {
             // Only the low bit of an msip register exists; the rest reads as zero.
-            Some(Register::Msip(hart)) => self.msip[hart] = value & 1 == 1,
-            Some(Register::Mtimecmp(hart)) => self.mtimecmp[hart] = value,
+            Some(Register::Msip(hart)) => {
+                self.msip[hart] = value & 1 == 1;
+                self.publish(hart);
+            }
+            Some(Register::Mtimecmp(hart)) => {
+                self.mtimecmp[hart] = value;
+                self.publish(hart);
+            }
             // mtime is writable, which is how a debugger or a boot rom sets the clock.
             Some(Register::Mtime) => {}
             None => return Err(Exception::StoreAmoAccessFault(offset)),
@@ -134,24 +166,14 @@ impl Device for Clint {
         Ok(())
     }
 
-    /// The timer interrupt is a comparison, not an event: it is asserted for exactly
-    /// as long as `mtime` is at or past that hart's `mtimecmp`, and the only way to
-    /// clear it is to move that deadline.
-    ///
-    /// The RISC-V Instruction Set Manual Volume II, 3.1.9.
-    fn interrupts(&self, hart: usize) -> u64 {
-        let mut bits = 0;
-        if self.msip[hart] {
-            bits |= MSIP;
-        }
-        if self.sampled >= self.mtimecmp[hart] {
-            bits |= MTIP;
-        }
-        bits
+    fn pending(&self) -> Option<Pending> {
+        Some(self.pending.clone())
     }
 
-    /// Read the clock, once for the round of harts that follows.
+    /// Read the clock, once for the round of harts that follows, and say what every
+    /// deadline makes of it.
     fn poll(&mut self) {
         self.sampled = self.mtime();
+        self.publish_all();
     }
 }
