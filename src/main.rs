@@ -2,8 +2,11 @@ use std::{env, fs::File, io::Read};
 
 use rysk::{
     bochs,
+    debug::{Session, Stop, Symbols},
     dram::DRAM_SIZE,
-    elf, htif, machine,
+    elf, htif,
+    inst::REG_NAMES,
+    machine,
     machine::{Aia, Halt, Machine, Schedule, Storage, Usb, Video},
 };
 use tracing::Level;
@@ -66,10 +69,68 @@ fn handoff(machine: &mut Machine) {
 
 /// How a run ended, for the line printed after it. A run that was asked to stop
 /// reached no trap, so there is nothing to name but the asking.
-fn describe(machine: &Machine, halt: Option<Halt>) -> String {
-    match halt {
-        Some(halt) => format!("{halt}, pc {:#x}", machine.harts[halt.hart].pc),
-        None => "asked to stop".to_owned(),
+fn describe(session: &Session, stop: &Stop) -> String {
+    match stop {
+        Stop::Halted(halt) => {
+            let pc = session.registers(halt.hart).pc;
+            format!("{halt}, pc {}", place(session, pc))
+        }
+        _ => "asked to stop".to_owned(),
+    }
+}
+
+/// An address, and what it is called if the image said. A kernel that stopped
+/// somewhere is far easier to place by the name of the function it stopped in than by
+/// the number.
+fn place(session: &Session, addr: u64) -> String {
+    match session.symbols().nearest(addr) {
+        Some((name, 0)) => format!("{addr:#x} <{name}>"),
+        Some((name, offset)) => format!("{addr:#x} <{name}+{offset:#x}>"),
+        None => format!("{addr:#x}"),
+    }
+}
+
+/// Everything a hart was left holding, which is what a run prints after it.
+///
+/// Read through the inspection surface rather than out of the hart, so that what is
+/// printed here and what a panel or a control channel would show are the same values
+/// answered by the same call.
+fn dump(session: &Session, hart: usize) {
+    let regs = session.registers(hart);
+    println!(
+        "hart {hart}: pc {}, {:?} mode, {} retired{}",
+        place(session, regs.pc),
+        regs.mode,
+        regs.instret,
+        match regs.waiting {
+            true => ", parked",
+            false => "",
+        }
+    );
+    for (which, value) in regs.x.iter().enumerate() {
+        print!("x{which:02} ({:>4}) = {value:>#18x} | ", REG_NAMES[which]);
+        if (which + 1) % 4 == 0 {
+            println!();
+        }
+    }
+    // The registers a person reads, named, and only the ones holding something: a
+    // machine that never entered supervisor mode has nothing to say about `stvec`.
+    let live: Vec<_> = session
+        .csrs(hart)
+        .into_iter()
+        .filter(|csr| csr.value != 0)
+        .collect();
+    for (index, csr) in live.iter().enumerate() {
+        print!("{:>10} = {:>#18x} | ", csr.name, csr.value);
+        if (index + 1) % 4 == 0 {
+            println!();
+        }
+    }
+    if !live.len().is_multiple_of(4) {
+        println!();
+    }
+    if let Some(taken) = session.traps(hart).first() {
+        println!("last trap: {taken}");
     }
 }
 
@@ -181,14 +242,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // An image that carries a `tohost` symbol is a test: it signals its result there
     // and then spins, so watching that address is the only way the run ends.
-    let (mut machine, tohost) = if elf::is_elf(&code) {
+    let (mut machine, tohost, symbols) = if elf::is_elf(&code) {
         let image = elf::parse(&code)?;
         (
             Machine::from_elf(&image, memory, harts)?,
             htif::tohost(&image),
+            Symbols::new(image.symbols.clone()),
         )
     } else {
-        (Machine::new(code, memory, harts), None)
+        (Machine::new(code, memory, harts), None, Symbols::default())
     };
 
     for arg in &images[1..] {
@@ -256,21 +318,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => Schedule::Threads,
     });
 
+    // The machine goes into a session for the rest of its life. Nothing here sets a
+    // breakpoint, so a run is the run it always was; what the session adds is that
+    // what is printed afterwards is read through the same surface a window's panels
+    // and a control channel read, rather than out of the harts directly.
+    let mut session = Session::with_symbols(machine, symbols);
+
     let stopped = match (tohost, gui) {
-        (Some(tohost), _) => htif::run(&mut machine, tohost, MAX_STEPS).to_string(),
+        (Some(tohost), _) => htif::run(session.machine_mut(), tohost, MAX_STEPS).to_string(),
         (None, true) => {
-            let halt = window(&mut machine, ends)?;
-            describe(&machine, halt)
+            let halt = window(session.machine_mut(), ends)?;
+            describe(&session, &halt.map_or(Stop::Paused, Stop::Halted))
         }
         (None, false) => {
-            let halt = machine.run();
-            describe(&machine, halt)
+            let stop = session.resume();
+            describe(&session, &stop)
         }
     };
 
-    for hart in &machine.harts {
-        hart.dump_registers();
-        hart.dump_csr();
+    for hart in 0..session.harts() {
+        dump(&session, hart);
     }
     // What the display was showing when it stopped. Presenting it is the frontend's
     // job and the frontend is not written yet, so this says what there was to present:

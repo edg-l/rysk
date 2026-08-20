@@ -1396,38 +1396,6 @@ impl Cpu {
             AmoOp::MaxU => d.max(s),
         }
     }
-
-    pub fn dump_registers(&self) {
-        let abi = [
-            "zero", " ra ", " sp ", " gp ", " tp ", " t0 ", " t1 ", " t2 ", " s0 ", " s1 ", " a0 ",
-            " a1 ", " a2 ", " a3 ", " a4 ", " a5 ", " a6 ", " a7 ", " s2 ", " s3 ", " s4 ", " s5 ",
-            " s6 ", " s7 ", " s8 ", " s9 ", " s10", " s11", " t3 ", " t4 ", " t5 ", " t6 ",
-        ];
-
-        for (i, r) in self.regs.iter().enumerate() {
-            print!("x{:02} ({}) = {:>#18x} | ", i, abi[i], r);
-            if (i + 1) % 4 == 0 {
-                println!()
-            }
-        }
-        println!()
-    }
-
-    pub fn dump_csr(&self) {
-        for (i, x) in self
-            .csrs
-            .iter()
-            .enumerate()
-            .filter(|x| x.1 != &0)
-            .enumerate()
-        {
-            print!("{:02} = {:>#18x} | ", x.0, x.1);
-            if (i + 1) % 4 == 0 {
-                println!()
-            }
-        }
-        println!()
-    }
 }
 
 /// What a value of `miselect` or `siselect` names. It is what decides both whether an
