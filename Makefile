@@ -102,12 +102,20 @@ bench: $(BENCHES)
 	cargo build --release
 	hyperfine -w3 -r15 -N -L prog $(BENCH_LIST) './target/release/rysk {prog}'
 
-# Same run under perf. dwarf unwinding, not fp: rust omits frame pointers and fp
-# walks garbage.
+# Same run under perf. Frame pointers are forced on rather than unwound around: rust
+# omits them by default and fp walks garbage without them, but asking for them costs a
+# register in a build nothing ships and turns a sample from an eight-kilobyte stack
+# dump into a few words, which is three orders of magnitude off the size of the
+# recording. Line tables are all the debug info a profile reads; the names come out of
+# the symbol table either way.
+#
+# It is a different binary from the one `bench` times, so it says where the time goes
+# and not how much of it there is.
 .PHONY: bench-profile
 bench-profile: bench/loop.bin
-	CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release
-	perf record --call-graph dwarf -F 999 -o bench/perf.data ./target/release/rysk $<
+	CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS='-C force-frame-pointers=yes' \
+		cargo build --release
+	perf record --call-graph fp -F 999 -o bench/perf.data ./target/release/rysk $<
 	perf report -i bench/perf.data --no-children --percent-limit 1 --stdio
 
 .PHONY: clean
