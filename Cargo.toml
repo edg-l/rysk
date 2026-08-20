@@ -5,6 +5,20 @@ edition = "2024"
 license = "AGPL-3.0-only"
 description = "A RISC-V emulator: RV64GC, privilege modes, Sv39, several harts, and a PCI bus."
 repository = "https://github.com/edg-l/rysk"
+homepage = "https://github.com/edg-l/rysk"
+readme = "README.md"
+keywords = ["riscv", "emulator", "riscv64", "rv64gc", "virtual-machine"]
+# From the crates.io list, which is fixed: an emulator of a machine, that runs an
+# operating system, and models the devices on a bus.
+categories = ["emulators", "virtualization", "hardware-support"]
+# What the window needs. `eframe` and `egui` both ask for 1.95, which is above what
+# the emulator itself wants, and the window is compiled by default; a build with
+# `--no-default-features` will go back further than this says.
+rust-version = "1.95"
+# What a published crate has no use for: the manuals `docs/reference` holds are
+# hundreds of kilobytes of text the code cites rather than reads, the benchmarks
+# are measured from a checkout, and the workflows belong to the repository.
+exclude = ["/docs/reference", "/bench", "/.github", "/Makefile"]
 
 [features]
 default = ["gui"]
