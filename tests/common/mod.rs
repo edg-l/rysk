@@ -12,7 +12,7 @@ use rysk::{
     device::{Device, Level},
     dram::DRAM_SIZE,
     imsic::Imsic,
-    machine::Machine,
+    machine::{Machine, Schedule},
     trap::Trap,
 };
 
@@ -162,6 +162,19 @@ impl Program {
                 return machine;
             }
         }
+    }
+
+    /// The same, with every hart on a host thread of its own and running at once.
+    ///
+    /// `parked` interleaves the harts as finely as one thread can, which is between
+    /// whole instructions and no finer. This is the only way a hart can be inside
+    /// another's instruction, which is what anything claiming to be atomic has to
+    /// survive, so a test of an atomic is only a test of it under this.
+    pub fn contended(self) -> Machine {
+        let mut machine = self.build();
+        machine.schedule = Schedule::Threads;
+        machine.run_until_parked();
+        machine
     }
 
     fn run_to_trap(self) -> (Machine, Trap) {

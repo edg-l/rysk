@@ -3,7 +3,7 @@ use std::{env, fs::File, io::Read};
 use rysk::{
     dram::DRAM_SIZE,
     elf, htif, machine,
-    machine::{Aia, Machine},
+    machine::{Aia, Machine, Schedule},
 };
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut memory = DRAM_SIZE;
     let mut harts = 1;
     let mut aia = Aia::default();
+    let mut schedule = None;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
     let mut at = 0;
@@ -68,6 +69,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--initrd" => ramdisk = Some(value),
             "--append" => options.bootargs = Some(value),
             "--aia" => aia = value.parse().unwrap_or_else(|why| panic!("--aia {why}")),
+            "--schedule" => {
+                schedule = Some(
+                    value
+                        .parse()
+                        .unwrap_or_else(|why| panic!("--schedule {why}")),
+                )
+            }
             _ => break,
         }
         at += 2;
@@ -77,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!(
             "Usage: rysk [-m <mebibytes>] [-smp <harts>] [--initrd <file>] \
              [--append <args>] [--aia none|aplic|aplic-imsic] \
+             [--schedule turns|threads] \
              <image> [image@address ...]"
         );
     };
@@ -142,6 +151,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while std::io::stdin().read_exact(&mut byte).is_ok() {
             keyboard.typed(&byte);
         }
+    });
+
+    // A hart each on a host thread once there is more than one hart, which is the whole
+    // of what threads are worth: one hart has nothing to run alongside. Keeping a single
+    // hart taking turns also keeps the benchmarks the one shape, since they all run
+    // `-smp 1` and would otherwise be timing a poller thread as well.
+    machine.schedule = schedule.unwrap_or(match machine.harts.len() {
+        1 => Schedule::RoundRobin,
+        _ => Schedule::Threads,
     });
 
     let stopped = match tohost {

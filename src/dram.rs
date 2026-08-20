@@ -148,9 +148,9 @@ impl Dram {
     /// What it leaves is the progress axiom (Volume I, 17.1): a hart spinning on a
     /// plain load has to see a remote store eventually, which a compiler that hoisted
     /// the load out of the interpreter's own loop would break. Nothing can hoist it
-    /// today, since the address is recomputed from guest registers through calls that
-    /// clobber memory, and a hart spinning on what another one writes is what stops
-    /// being able to see it if a later compiler ever manages it.
+    /// today, since the address is worked out afresh from guest registers through calls
+    /// that clobber memory, and `a_hart_spinning_on_a_plain_load_sees_another_hart_write`
+    /// is what stops passing, by hanging, if a later compiler ever manages it.
     #[inline]
     pub fn load(&self, addr: u64, size: u64) -> u64 {
         let index = self.offset(addr, size);

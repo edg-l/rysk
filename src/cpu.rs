@@ -1247,18 +1247,13 @@ impl Cpu {
                 let a = self.translate(bus, a, access)?;
                 match op {
                     Op::Lr { .. } => {
-                        self.regs[rd] = Self::sext(bus.load(a, bits)?, bits);
-                        bus.reserve(self.hart, a, bits);
+                        let read = bus.load(a, bits)?;
+                        self.regs[rd] = Self::sext(read, bits);
+                        bus.reserve(self.hart, a, bits, read);
                     }
                     Op::Sc { .. } => {
-                        // The store happens only if the reservation still covers these
-                        // bytes, and rd reports zero for success, nonzero for failure.
-                        self.regs[rd] = if bus.take_reservation(self.hart, a, bits) {
-                            bus.store(a, bits, b)?;
-                            0
-                        } else {
-                            1
-                        };
+                        // rd reports zero for success, nonzero for failure.
+                        self.regs[rd] = !bus.store_conditional(self.hart, a, bits, b)? as u64;
                     }
                     Op::Amo { op, .. } => {
                         // One operation rather than a load, an arithmetic and a store,

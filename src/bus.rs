@@ -84,6 +84,12 @@ pub struct Bus {
     /// of them, and making them queue behind each other here would be inventing the
     /// contention the guest is trying to resolve.
     reservations: Box<[AtomicU64]>,
+    /// And what the load-reserved read there, so a store-conditional can tell that the
+    /// bytes still hold it. The reservation alone is not enough: a store breaks it in
+    /// the instruction after writing, and a store-conditional landing in between would
+    /// find it whole. That gap is code rather than a store buffer, so it is wide enough
+    /// to hit, and this is what closes it.
+    reserved_data: Box<[AtomicU64]>,
     /// How many of them are live, so that a store which cannot break one does not look
     /// at them at all. Almost no store can: only the window between a load-reserved
     /// and its store-conditional has anything reserved.
@@ -106,6 +112,7 @@ impl Bus {
             pending: Pending::new(harts),
             controllers: Vec::new(),
             reservations: (0..harts).map(|_| AtomicU64::new(UNRESERVED)).collect(),
+            reserved_data: (0..harts).map(|_| AtomicU64::new(0)).collect(),
             reserved: AtomicUsize::new(0),
             wide: Mutex::new(()),
         }
@@ -247,22 +254,6 @@ impl Bus {
             return self.device_store(addr, size, value);
         }
         self.dram.store(addr, size, value);
-        // After the write, not before it, and that order is the whole of what makes a
-        // store-conditional safe against another hart. Breaking first leaves a window
-        // where this hart sees no reservation, another hart takes one and reads the old
-        // value, this store lands, and its store-conditional then succeeds against
-        // memory that moved under it: two harts leaving the same lock believing they
-        // hold it. Breaking afterwards closes it the other way round, since a hart that
-        // reserved early enough to miss this scan also reserved early enough that its
-        // own read came before this write.
-        //
-        // What is left is the width of a store buffer. A hart that reserves while this
-        // store is still draining is neither seen by the scan nor sees the write, and
-        // only a barrier between the two would order them, which is what a real
-        // machine's cache coherence is and is not something a store can afford per
-        // store. A store-conditional is allowed to fail when it need not; this is the
-        // far rarer converse, and it is the bargain every emulator running harts on
-        // host threads makes.
         if self.reserved.load(SeqCst) != 0 {
             self.break_reservations(addr, size);
         }
@@ -395,27 +386,60 @@ impl Bus {
     ///
     /// Published before the load it belongs to is answered, so a store about to break it
     /// either sees it here or has already written what that load is about to read.
-    pub fn reserve(&self, hart: usize, addr: u64, size: u64) {
+    pub fn reserve(&self, hart: usize, addr: u64, size: u64, read: u64) {
         debug_assert!(
             (size == 32 || size == 64) && addr.is_multiple_of(size / 8),
             "a load-reserved of {size} bits at {addr:#x}"
         );
+        self.reserved_data[hart].store(read, SeqCst);
         if self.reservations[hart].swap(reserved_word(addr, size), SeqCst) == UNRESERVED {
             self.reserved.fetch_add(1, SeqCst);
         }
     }
 
-    /// Whether a store-conditional by `hart` of `size` bits at `addr` may write. That
-    /// hart's reservation is released either way.
-    pub fn take_reservation(&self, hart: usize, addr: u64, size: u64) -> bool {
+    /// Carry out a store-conditional by `hart`: write `value` over `size` bits at
+    /// `addr` if the reservation still covers them and the bytes still hold what the
+    /// load-reserved read. Answers whether it wrote. The reservation is released either
+    /// way, which is what the instruction says happens.
+    ///
+    /// Two conditions rather than one, and the second is what makes this safe against
+    /// another hart rather than only against another turn. A store breaks reservations
+    /// in the instruction after it writes, so a store-conditional running in that gap
+    /// finds its reservation whole even though the bytes moved; comparing the bytes is
+    /// what notices. A store from another hart that wrote back the same value is the one
+    /// case the comparison cannot see, and the reservation is what sees that, which is
+    /// why both are here and neither is enough alone.
+    /// The RISC-V Instruction Set Manual Volume I, 14.2.
+    pub fn store_conditional(
+        &self,
+        hart: usize,
+        addr: u64,
+        size: u64,
+        value: u64,
+    ) -> Result<bool, Exception> {
         let written = addr..addr + size / 8;
         let word = self.reservations[hart].swap(UNRESERVED, SeqCst);
         if word == UNRESERVED {
-            return false;
+            return Ok(false);
         }
-        let reserved = reserved_bytes(word);
         self.reserved.fetch_sub(1, SeqCst);
-        reserved.start <= written.start && written.end <= reserved.end
+        let reserved = reserved_bytes(word);
+        if reserved.start > written.start || written.end > reserved.end {
+            return Ok(false);
+        }
+        let read = self.reserved_data[hart].load(SeqCst);
+        // A device is not something a reservation can be compared against, since reading
+        // it again is not the same question as reading it once. Nothing puts a lock in
+        // one, and the reservation alone is what answers for it.
+        if !self.in_dram(addr, size) {
+            self.device_store(addr, size, value)?;
+            return Ok(true);
+        }
+        if self.dram.compare_swap(addr, size, read, value) != read {
+            return Ok(false);
+        }
+        self.break_reservations(addr, size);
+        Ok(true)
     }
 
     /// Whether `size` bits at `addr` fall inside dram.

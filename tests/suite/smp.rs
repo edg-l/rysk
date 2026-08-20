@@ -220,3 +220,102 @@ fn each_hart_holds_a_reservation_of_its_own() {
         assert_eq!(machine.load(SCRATCH + hart as u64 * 8, 8), 0xcccc);
     }
 }
+
+/// How many times each hart goes round in the contended tests below. Large enough that
+/// the harts really are inside one another rather than happening to take turns, small
+/// enough that the test is not something anybody waits for.
+const ROUNDS: u64 = 20_000;
+
+/// The lock, and the counter it guards, in memory nothing else uses.
+const LOCK: u64 = SCRATCH;
+const COUNTER: u64 = SCRATCH + 8;
+
+#[test]
+fn two_harts_counting_behind_one_lock_lose_no_count() {
+    // A spinlock built the way a guest builds one, out of `lr`/`sc`, with a read, an
+    // add and a write inside it that are not atomic and do not need to be. Both harts
+    // run the same program at the same time on host threads of their own.
+    //
+    // What this is really testing is the reservation. If a store from one hart can fail
+    // to break the other's reservation, both leave the acquire believing they hold the
+    // lock, both read the same count, and the total comes out short. Taking turns
+    // cannot fail this way and so cannot test it.
+    let machine = prog(&[
+        // acquire:
+        lr_d(T4, ZERO, T1),
+        bne(T4, ZERO, -4),
+        addi(T5, ZERO, 1),
+        sc_d(T6, T5, T1),
+        bne(T6, ZERO, -16),
+        // the count, which the lock is what makes safe
+        ld(T4, T2, 0),
+        addi(T4, T4, 1),
+        sd(T4, T2, 0),
+        // release, and go round again
+        sd(ZERO, T1, 0),
+        addi(T3, T3, -1),
+        bne(T3, ZERO, -40),
+        wfi(),
+    ])
+    .harts(2)
+    .reg(T1, LOCK)
+    .reg(T2, COUNTER)
+    .reg(T3, ROUNDS)
+    .contended();
+
+    assert_eq!(
+        machine.load(COUNTER, 8),
+        2 * ROUNDS,
+        "every increment of both harts is in the total"
+    );
+    assert_eq!(machine.load(LOCK, 8), 0, "and the lock was given back");
+}
+
+#[test]
+fn two_harts_adding_atomically_lose_no_count() {
+    // The same total with no lock at all, which is the instruction on its own rather
+    // than the reservation: an `amoadd` that is a load, an add and a store instead of
+    // one indivisible operation loses every increment another hart lands inside.
+    let machine = prog(&[
+        amoadd_d(ZERO, T5, T2),
+        addi(T3, T3, -1),
+        bne(T3, ZERO, -8),
+        wfi(),
+    ])
+    .harts(2)
+    .reg(T2, COUNTER)
+    .reg(T3, ROUNDS)
+    .reg(T5, 1)
+    .contended();
+
+    assert_eq!(machine.load(COUNTER, 8), 2 * ROUNDS);
+}
+
+#[test]
+fn a_hart_spinning_on_a_plain_load_sees_another_hart_write() {
+    // The progress axiom, Volume I, 17.1: a hart spinning on an ordinary load has to
+    // see a remote store eventually. Nothing in rysk asks the host for that, since
+    // guest memory is read and written without `volatile`, so what holds it up is that
+    // the address is worked out afresh from guest registers through calls that clobber
+    // memory and the compiler cannot lift the load out of the interpreter's own loop.
+    //
+    // This test does not fail if that ever stops being true. It hangs.
+    let machine = prog(&[
+        csrrs(T0, MHARTID as u32, ZERO),
+        bne(T0, ZERO, 16),
+        // hart 0 waits for the word to change
+        ld(T4, T1, 0),
+        beq(T4, ZERO, -4),
+        wfi(),
+        // hart 1 changes it
+        sd(T5, T1, 0),
+        wfi(),
+    ])
+    .harts(2)
+    .reg(T1, SCRATCH)
+    .reg(T5, 0xd0d0)
+    .contended();
+
+    assert_eq!(machine.harts[0].regs[T4 as usize], 0xd0d0);
+    assert_eq!(machine.load(SCRATCH, 8), 0xd0d0);
+}

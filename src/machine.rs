@@ -5,7 +5,18 @@
 //! `virt` is the QEMU machine of the same name, which is where `DRAM_BASE` and every
 //! other address here comes from.
 
-use std::io;
+use std::{
+    io,
+    sync::{
+        Mutex,
+        atomic::{
+            AtomicBool, AtomicUsize,
+            Ordering::{Relaxed, SeqCst},
+        },
+    },
+    thread,
+    time::Duration,
+};
 
 use crate::{
     aplic::{self, Aplic},
@@ -215,6 +226,9 @@ impl std::fmt::Display for Halt {
 pub struct Machine {
     pub harts: Vec<Cpu>,
     pub bus: Bus,
+    /// How the harts take their turns. The machine's, not the loop's, so that a
+    /// frontend needing one run to repeat another can ask for the schedule that does.
+    pub schedule: Schedule,
     /// Instructions a hart runs before the next one gets a turn.
     ///
     /// Long enough that switching costs nothing measurable, short enough that a hart
@@ -226,6 +240,41 @@ pub struct Machine {
 
 /// The default for `Machine::quantum`.
 const QUANTUM: u64 = 4096;
+
+/// How long a hart with nothing to do waits before asking again, and how long the poller
+/// leaves between rounds. Short against anything a guest can notice: a kernel tick is
+/// milliseconds and a typed byte is tens of them, and the round-robin schedule polls
+/// about this often anyway, once every quantum times however many harts there are.
+const IDLE: Duration = Duration::from_micros(50);
+
+/// How the harts of a machine get their turns.
+///
+/// Two policies rather than one replacing the other. A hart per host thread is what
+/// makes parallel guest work parallel, and taking turns is what makes a run repeat
+/// another, which is what a frontend that records and replays needs. QEMU draws the same
+/// line, and its record and replay run on single-threaded TCG only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Schedule {
+    /// One host thread, a quantum each, in a fixed order. A switch only ever happens
+    /// between whole instructions.
+    #[default]
+    RoundRobin,
+    /// A host thread each, running at once. What the harts share is the bus, and what
+    /// orders them is the guest's own barriers and atomics rather than the schedule.
+    Threads,
+}
+
+impl std::str::FromStr for Schedule {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "turns" => Ok(Self::RoundRobin),
+            "threads" => Ok(Self::Threads),
+            _ => Err(format!("{name}: not turns or threads")),
+        }
+    }
+}
 
 impl Machine {
     /// A machine with `memory` bytes of dram and `harts` harts, running `code` placed
@@ -239,6 +288,7 @@ impl Machine {
         let mut machine = Self {
             harts: (0..harts).map(Cpu::new).collect(),
             bus: Bus::new(Dram::with_size(code, memory), harts),
+            schedule: Schedule::default(),
             quantum: QUANTUM,
         };
         for hart in &mut machine.harts {
@@ -269,12 +319,18 @@ impl Machine {
     /// Run until a trap that nothing is installed to handle, and say which hart raised
     /// it.
     ///
-    /// The harts take turns a quantum at a time. One host thread runs all of them, so
-    /// a switch only ever happens between whole instructions: an atomic is atomic
-    /// because nothing can interleave with it, rather than because anything makes it
-    /// so. The schedule itself is fixed, though a run is not yet reproducible, since
-    /// the devices still advance with the wall clock.
+    /// Which of the two schedules gives them their turns is the machine's to say.
     pub fn run(&mut self) -> Halt {
+        match self.schedule {
+            Schedule::RoundRobin => self.run_in_turn(),
+            Schedule::Threads => self.run_on_threads(),
+        }
+    }
+
+    /// The harts take turns a quantum at a time on one host thread, so a switch only
+    /// ever happens between whole instructions. The schedule itself is fixed, though a
+    /// run is not yet reproducible, since the devices still advance with the wall clock.
+    fn run_in_turn(&mut self) -> Halt {
         loop {
             self.bus.poll();
             let mut ran = false;
@@ -295,26 +351,94 @@ impl Machine {
         }
     }
 
+    /// A host thread for each hart, and one more that polls the devices, since polling
+    /// is not a question about a hart and no hart's turn is the right time to ask it.
+    ///
+    /// What the harts share is the bus, which answers all of them at once. Nothing here
+    /// orders one hart against another: the guest's `fence` and its atomics are what do
+    /// that, which is what they are for and what a real machine gives it.
+    ///
+    /// The first hart to reach a trap nothing handles stops the rest, so the machine
+    /// halts on the same thing it would have halted on taking turns, even though which
+    /// hart gets there first is no longer fixed.
+    fn run_on_threads(&mut self) -> Halt {
+        let (bus, quantum) = (&self.bus, self.quantum);
+        let stop = AtomicBool::new(false);
+        let first: Mutex<Option<Halt>> = Mutex::new(None);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Relaxed) {
+                    bus.poll();
+                    thread::sleep(IDLE);
+                }
+            });
+            for (hart, cpu) in self.harts.iter_mut().enumerate() {
+                let (stop, first) = (&stop, &first);
+                scope.spawn(move || {
+                    while !stop.load(Relaxed) {
+                        // A parked hart waits rather than spinning. Only a device or
+                        // another hart can change what it will do next, and both of
+                        // them end in the word `ready` looks at.
+                        if !ready(cpu, bus) {
+                            thread::park_timeout(IDLE);
+                            continue;
+                        }
+                        if let Some(halt) = run_quantum(cpu, bus, quantum, hart) {
+                            let mut held = first.lock().unwrap_or_else(|h| h.into_inner());
+                            held.get_or_insert(halt);
+                            stop.store(true, SeqCst);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        first
+            .into_inner()
+            .unwrap_or_else(|h| h.into_inner())
+            .expect("a hart stopped the machine")
+    }
+
+    /// Run every hart on a host thread of its own until all of them have parked.
+    ///
+    /// The threaded answer to the same question `step` in a row answers: a program with
+    /// more than one hart says it is finished by waiting rather than by running off the
+    /// end into a trap, which would stop the machine before the others had finished.
+    pub fn run_until_parked(&mut self) {
+        let (bus, quantum) = (&self.bus, self.quantum);
+        let left = AtomicUsize::new(self.harts.len());
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while left.load(Relaxed) > 0 {
+                    bus.poll();
+                    thread::sleep(IDLE);
+                }
+            });
+            for (hart, cpu) in self.harts.iter_mut().enumerate() {
+                let left = &left;
+                scope.spawn(move || {
+                    while ready(cpu, bus) {
+                        if let Some(halt) = run_quantum(cpu, bus, quantum, hart) {
+                            panic!(
+                                "hart {hart} stopped on {} at {:#x} instead of parking",
+                                halt.trap, cpu.pc
+                            );
+                        }
+                    }
+                    left.fetch_sub(1, Relaxed);
+                });
+            }
+        });
+    }
+
     /// Run one hart, which has to be one that may run, for up to `steps` instructions,
     /// stopping early if it parks on a `wfi`. Answers the trap that nothing handled,
     /// if that is how it stopped.
     fn run_hart(&mut self, hart: usize, steps: u64) -> Option<Halt> {
-        let cpu = &mut self.harts[hart];
-        let bus = &self.bus;
-        let mut left = steps;
-        while left > 0 {
-            match tick(cpu, bus, left) {
-                // A round that retired nothing still took one of the quantum: it
-                // entered a handler, and a hart that did nothing else would otherwise
-                // never give the others their turn.
-                Ok(retired) => left -= retired.max(1),
-                Err(trap) => return Some(Halt { hart, trap }),
-            }
-            if cpu.waiting {
-                break;
-            }
-        }
-        None
+        run_quantum(&mut self.harts[hart], &self.bus, steps, hart)
     }
 
     /// Run a single instruction on one hart, for a caller that needs to look at the
@@ -334,6 +458,25 @@ impl Machine {
         }
         tick(&mut self.harts[hart], &self.bus, max)
     }
+}
+
+/// Run `cpu` for up to `quantum` instructions, stopping early if it parks. Answers the
+/// trap nothing was installed to take, if that is how it stopped.
+fn run_quantum(cpu: &mut Cpu, bus: &Bus, quantum: u64, hart: usize) -> Option<Halt> {
+    let mut left = quantum;
+    while left > 0 {
+        match tick(cpu, bus, left) {
+            // A round that retired nothing still took one of the quantum: it entered a
+            // handler, and a hart that did nothing else would otherwise never give the
+            // others their turn.
+            Ok(retired) => left -= retired.max(1),
+            Err(trap) => return Some(Halt { hart, trap }),
+        }
+        if cpu.waiting {
+            break;
+        }
+    }
+    None
 }
 
 /// Whether a hart may execute at all. A parked one may once something it has enabled
