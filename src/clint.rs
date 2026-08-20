@@ -166,8 +166,12 @@ impl Device for Clint {
         Ok(())
     }
 
-    fn pending(&self) -> Option<Pending> {
-        Some(self.pending.clone())
+    /// A clint owns the software and timer interrupts of every hart it has, and
+    /// nothing else on the machine drives those.
+    fn wire(&mut self, pending: &Pending) -> bool {
+        self.pending = pending.owning(MSIP | MTIP);
+        self.publish_all();
+        true
     }
 
     /// Read the clock, once for the round of harts that follows, and say what every

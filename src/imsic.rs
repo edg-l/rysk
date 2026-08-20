@@ -19,6 +19,7 @@ use std::{
 };
 
 use crate::{
+    csr::{MEIP, SEIP},
     device::{Device, Level, Pending},
     trap::Exception,
 };
@@ -182,22 +183,46 @@ impl File {
 /// Held behind a lock because two things reach them: the hart, through its CSRs, and
 /// the page a message is written to, which is a device on the bus. They are the same
 /// registers seen from both sides, so they cannot be two copies.
-#[derive(Debug, Clone)]
-pub struct Imsic {
-    files: Arc<Mutex<Vec<[File; 2]>>>,
+#[derive(Debug)]
+struct State {
+    files: Vec<[File; 2]>,
     /// What the files are asserting at their harts, kept up to date by every path that
     /// changes one. Reading it is what a hart does before an instruction; taking the
     /// lock and asking each file was what it used to do, and that cost more than the
     /// instruction.
+    ///
+    /// It is in here rather than beside the lock because the machine hands the handle
+    /// out once, to whichever clone the bus was given, and every other clone has to see
+    /// it: the hart reaching its own files through CSRs is one of them.
     pending: Pending,
 }
+
+#[derive(Debug, Clone)]
+pub struct Imsic(Arc<Mutex<State>>);
 
 impl Imsic {
     /// An IMSIC for each of `harts` harts.
     pub fn new(harts: usize) -> Self {
-        Self {
-            files: Arc::new(Mutex::new(vec![Default::default(); harts])),
-            pending: Pending::new(harts),
+        Self(Arc::new(Mutex::new(State {
+            files: vec![Default::default(); harts],
+            pending: Pending::default(),
+        })))
+    }
+
+    /// Take the word this machine's controllers drive `mip` through. Where a hart has
+    /// interrupt files, they are what reaches it, so both external interrupts are
+    /// theirs and the APLIC in front of them drives no wires.
+    fn wire(&self, pending: &Pending) {
+        let mut inner = self.0.lock().unwrap();
+        inner.pending = pending.owning(MEIP | SEIP);
+        // A handle taken says what the files are asserting already, which is not
+        // always nothing: what a machine is built holding is as real as what arrives.
+        for hart in 0..inner.files.len() {
+            let bits = [Level::Machine, Level::Supervisor]
+                .into_iter()
+                .filter(|at| inner.files[hart][*at as usize].signalling())
+                .fold(0, |bits, at| bits | at.external());
+            inner.pending.set(hart, bits);
         }
     }
 
@@ -225,16 +250,16 @@ impl Imsic {
 
     /// Look at one file without changing it.
     fn peek<T>(&self, hart: usize, level: Level, f: impl FnOnce(&File) -> T) -> Option<T> {
-        let files = self.files.lock().unwrap();
-        Some(f(&files.get(hart)?[level as usize]))
+        let inner = self.0.lock().unwrap();
+        Some(f(&inner.files.get(hart)?[level as usize]))
     }
 
     /// Change one file, and say afterwards what that hart's two files are asserting.
     /// Every path that can change what a hart should see goes through here, which is
     /// what keeps the published word true.
     fn with<T>(&self, hart: usize, level: Level, f: impl FnOnce(&mut File) -> T) -> Option<T> {
-        let mut files = self.files.lock().unwrap();
-        let file = files.get_mut(hart)?;
+        let mut inner = self.0.lock().unwrap();
+        let file = inner.files.get_mut(hart)?;
         let answer = f(&mut file[level as usize]);
         let mut bits = 0;
         for at in [Level::Machine, Level::Supervisor] {
@@ -242,7 +267,7 @@ impl Imsic {
                 bits |= at.external();
             }
         }
-        self.pending.set(hart, bits);
+        inner.pending.set(hart, bits);
         Some(answer)
     }
 
@@ -326,9 +351,8 @@ impl Device for Files {
         Ok(())
     }
 
-    /// Both levels' files publish into one word per hart, so either set of pages
-    /// names the same one.
-    fn pending(&self) -> Option<Pending> {
-        Some(self.imsic.pending.clone())
+    fn wire(&mut self, pending: &Pending) -> bool {
+        self.imsic.wire(pending);
+        true
     }
 }

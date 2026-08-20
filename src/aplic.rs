@@ -17,6 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
+    csr::{MEIP, SEIP},
     device::{Device, Level, Line, Msi, Pending},
     imsic::PAGE,
     trap::Exception,
@@ -761,10 +762,18 @@ impl Device for Region {
         Ok(())
     }
 
-    /// Both domains publish into one word per hart, so either region names the same
-    /// one.
-    fn pending(&self) -> Option<Pending> {
-        Some(self.aplic.0.lock().unwrap().pending.clone())
+    /// Both domains publish into one word per hart, so either region takes the same
+    /// handle. What that handle owns is nothing at all when this controller forwards:
+    /// the interrupts then arrive at an interrupt file, which owns those bits instead.
+    fn wire(&mut self, pending: &Pending) -> bool {
+        let mut controller = self.aplic.0.lock().unwrap();
+        let owns = match controller.domain(Level::Machine).forwards {
+            true => 0,
+            false => MEIP | SEIP,
+        };
+        controller.pending = pending.owning(owns);
+        controller.publish();
+        true
     }
 
     /// Look at the wires. Both regions are the same controller, so the second look of

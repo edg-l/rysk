@@ -41,7 +41,7 @@ impl Line {
     }
 }
 
-/// The `mip` bits an interrupt controller is asserting, one word per hart.
+/// The `mip` bits the interrupt controllers are asserting, one word per hart.
 ///
 /// A controller publishes into this whenever its own state changes, and the bus reads
 /// it. That direction is the point: what a hart needs before every instruction is the
@@ -49,38 +49,58 @@ impl Line {
 /// thresholds that only a write, a message or a wire can change. Asking cost more than
 /// interpreting the instruction the question was asked about.
 ///
+/// There is one word rather than one per controller, so the question is one load from
+/// one cache line however many controllers a machine has. What keeps them out of each
+/// other's way is that a handle carries the mask of bits its holder owns, and a machine
+/// gives no two controllers the same bit: a clint owns the software and timer
+/// interrupts, and whichever of the plic, the aplic and the imsic is the one reaching
+/// its harts owns the external ones.
+///
 /// What it costs is that a controller which forgets to publish keeps asserting what it
 /// used to, so every path that changes what a hart should see ends in one of these.
 #[derive(Debug, Clone, Default)]
-pub struct Pending(Arc<[AtomicU64]>);
+pub struct Pending {
+    words: Arc<[AtomicU64]>,
+    /// The bits this handle may write. The word the bus reads is every controller's
+    /// bits together, so a handle can only ever say something about its own.
+    mask: u64,
+}
 
 impl Pending {
-    /// A word for each of `harts` harts, all clear.
+    /// A word for each of `harts` harts, all clear, owned by nobody yet.
     pub fn new(harts: usize) -> Self {
-        Self((0..harts).map(|_| AtomicU64::new(0)).collect())
-    }
-
-    /// Assert exactly `bits` at `hart`, replacing whatever this controller asserted
-    /// before. A controller owns its whole word, so it says what it is asserting
-    /// rather than adding to what is there.
-    pub fn set(&self, hart: usize, bits: u64) {
-        if let Some(word) = self.0.get(hart) {
-            word.store(bits, Ordering::Relaxed);
+        Self {
+            words: (0..harts).map(|_| AtomicU64::new(0)).collect(),
+            mask: 0,
         }
     }
 
+    /// The same words, as the handle of a controller that owns `mask`.
+    pub fn owning(&self, mask: u64) -> Self {
+        Self {
+            words: self.words.clone(),
+            mask,
+        }
+    }
+
+    /// Assert exactly `bits` of what this handle owns at `hart`, replacing whatever it
+    /// asserted before and leaving every other controller's bits alone.
+    pub fn set(&self, hart: usize, bits: u64) {
+        if let Some(word) = self.words.get(hart) {
+            let mine = bits & self.mask;
+            let _ = word.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some((current & !self.mask) | mine)
+            });
+        }
+    }
+
+    /// Everything every controller is asserting at `hart`.
+    #[inline]
     pub fn get(&self, hart: usize) -> u64 {
-        match self.0.get(hart) {
+        match self.words.get(hart) {
             Some(word) => word.load(Ordering::Relaxed),
             None => 0,
         }
-    }
-
-    /// Whether these are the same word rather than two words that agree. A controller
-    /// seen at more than one address hands out the same one, and the bus has no use
-    /// for the second copy.
-    pub fn is(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -159,15 +179,16 @@ pub trait Device: std::fmt::Debug + Send {
     /// Write `size` bits at `offset` from the device's base.
     fn store(&mut self, offset: u64, size: u64, value: u64) -> Result<(), Exception>;
 
-    /// The word this device drives `mip` through, if it drives `mip` at all. Only an
-    /// interrupt controller does; everything else raises a line into one and answers
-    /// nothing here.
+    /// Take a handle on the word this machine's controllers drive `mip` through, and
+    /// say whether this device is one of them. A device that is not ignores the word
+    /// and answers no; everything it has to say about interrupts it says by raising a
+    /// line into a controller.
     ///
     /// Asked once, when the device is attached, rather than per hart per instruction.
-    /// A controller seen at more than one address answers with the same word each
-    /// time, and the bus keeps one of them.
-    fn pending(&self) -> Option<Pending> {
-        None
+    /// A controller seen at more than one address is asked once per address and takes
+    /// a handle each time, which is the same word both times.
+    fn wire(&mut self, _pending: &Pending) -> bool {
+        false
     }
 
     /// Notice anything that has changed without an access to notice it at: a byte

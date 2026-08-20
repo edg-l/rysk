@@ -228,8 +228,12 @@ impl Device for Plic {
         Ok(())
     }
 
-    fn pending(&self) -> Option<Pending> {
-        Some(self.pending_bits.clone())
+    /// A plic owns both external interrupts of every hart. It is a machine's one
+    /// external controller, so nothing else on that machine drives them.
+    fn wire(&mut self, pending: &Pending) -> bool {
+        self.pending_bits = pending.owning(MEIP | SEIP);
+        self.publish();
+        true
     }
 
     /// What a source's wire is doing is not something an access notices, so this is

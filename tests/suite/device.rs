@@ -147,8 +147,9 @@ impl Device for Controller {
         Ok(())
     }
 
-    fn pending(&self) -> Option<Pending> {
-        Some(self.pending.clone())
+    fn wire(&mut self, pending: &Pending) -> bool {
+        self.pending = pending.owning(MEIP);
+        true
     }
 
     fn poll(&mut self) {
@@ -170,7 +171,7 @@ fn a_wire_raised_during_an_access_reaches_a_controller_attached_before_it() {
             0x1000,
             Box::new(Controller {
                 line: line.clone(),
-                pending: Pending::new(1),
+                pending: Pending::default(),
             }),
         )
         .device(0x0200_0000, 0x1000, Box::new(Wired(line)))

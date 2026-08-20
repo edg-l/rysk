@@ -23,11 +23,10 @@ pub struct Bus {
     /// Every device, sorted by base address and never overlapping, so an address
     /// decodes by binary search.
     devices: Vec<(Range<u64>, Box<dyn Device>)>,
-    /// The words the interrupt controllers drive `mip` through, collected as they were
-    /// attached. There are a handful of these and ten or so devices, so what a hart
-    /// asks before every instruction is a fold over the things that can answer rather
-    /// than over everything on the bus.
-    pending: Vec<Pending>,
+    /// The word the interrupt controllers drive `mip` through, one per hart. What a
+    /// hart asks before every instruction is one load from it, however many controllers
+    /// the machine has and however many devices are on the bus.
+    pending: Pending,
     /// Where in `devices` the interrupt controllers are. A wire moves when the device
     /// driving it is accessed, which is an access the controller on the other end
     /// never sees, so the controllers are asked to look again after every access that
@@ -53,7 +52,7 @@ impl Bus {
         Self {
             dram,
             devices: Vec::new(),
-            pending: Vec::new(),
+            pending: Pending::new(harts),
             controllers: Vec::new(),
             reservations: vec![None; harts],
             reserved: 0,
@@ -62,7 +61,7 @@ impl Bus {
 
     /// Place `device` so it answers for `size` bytes from `base`. Two devices may not
     /// claim the same address, and a machine that says they do is built wrong.
-    pub fn attach(&mut self, base: u64, size: u64, device: Box<dyn Device>) {
+    pub fn attach(&mut self, base: u64, size: u64, mut device: Box<dyn Device>) {
         let range = base..base + size;
         // Dram is answered before the devices are searched, so a device underneath it
         // would never be reached. That is a machine built wrong rather than a device
@@ -86,20 +85,16 @@ impl Bus {
                     .is_some_and(clashes),
             "a device already answers for {range:#x?}"
         );
-        // A controller says once, here, which word it drives `mip` through. One seen
-        // at two addresses names the same word both times and is kept once, though
-        // both regions are still asked to look again, since either can be the half
-        // that has something to say.
         // Inserting ahead of a controller moves it along one.
         for controller in &mut self.controllers {
             if *controller >= at {
                 *controller += 1;
             }
         }
-        if let Some(pending) = device.pending() {
-            if !self.pending.iter().any(|kept| kept.is(&pending)) {
-                self.pending.push(pending);
-            }
+        // A controller takes its handle on the word it drives `mip` through once, here.
+        // One seen at two addresses takes one per address and is looked at through
+        // both, since either can be the half with something to say.
+        if device.wire(&self.pending) {
             self.controllers.push(at);
         }
         self.devices.insert(at, (range, device));
@@ -149,9 +144,7 @@ impl Bus {
     /// The bits the controllers are asserting in `hart`'s `mip`, together.
     #[inline]
     pub fn interrupts(&self, hart: usize) -> u64 {
-        self.pending
-            .iter()
-            .fold(0, |bits, pending| bits | pending.get(hart))
+        self.pending.get(hart)
     }
 
     /// Read `size` bits at `addr`.
