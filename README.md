@@ -29,12 +29,12 @@ disagree. Nothing about the guest is special-cased: it enumerates a PCI bus,
 walks page tables, takes interrupts and starts its other harts the way it would
 on a board.
 
-| | |
+| set | what it covers |
 |---|---|
 | **RV64I** | the base integer set, with `fence` as the no-op it is on one in-order hart and `fence.i` emptying the decoded instructions |
 | **RV64M** | `mul`, `div`, `rem` and their unsigned and `W` forms |
 | **RV64A** | `lr`/`sc` against a reservation per hart, and the atomic memory operations |
-| **RV64FD** | single and double floating point, done in integers rather than handed to the host, because no host rounds the five ways this machine can |
+| **RV64FD** | single and double floating point, done in integers because no host rounds the five ways this machine can, with the arithmetic the host reaches the same way handed to it |
 | **RV64C** | the compressed instructions, expanded into what their 32-bit form would decode to |
 | **Zicsr, Zicntr** | the CSR instructions, and `cycle`, `time` and `instret` |
 | **Zicond, Zacas, Zabha, Zawrs** | conditional zeroing, compare-and-swap up to a quadword, byte and halfword atomics, and the two wait-on-reservation hints |
@@ -175,9 +175,9 @@ src/
   cpu.rs       one hart: its state, trap entry and return, and execute
   csr.rs       control and status register numbers, and the mstatus layout
   trap.rs      the cause numbers of both kinds of trap, and the mtval each owes
-  fpu.rs       IEEE arithmetic in integers, because rounding is the point
+  fpu.rs       IEEE arithmetic in integers, and the host where it agrees
   mmu.rs       Sv39: the walk, the permission rules, and the cache in front
-  icache.rs    the instructions already decoded, by the address they came from
+  block.rs     the decoded instructions, as the straight-line runs they were decoded as
   machine.rs   what a machine is made of, and the loop that gives each hart a turn
   bus.rs       address decode: dram, then a binary search over the devices
   device.rs    the Device trait, and the Line and Msi a device raises
@@ -188,7 +188,7 @@ src/
   pci.rs       a root complex: config space, the windows, INTx and MSI-X
   uart.rs      a 16550
   fdt.rs       the device tree, built from the same table that builds the bus
-  dram.rs      a Vec<u8> behind sized load and store helpers
+  dram.rs      the bytes every hart shares, behind sized load and store helpers
   elf.rs       enough ELF64 to place an image and find its symbols
   htif.rs      how the riscv-tests corpus reports pass or fail
   main.rs      argv, tracing, run, dump
@@ -198,6 +198,7 @@ tests/
   common/      an assembler and a harness to run what it emits
   compliance.rs  the official riscv-tests corpus
   devicetree.rs  the tree rysk builds, read back
+  softfloat.rs   the float arithmetic, held against the host's
 ```
 
 Each file has one job. Decoding is separate from execution, so `Op` is a small
@@ -210,7 +211,7 @@ argument, which is what lets several harts share one address space.
 
 Working, and not finished. What is missing, roughly in the order it matters:
 
-| | |
+| missing | where it stands |
 |---|---|
 | **Real devices** | nothing is plugged into the PCI bus yet, so BAR routing and MSI-X are proven by test functions rather than by a driver. A display, xHCI with a USB keyboard, and NVMe are next |
 | **A window** | the machine has no frontend: output goes to stdout and the terminal is still line buffered, so typing at a guest shell arrives a line at a time |
