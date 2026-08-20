@@ -18,7 +18,9 @@ use std::{
 };
 
 use crate::{
+    bus::DRAM_BASE,
     csr::{MEIP, SEIP},
+    dram::Dram,
     trap::Exception,
 };
 
@@ -196,4 +198,68 @@ pub trait Device: std::fmt::Debug + Send {
     /// advances. Asked once every time round the harts rather than per hart, because
     /// it is not a question about a hart and there is no reason to ask it many times.
     fn poll(&mut self) {}
+}
+
+/// The guest memory a bus-mastering device transfers to and from.
+///
+/// A device holding one reaches memory without going back through the bus that is
+/// holding it, which is the same bargain `Msi` makes and for the same reason: the thing
+/// doing the transfer is itself being accessed, and an access cannot wait on the access
+/// it is inside.
+///
+/// What it reaches is memory and nothing else. A descriptor pointing at another
+/// device's window reaches nothing rather than that device, which is a guest asking for
+/// peer-to-peer traffic on a machine that has no path for it, and a transfer that runs
+/// off the end of memory does not happen rather than happening somewhere else.
+///
+/// It does not break a hart's reservation, which real coherence would. What that leaves
+/// is the case a store-conditional's data comparison cannot see either: a transfer that
+/// wrote back the byte that was already there. Anything that changed a reserved word is
+/// caught by the comparison in `Bus::store_conditional`.
+#[derive(Debug, Clone, Default)]
+pub struct Dma(Option<Arc<Dram>>);
+
+impl Dma {
+    pub fn new(memory: Arc<Dram>) -> Self {
+        Self(Some(memory))
+    }
+
+    /// Whether all `len` bytes at `addr` are memory this can reach.
+    fn holds(&self, addr: u64, len: usize) -> Option<&Dram> {
+        let memory = self.0.as_deref()?;
+        let end = addr.checked_add(len as u64)?;
+        (DRAM_BASE <= addr && end <= DRAM_BASE + memory.size()).then_some(memory)
+    }
+
+    /// Fill `into` from `addr`. Answers whether the whole of it was memory; a transfer
+    /// that was not leaves `into` as it found it.
+    pub fn read(&self, addr: u64, into: &mut [u8]) -> bool {
+        let Some(memory) = self.holds(addr, into.len()) else {
+            return false;
+        };
+        let at = (addr - DRAM_BASE) as usize;
+        into.copy_from_slice(&unsafe { memory.as_slice() }[at..at + into.len()]);
+        true
+    }
+
+    /// Put `from` at `addr`, with the same answer.
+    pub fn write(&self, addr: u64, from: &[u8]) -> bool {
+        match self.holds(addr, from.len()) {
+            Some(memory) => memory.write(addr, from, 0),
+            None => false,
+        }
+    }
+
+    /// The `size` bits at `addr`, which is how a descriptor's fields are read.
+    pub fn load(&self, addr: u64, size: u64) -> Option<u64> {
+        let mut bytes = [0u8; 8];
+        let len = (size / 8) as usize;
+        self.read(addr, &mut bytes[..len])
+            .then(|| u64::from_le_bytes(bytes))
+    }
+
+    /// And how one is written back.
+    pub fn store(&self, addr: u64, size: u64, value: u64) -> bool {
+        self.write(addr, &value.to_le_bytes()[..(size / 8) as usize])
+    }
 }

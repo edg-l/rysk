@@ -122,9 +122,12 @@ const fn pending_bytes(vectors: usize) -> u64 {
 /// `command`'s memory space enable: a base address register answers for nothing until
 /// software has said it may. PCI Local Bus Specification 3.0, 6.2.2.
 const COMMAND_MEMORY: u16 = 1 << 1;
+/// The bit software sets to say a function may not use a wire, which is what it does to
+/// one it has given messages to instead. PCI Local Bus Specification 3.0, 6.2.2.
+const COMMAND_INTX_DISABLE: u16 = 1 << 10;
 /// The bits of `command` that are ours to keep. The rest are for capabilities and bus
 /// behaviours this root complex does not have.
-const COMMAND_MASK: u16 = COMMAND_MEMORY | (1 << 0) | (1 << 2) | (1 << 10);
+const COMMAND_MASK: u16 = COMMAND_MEMORY | (1 << 0) | (1 << 2) | COMMAND_INTX_DISABLE;
 
 /// `status`, which is read-only here and says only whether there is a capability list
 /// to follow. PCI Local Bus Specification 3.0, 6.2.3.
@@ -217,6 +220,25 @@ impl Default for Header {
     }
 }
 
+/// What a function is asserting, which the root complex is what delivers.
+///
+/// A function cannot raise its own interrupt. It is being accessed when it decides to,
+/// and the root complex holding it is what would have to send the message or move the
+/// wire, so it says what it wants instead and the complex does it the moment the access
+/// is over. That is the same shape a device on the bus already has, where a line moved
+/// inside an access is seen by the controller after it.
+///
+/// The wire is a level and the messages are edges, which is what the two kinds of
+/// interrupt are: a function holds its pin up until whatever it is reporting has been
+/// dealt with, and sends a message once per thing there is to report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Asserted {
+    /// Whether it is pulling its pin.
+    pub pin: bool,
+    /// One bit per vector it wants a message sent for, taken and cleared.
+    pub messages: u64,
+}
+
 /// A function on the bus: what it is, and what its windows answer.
 ///
 /// It never learns where its windows were put. An access arrives as the register it
@@ -229,6 +251,26 @@ pub trait Function: std::fmt::Debug + Send {
     fn load(&mut self, bar: usize, offset: u64, size: u64) -> Result<u64, Exception>;
 
     fn store(&mut self, bar: usize, offset: u64, size: u64, value: u64) -> Result<(), Exception>;
+
+    /// Notice whatever arrived without an access to notice it at: a key that was typed
+    /// into a device this function drives. Asked once every time round, the way a
+    /// device on the bus is, and through the same call: config space is polled and it
+    /// polls what is below it.
+    fn poll(&mut self) {}
+
+    /// What it is asserting, taken. Asked after anything that could have changed it,
+    /// which is an access to it and a poll of it.
+    ///
+    /// `messaging` is whether this function's message-signalled interrupts are turned
+    /// on, which is the one thing about its own configuration a function is told.
+    /// Everything else about the capability is storage the complex keeps on its behalf,
+    /// but this changes what the function itself does: a function sending messages does
+    /// not pull its pin, and a register whose pending bit software clears when a wire
+    /// carries the interrupt is one the function clears itself when a message does,
+    /// since software never sees the message go.
+    fn asserted(&mut self, _messaging: bool) -> Asserted {
+        Asserted::default()
+    }
 }
 
 /// One device number's worth of bus: the function there, and what software has
@@ -251,6 +293,9 @@ struct Slot {
     /// second in the high half. Nothing here reads them: payload sizes and error
     /// reporting describe a link, and there is no link below a root complex's own bus.
     express_control: u32,
+    /// Whether the function is pulling its pin, which is what the wire it is swizzled
+    /// onto is the union of.
+    pin: bool,
     /// One entry per vector, four words each, and a bit per vector for the ones that
     /// were raised while masked.
     vectors: Vec<[u32; 4]>,
@@ -402,6 +447,66 @@ impl Complex {
         self.msi.send(address, entry[VECTOR_DATA]);
     }
 
+    /// Take what the function at `device` is asserting and do it: send the messages it
+    /// wants sent, and let its pin move the wire it is swizzled onto.
+    fn deliver(&mut self, device: usize) {
+        let Some(slot) = self.slots.get_mut(device).and_then(Option::as_mut) else {
+            return;
+        };
+        let messaging = slot.msix_control & MSIX_ENABLE != 0;
+        let asserted = slot.function.asserted(messaging);
+        slot.pin = asserted.pin;
+        for vector in 0..u64::BITS as usize {
+            if asserted.messages & (1 << vector) != 0 {
+                self.message(device, vector);
+            }
+        }
+        self.wires();
+    }
+
+    /// Drive each of the four wires with what everything on it is asserting together.
+    ///
+    /// A wire is shared: four functions are swizzled onto each of them, and a wire is
+    /// up while any of them is pulling. Working it out from all of them rather than
+    /// letting the last one to change write it is what stops one function lowering
+    /// another's interrupt.
+    ///
+    /// A function software has told not to use a wire does not, whatever it says it is
+    /// asserting. PCI Local Bus Specification 3.0, 6.2.2.
+    fn wires(&self) {
+        let mut raised = [false; PINS];
+        for (device, slot) in self.slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            if slot.command & COMMAND_INTX_DISABLE != 0 {
+                continue;
+            }
+            if slot.pin && slot.header.pin != 0 {
+                raised[swizzle(device, slot.header.pin)] = true;
+            }
+        }
+        for (line, raised) in self.lines.iter().zip(raised) {
+            line.set(raised);
+        }
+    }
+
+    /// Let every function notice what arrived with no access to notice it at.
+    fn poll(&mut self) {
+        for device in 0..self.slots.len() {
+            if let Some(slot) = self.slots[device].as_mut() {
+                slot.function.poll();
+                let messaging = slot.msix_control & MSIX_ENABLE != 0;
+                let asserted = slot.function.asserted(messaging);
+                slot.pin = asserted.pin;
+                for vector in 0..u64::BITS as usize {
+                    if asserted.messages & (1 << vector) != 0 {
+                        self.message(device, vector);
+                    }
+                }
+            }
+        }
+        self.wires();
+    }
+
     /// Send whatever a function was holding because it was masked, which is what
     /// unmasking either the function or one of its vectors has to do.
     fn release(&mut self, device: usize) {
@@ -467,6 +572,7 @@ impl Complex {
             interrupt_line: 0,
             msix_control: 0,
             express_control: EXPRESS_DEVCTL_RESET,
+            pin: false,
             // A vector starts masked, which is what stops a function interrupting
             // before software has said where to send it.
             // PCI Local Bus Specification 3.0, 6.8.2.9.
@@ -562,7 +668,11 @@ impl Complex {
         };
         let merge = |old: u32| (old & !mask) | (value & mask);
         match reg {
-            COMMAND => slot.command = merge(slot.command as u32) as u16 & COMMAND_MASK,
+            COMMAND => {
+                slot.command = merge(slot.command as u32) as u16 & COMMAND_MASK;
+                // Whether a function may use a wire is one of the bits just written.
+                self.wires();
+            }
             _ if reg >= HEADER_END => {
                 let Some((capability, at, _)) = in_capability(&slot.header, reg) else {
                     return;
@@ -573,6 +683,9 @@ impl Complex {
                     (Capability::MsiX, MSIX_CONTROL) => {
                         slot.msix_control = merge(slot.msix_control) & MSIX_WRITABLE;
                         self.release(device);
+                        // Turning messages on takes the function's wire away and turning
+                        // them off gives it back, so what it is asserting is asked again.
+                        self.deliver(device);
                     }
                     // Device control is storage but for the bit that would start a
                     // reset this root complex does not offer, and device status above
@@ -685,12 +798,6 @@ impl Root {
         self.0.lock().unwrap().plug(device, function);
     }
 
-    /// Raise or lower the wire `device`'s pin is swizzled onto.
-    pub fn interrupt(&self, device: usize, pin: u8, raised: bool) {
-        let complex = self.0.lock().unwrap();
-        complex.lines[swizzle(device, pin)].set(raised);
-    }
-
     /// Raise vector `vector` of the function at `device`, which is what a function
     /// that sends messages does instead of pulling a wire.
     pub fn message(&self, device: usize, vector: usize) {
@@ -762,6 +869,14 @@ impl Device for Ecam {
         );
         Ok(())
     }
+
+    /// The complex is polled through config space rather than through one of the
+    /// windows, since config space is the one address the complex itself is at and the
+    /// windows are addresses it routes. Polling it through all three would ask every
+    /// function three times a round.
+    fn poll(&mut self) {
+        self.0.0.lock().unwrap().poll();
+    }
 }
 
 /// One of the windows, which answers for whichever function's base address register
@@ -788,7 +903,13 @@ impl Device for Window {
         match slot.msix(bar, at, size) {
             Some(Region::Table(vector, word)) => Ok(read(&slot.vectors[vector], word, size)),
             Some(Region::Pending(byte)) => Ok(blocked(&slot.blocked, byte, size)),
-            None => slot.function.load(bar, at, size),
+            None => {
+                // A read of a register can be what makes a function stop interrupting,
+                // so what it is asserting is taken afterwards and not only after a write.
+                let answer = slot.function.load(bar, at, size);
+                complex.deliver(device);
+                answer
+            }
         }
     }
 
@@ -808,7 +929,11 @@ impl Device for Window {
             }
             // Which vectors are waiting is the root complex's to say, not software's.
             Some(Region::Pending(_)) => Ok(()),
-            None => slot.function.store(bar, at, size, value),
+            None => {
+                let answer = slot.function.store(bar, at, size, value);
+                complex.deliver(device);
+                answer
+            }
         }
     }
 }

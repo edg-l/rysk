@@ -28,11 +28,14 @@ use crate::{
     dram::Dram,
     elf::{Error as ElfError, Image},
     fdt::Fdt,
+    hid::{Hid, Keys, Pointer},
     imsic::{self, Imsic},
     pci::{self, HostBridge, Ports, Root},
     plic::{self, Plic},
     trap::Trap,
     uart::{self, Keyboard, Uart},
+    usb,
+    xhci::Xhci,
 };
 
 /// Which interrupt architecture a machine is built with, in the spelling QEMU's `virt`
@@ -106,16 +109,46 @@ impl std::str::FromStr for Video {
     }
 }
 
+/// Which input devices the machine has, if it has any.
+///
+/// Named for what is plugged in rather than for the controller, the same way `Video` is:
+/// what this picks is a keyboard and a mouse, and xHCI is only how they are reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Usb {
+    /// No controller at all, which is what a machine driven through its serial port
+    /// wants: the port is where its keystrokes already arrive.
+    #[default]
+    None,
+    /// A keyboard and a mouse behind an xHCI controller.
+    Hid,
+}
+
+impl std::str::FromStr for Usb {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "none" => Ok(Self::None),
+            "hid" => Ok(Self::Hid),
+            _ => Err(format!("{name}: not none or hid")),
+        }
+    }
+}
+
 /// The ends of the machine that face the world rather than the guest: what a keystroke
 /// is typed into, and what a frame is read out of.
 ///
 /// Everything here is a handle on something the machine owns, so a frontend holding one
-/// does not hold the machine and can be on a thread of its own. There is no display
-/// unless the machine was built with one.
+/// does not hold the machine and can be on a thread of its own. There is no display and
+/// no keyboard unless the machine was built with them.
 #[derive(Debug)]
 pub struct Frontend {
+    /// The serial port's end, which is where a machine with no window is driven from.
     pub keyboard: Keyboard,
     pub screen: Option<Screen>,
+    /// The two devices on the bus, which are where a machine with one is driven from.
+    pub keys: Option<Keys>,
+    pub pointer: Option<Pointer>,
 }
 
 /// The interrupt source the first serial port drives, as the `virt` machine wires it.
@@ -131,6 +164,8 @@ const HOST_BRIDGE: usize = 0;
 /// And which the display takes, when there is one. Any number would do, since a card
 /// that never interrupts is never swizzled onto a wire.
 const DISPLAY: usize = 1;
+/// And the USB controller, which does interrupt and so is swizzled onto one.
+const CONTROLLER: usize = 2;
 
 /// The phandles the tree refers to its interrupt controllers by. A device says which
 /// controller its line runs to, so the controllers need names, and each hart has a
@@ -225,9 +260,16 @@ pub struct Boot {
 ///
 /// Every hart is handed the same tree and its own id, because every hart comes out of
 /// reset at the same address: firmware is what picks one to boot and parks the others.
-pub fn boot(machine: &mut Machine, isa: &str, options: &Boot, aia: Aia, video: Video) -> Frontend {
+pub fn boot(
+    machine: &mut Machine,
+    isa: &str,
+    options: &Boot,
+    aia: Aia,
+    video: Video,
+    usb: Usb,
+) -> Frontend {
     let harts = machine.harts.len();
-    let frontend = virt(machine, aia, video);
+    let frontend = virt(machine, aia, video, usb);
     let memory = machine.bus.dram.size();
     let at = fdt_base(memory);
     let tree = describe(isa, memory, harts, options, aia);
@@ -609,7 +651,7 @@ fn tick(cpu: &mut Cpu, bus: &Bus, max: u64) -> Result<u64, Trap> {
 /// attaches is not only on the bus: an interrupt file is a hart's own, reached by that
 /// hart's CSRs, and the page a message arrives at is the same registers seen from the
 /// other side.
-pub fn virt(machine: &mut Machine, aia: Aia, video: Video) -> Frontend {
+pub fn virt(machine: &mut Machine, aia: Aia, video: Video, usb: Usb) -> Frontend {
     let harts = machine.harts.len();
     let bus = &mut machine.bus;
     let serial = Line::default();
@@ -692,6 +734,19 @@ pub fn virt(machine: &mut Machine, aia: Aia, video: Video) -> Frontend {
         }
     };
 
+    // And a controller with a keyboard and a mouse behind it, for a machine that is
+    // driven by hand rather than through its serial port.
+    let (keys, pointer) = match usb {
+        Usb::None => (None, None),
+        Usb::Hid => {
+            let (keyboard, keys) = Hid::keyboard();
+            let (mouse, pointer) = Hid::mouse();
+            let devices: Vec<Box<dyn usb::Device>> = vec![Box::new(keyboard), Box::new(mouse)];
+            root.plug(CONTROLLER, Box::new(Xhci::new(bus.memory(), devices)));
+            (Some(keys), Some(pointer))
+        }
+    };
+
     bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::new(harts)));
     bus.attach(
         uart::BASE,
@@ -706,7 +761,12 @@ pub fn virt(machine: &mut Machine, aia: Aia, video: Video) -> Frontend {
         Box::new(root.window(pci::MMIO64)),
     );
     bus.attach(pci::PIO, pci::PIO_SIZE, Box::new(Ports));
-    Frontend { keyboard, screen }
+    Frontend {
+        keyboard,
+        screen,
+        keys,
+        pointer,
+    }
 }
 
 /// The `interrupt-map` of the root complex: for each of the four device numbers the

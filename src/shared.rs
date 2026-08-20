@@ -84,12 +84,29 @@ impl Bytes {
         unsafe { slice::from_raw_parts(self.base(), self.bytes.len()) }
     }
 
-    /// Every byte, exclusively. `&mut self` is exclusive access to the whole array, so
-    /// this is the one path that may hold a slice of it: nothing can be racing with a
-    /// caller that has one.
+    /// Put `bytes` at `index`, for a caller placing more of them than one access
+    /// reaches: an image being loaded, or a device transferring a block.
+    ///
+    /// The caller has already found all of them to be inside.
     #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.base(), self.bytes.len()) }
+    pub fn put(&self, index: usize, bytes: &[u8]) {
+        debug_assert!(
+            index + bytes.len() <= self.bytes.len(),
+            "a write past the end"
+        );
+        unsafe {
+            self.base()
+                .add(index)
+                .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len())
+        }
+    }
+
+    /// Zero `len` bytes at `index`, which is the rest of a segment whose image is
+    /// shorter than the memory it asked for.
+    #[inline]
+    pub fn clear(&self, index: usize, len: usize) {
+        debug_assert!(index + len <= self.bytes.len(), "a write past the end");
+        unsafe { self.base().add(index).write_bytes(0, len) }
     }
 
     /// The `N` bytes at `index`, which the caller has already found to be inside.

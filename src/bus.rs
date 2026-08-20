@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     ops::Range,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{
             AtomicU64, AtomicUsize,
             Ordering::{Relaxed, SeqCst},
@@ -14,7 +14,7 @@ use std::{
 use tracing::instrument;
 
 use crate::{
-    device::{Device, Pending},
+    device::{Device, Dma, Pending},
     dram::Dram,
     trap::Exception,
 };
@@ -59,7 +59,9 @@ fn reserved_bytes(word: u64) -> Range<u64> {
 /// for an access that was not memory, which is rare by construction.
 #[derive(Debug)]
 pub struct Bus {
-    pub dram: Dram,
+    /// The memory, shared rather than owned: a bus-mastering device reaches it without
+    /// going back through the bus, and `Dma` is the handle it does that with.
+    pub dram: Arc<Dram>,
     /// Every device, sorted by base address and never overlapping, so an address
     /// decodes by binary search.
     devices: Vec<Attached>,
@@ -107,7 +109,7 @@ impl Bus {
     /// A bus with memory and room for `harts` reservations.
     pub fn new(dram: Dram, harts: usize) -> Self {
         Self {
-            dram,
+            dram: Arc::new(dram),
             devices: Vec::new(),
             pending: Pending::new(harts),
             controllers: Vec::new(),
@@ -446,5 +448,10 @@ impl Bus {
     #[inline]
     pub fn in_dram(&self, addr: u64, size: u64) -> bool {
         self.dram.contains(addr, size)
+    }
+
+    /// A handle on the memory, for a device that transfers to and from it.
+    pub fn memory(&self) -> Dma {
+        Dma::new(self.dram.clone())
     }
 }

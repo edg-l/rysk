@@ -76,7 +76,7 @@ impl Dram {
 
     /// Place `bytes` at `addr` and zero `zeroes` bytes after them, as loading an image
     /// does. Returns whether it fit.
-    pub fn write(&mut self, addr: u64, bytes: &[u8], zeroes: u64) -> bool {
+    pub fn write(&self, addr: u64, bytes: &[u8], zeroes: u64) -> bool {
         let Some(start) = addr.checked_sub(DRAM_BASE) else {
             return false;
         };
@@ -86,10 +86,10 @@ impl Dram {
         if end as u64 > self.size() {
             return false;
         }
-        let memory = self.bytes.as_mut_slice();
         let start = start as usize;
-        memory[start..start + bytes.len()].copy_from_slice(bytes);
-        memory[start + bytes.len()..end].fill(0);
+        self.bytes.put(start, bytes);
+        self.bytes
+            .clear(start + bytes.len(), end - start - bytes.len());
         true
     }
 
@@ -194,14 +194,5 @@ impl Dram {
         ) {
             Ok(was) | Err(was) => was,
         })
-    }
-}
-
-impl Clone for Dram {
-    fn clone(&self) -> Self {
-        // A snapshot, which only means anything to a caller holding the memory still.
-        let mut copy = Self::with_size(Vec::new(), self.size());
-        copy.write(DRAM_BASE, unsafe { self.as_slice() }, 0);
-        copy
     }
 }
