@@ -621,3 +621,37 @@ fn a_source_the_controller_does_not_have_reads_as_not_being_there() {
     assert_eq!(machine.reg(A0), 0, "its configuration is not there");
     assert_eq!(machine.reg(A1), 0, "and neither is its target");
 }
+
+/// The read-only byte at the top of `domaincfg`, which is what tells a reader the
+/// register came back in the byte order it asked for.
+/// The RISC-V Advanced Interrupt Architecture, 4.5.1.
+const DOMAINCFG_READBACK: u32 = 0x8000_0000;
+
+#[test]
+fn the_delivery_mode_is_the_one_the_machine_built_the_controller_with() {
+    // A controller with nowhere to post a message delivers, and a write saying it
+    // forwards does not make it one: the domain has the one mode, so DM reads back as
+    // what it is rather than as what was asked for.
+    let (program, _) = wired(
+        &[sw(T4, T0, DOMAINCFG), lw(A0, T0, DOMAINCFG)],
+        Msi::default(),
+    );
+    let machine = program.reg(T4, FORWARDS).run();
+    assert_eq!(
+        machine.reg(A0) as u32,
+        DOMAINCFG_READBACK | DELIVERS as u32,
+        "enabled, and still delivering"
+    );
+
+    // And one the machine gave somewhere to post to forwards, whatever is written.
+    let (program, _) = wired(
+        &[sw(T4, T0, DOMAINCFG), lw(A0, T0, DOMAINCFG)],
+        Msi::new(|_, _| {}),
+    );
+    let machine = program.reg(T4, DELIVERS).run();
+    assert_eq!(
+        machine.reg(A0) as u32,
+        DOMAINCFG_READBACK | FORWARDS as u32,
+        "enabled, and still forwarding"
+    );
+}

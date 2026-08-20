@@ -116,8 +116,10 @@ struct Idc {
 /// by the machine-level domain's delegation bits.
 #[derive(Debug)]
 struct Domain {
-    /// `domaincfg.IE` and `domaincfg.DM`.
+    /// `domaincfg.IE`.
     enabled: bool,
+    /// `domaincfg.DM`, which this controller has one of rather than both, so it is
+    /// what the machine built the controller with and not something software moves.
     forwards: bool,
     sourcecfg: Vec<u32>,
     pending: [u32; WORDS],
@@ -132,10 +134,10 @@ struct Domain {
 }
 
 impl Domain {
-    fn new(harts: usize, files: u64) -> Self {
+    fn new(harts: usize, files: u64, forwards: bool) -> Self {
         Self {
             enabled: false,
-            forwards: false,
+            forwards,
             sourcecfg: vec![0; SOURCES],
             pending: [0; WORDS],
             enable: [0; WORDS],
@@ -204,12 +206,19 @@ struct Controller {
 
 impl Controller {
     fn new(harts: usize, msi: Msi) -> Self {
+        // Which of the two delivery modes this controller has. A machine either gave
+        // it somewhere to post a message, in which case its harts are reached that way
+        // and driving their wires would deliver nothing, or it did not and they are
+        // reached by wire. An implementation may support one mode or both, and this
+        // one supports whichever the machine built it for.
+        // The RISC-V Advanced Interrupt Architecture, 4.5.1.
+        let forwards = msi.wired();
         Self {
             lines: Vec::new(),
             seen: [0; WORDS],
             domains: [
-                Domain::new(harts, crate::imsic::MACHINE),
-                Domain::new(harts, crate::imsic::SUPERVISOR),
+                Domain::new(harts, crate::imsic::MACHINE, forwards),
+                Domain::new(harts, crate::imsic::SUPERVISOR, forwards),
             ],
             msi,
             pending: Pending::new(harts),
@@ -589,9 +598,10 @@ impl Controller {
         let word = |offset: u64, from: u64| ((offset - from) / 4) as usize * 32;
         match offset {
             DOMAINCFG => {
-                let domain = self.domain_mut(level);
-                domain.enabled = value & DOMAINCFG_IE != 0;
-                domain.forwards = value & DOMAINCFG_DM != 0;
+                // DM is WARL over the modes the domain has, and this one has the mode
+                // it was built with, so what is written to it does not stick.
+                // The RISC-V Advanced Interrupt Architecture, 4.5.1.
+                self.domain_mut(level).enabled = value & DOMAINCFG_IE != 0;
             }
             SOURCECFG..SOURCECFG_END => self.configure(level, (offset / 4) as usize, value),
             SETIP..SETIP_END => {

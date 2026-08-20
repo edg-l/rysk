@@ -120,6 +120,13 @@ impl Msi {
         Self(Some(Arc::new(deliver)))
     }
 
+    /// Whether this goes anywhere. A machine that wired one has somewhere to deliver
+    /// a message to, which is what makes message delivery something a controller can
+    /// be built for rather than switched into.
+    pub fn wired(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// Post `identity` to `addr`. A machine with nowhere to deliver one drops it,
     /// which is what a write to an address nothing answers for does.
     pub fn send(&self, addr: u64, identity: u32) {
