@@ -203,8 +203,8 @@ impl Cpu {
             // The levels the entry did not translate are taken from the address, which
             // is what makes a superpage one page rather than many.
             let ppn = (pte >> 10) & 0xfff_ffff_ffff;
-            let page = (ppn >> (9 * level)) << (9 * level)
-                | (va >> PAGE_BITS) & ((1 << (9 * level)) - 1);
+            let page =
+                (ppn >> (9 * level)) << (9 * level) | (va >> PAGE_BITS) & ((1 << (9 * level)) - 1);
             let entry = Translation {
                 vpn: va >> PAGE_BITS,
                 pte,
