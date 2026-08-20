@@ -6,7 +6,7 @@
 //! integers, and the answers are the same wherever rysk runs. QEMU and spike both do
 //! this, for the same reasons.
 //!
-//! Every operation ends at [`round`], which is where inexactness, overflow and
+//! Every operation ends at `round`, which is where inexactness, overflow and
 //! underflow are decided once rather than in each of them.
 //!
 //! The RISC-V Instruction Set Manual Volume I, chapters 20 and 21.

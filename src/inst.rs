@@ -271,7 +271,7 @@ pub struct Inst {
     pub imm: u64,
 }
 
-/// imm[11:0] = inst[31:20], sign-extended.
+/// `imm[11:0] = inst[31:20]`, sign-extended.
 const fn i_imm(inst: u32) -> u64 {
     ((inst as i32 as i64) >> 20) as u64
 }
@@ -289,7 +289,7 @@ const fn b_imm(inst: u32) -> u64 {
         | ((inst >> 7) & 0x1e) as u64
 }
 
-/// imm[31:12] = inst[31:12], sign-extended.
+/// `imm[31:12] = inst[31:12]`, sign-extended.
 const fn u_imm(inst: u32) -> u64 {
     (inst & 0xffff_f000) as i32 as i64 as u64
 }

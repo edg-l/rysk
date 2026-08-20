@@ -29,7 +29,7 @@ pub struct Cpu {
     /// Where control goes when it retires. Jumps and taken branches overwrite it.
     pub next_pc: u64,
     /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding
-    /// space (csr[11:0]) for up to 4096 CSRs.
+    /// space (`csr[11:0]`) for up to 4096 CSRs.
     pub csrs: [u64; 4096],
     /// The floating-point registers. A value narrower than the widest format is kept
     /// with every bit above it set, so a register holding a single can be told from

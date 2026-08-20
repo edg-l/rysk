@@ -33,6 +33,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features
 
+      # Almost every item in this tree carries a doc comment, and the links between
+      # them are the one part of that nothing else checks. A link to something renamed
+      # away is a warning, and warnings are errors here.
+      # RUSTDOCFLAGS rather than the RUSTFLAGS above: that one reaches rustc and
+      # this is rustdoc, and without it a broken link is a warning nothing reads.
+      - name: Documentation, and the links inside it
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --document-private-items
+
   test:
     name: tests
     runs-on: ubuntu-latest
@@ -85,3 +95,30 @@ jobs:
         run: |
           cargo check --locked --features trace
           cargo check --locked --no-default-features
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Nothing in src/ touches a Unix API and every dependency that reaches X11 or
+      # wayland opens it at runtime, so this is a plain build. It is here to keep that
+      # true: the day something reaches for termios or /proc, this is what says so.
+      - run: cargo build --locked
+
+      # Every suite but the corpus, which wants a RISC-V toolchain to assemble and
+      # fails rather than skipping when it is missing. What is checked here is the
+      # emulator, and the emulator is the part that has to be portable.
+      - run: cargo test --locked --test isa --test devicetree --test softfloat --lib
+
+  deny:
+    name: licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses advisories sources

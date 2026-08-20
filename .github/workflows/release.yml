@@ -1,0 +1,130 @@
+name: Release
+
+# A tag is what makes a release, so that what was built is always something that
+# exists in the history rather than whatever master happened to be. It can also be
+# run by hand against a tag that already exists, for when a build failed rather than
+# the code did.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing tag to build and upload
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# Two runs of the same release would race each other uploading the same names.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Not `ubuntu-latest`: a binary is linked against the glibc it was built
+          # on and runs on that version or newer, so the oldest runner still
+          # supported is the one that reaches the most machines.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+          # The toolchain Windows software is normally built with. Only the GNU
+          # target had ever been built by hand, so this is also the first time the
+          # native one is exercised.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The default build, which has the window compiled in. `--gui` is what opens
+      # one, so this is still the command-line program on a machine with no display:
+      # everything it needs for a window is opened at runtime and only when asked.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The emulator, held against the suite that needs nothing else present. The
+      # corpus wants a RISC-V toolchain to assemble and is the CI workflow's to run.
+      - name: Test what needs no toolchain
+        run: cargo test --release --locked --target ${{ matrix.target }} --test isa --test devicetree --test softfloat --lib
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="rysk-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/rysk" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="rysk-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/rysk.exe" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          (cd dist && 7z a "$name.zip" "$name" > /dev/null)
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # `gh` is on the runner already, so the upload needs no third-party action and
+      # nothing but the token it was given. A release that already exists is added
+      # to rather than replaced, which is what makes a hand-run rebuild work.
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! gh release view "$version" >/dev/null 2>&1; then
+            gh release create "$version" --title "$version" --generate-notes
+          fi
+          gh release upload "$version" dist/* --clobber

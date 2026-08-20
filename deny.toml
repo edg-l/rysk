@@ -1,0 +1,54 @@
+# What may be in the dependency tree, and under what licence.
+#
+# This mattered little while there were two dependencies and both were tracing. The
+# window brought about three hundred, every one of which has to sit under AGPL-3.0
+# without argument, and checking that by hand once is not the same as checking it.
+
+[graph]
+# The window is built for all three, so the licences of what it pulls in on each of
+# them are all this project's problem.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive, and each one already relied on: MIT and Apache-2.0 are most of the
+# ecosystem, Unicode-3.0 comes in with the text shaping, and 0BSD is smoltcp's, which
+# phase 12 will want. Anything not on this list is a decision rather than a default,
+# so it fails and gets read.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+
+# rysk's own licence, which is not on the list above because that list is about what
+# may be pulled in. AGPL is this project's to be, not a dependency's.
+exceptions = [{ allow = ["AGPL-3.0-only"], crate = "rysk" }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

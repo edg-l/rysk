@@ -2,6 +2,9 @@
 name = "rysk"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
+description = "A RISC-V emulator: RV64GC, privilege modes, Sv39, several harts, and a PCI bus."
+repository = "https://github.com/edg-l/rysk"
 
 [features]
 default = ["gui"]
