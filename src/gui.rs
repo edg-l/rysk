@@ -35,6 +35,7 @@ use crate::{
     input::{Keyboard, Mouse},
     machine::{Halt, Running, State},
     panels::{self, Action, View},
+    theme,
 };
 
 /// The ends of the machine a window drives it through: what a frame is read out of,
@@ -90,8 +91,10 @@ pub fn run(session: Session, ends: Ends) -> Result<(Session, Option<Halt>), efra
     // `try_lock`, and the names it wants for ever it takes now.
     let symbols = session.symbols().clone();
     // Made here rather than by `eframe`, so that the thread watching the guest's screen
-    // has something to wake the window through before there is a window.
+    // has something to wake the window through before there is a window. It is dressed
+    // here too, since it is the context the window will be built on.
     let ctx = Context::default();
+    theme::install(&ctx);
     let session = Arc::new(Mutex::new(session));
     let mut halt = None;
     let mut opened = Ok(());
@@ -390,7 +393,9 @@ impl Window {
                         panels::memory(ui, view, at, &mut actions)
                     });
                     section(ui, "traps", true, |ui| panels::traps(ui, view, symbols));
-                    section(ui, "devices", false, |ui| panels::devices(ui, view));
+                    // Open, because it is what says which machine this is: a person
+                    // orienting themselves reads it before anything else.
+                    section(ui, "the bus", true, |ui| panels::devices(ui, view));
                 });
             });
         self.pending.append(&mut actions);
@@ -487,21 +492,23 @@ impl Window {
     /// What the window says about the machine above the picture: what to ask of it,
     /// what it is doing, and the mode the guest asked for.
     fn status(&mut self, ui: &mut Ui, mode: Option<Mode>) {
-        let showing = match (&self.screen, mode) {
-            (None, _) => "no display: the machine was built without one".to_owned(),
-            (Some(_), None) => "showing nothing".to_owned(),
-            (Some(_), Some(mode)) => format!(
-                "{}x{} in {:?}, {} bytes to a row",
-                mode.width, mode.height, mode.format, mode.stride
-            ),
-        };
         let mut actions = Vec::new();
         panels::controls(ui, &self.view, self.showing(), &mut actions);
         ui.horizontal(|ui| {
-            ui.label(showing);
-            ui.separator();
-            ui.checkbox(&mut self.live, "live")
-                .on_hover_text("keep the panels current by pausing the machine to read it");
+            ui.label(theme::legend("display"));
+            ui.label(match (&self.screen, mode) {
+                (None, _) => theme::faint("none fitted"),
+                (Some(_), None) => theme::faint("blank"),
+                (Some(_), Some(mode)) => {
+                    theme::data(format!("{}×{} {:?}", mode.width, mode.height, mode.format))
+                }
+            });
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.live, theme::legend("follow"))
+                .on_hover_text(
+                    "keep the panels current while it runs, by holding the machine to \
+                     read it and letting it go again. It costs the guest speed.",
+                );
         });
         self.pending.append(&mut actions);
     }
@@ -520,10 +527,25 @@ impl eframe::App for Window {
             ctx.request_repaint_after(FRAME);
         }
         let mode = self.refresh(&ctx);
-        Panel::top("status").show(ui, |ui| self.status(ui, mode));
+        Panel::top("fascia")
+            .frame(
+                eframe::egui::Frame::new()
+                    .fill(theme::RAISED)
+                    .inner_margin(eframe::egui::Margin::symmetric(8, 5)),
+            )
+            .show(ui, |ui| self.status(ui, mode));
         self.panels(ui);
         CentralPanel::default().show(ui, |ui| {
             let Some(picture) = &self.picture else {
+                // A machine with nothing on its screen is the ordinary case, not a
+                // failure, so the middle says which of the two it is rather than
+                // sitting empty.
+                ui.centered_and_justified(|ui| {
+                    ui.label(theme::legend(match &self.screen {
+                        None => "no display fitted — run with --display bochs",
+                        Some(_) => "the guest has not set a mode",
+                    }));
+                });
                 return;
             };
             // Scaled to fit and centred, keeping the picture's own proportions: a
@@ -534,7 +556,16 @@ impl eframe::App for Window {
             let scale = (space.x / size.x).min(space.y / size.y);
             let texture = SizedTexture::new(picture.texture.id(), size);
             ui.centered_and_justified(|ui| {
-                ui.add(Image::new(texture).fit_to_exact_size(size * scale));
+                let shown = ui.add(Image::new(texture).fit_to_exact_size(size * scale));
+                // A hairline around it, because a guest's picture has its own black in
+                // it and without an edge there is no telling where the screen stops and
+                // the board begins.
+                ui.painter().rect_stroke(
+                    shown.rect,
+                    0.0,
+                    eframe::egui::Stroke::new(1.0, theme::TRACE),
+                    eframe::egui::StrokeKind::Outside,
+                );
             });
         });
     }
@@ -580,19 +611,20 @@ impl Borrowed {
 
 /// One folding section of the panel, open to begin with or not.
 fn section(ui: &mut Ui, name: &str, open: bool, contents: impl FnOnce(&mut Ui)) {
-    eframe::egui::CollapsingHeader::new(name)
+    ui.add_space(4.0);
+    eframe::egui::CollapsingHeader::new(theme::heading(name))
         .default_open(open)
-        .show(ui, contents);
+        .show_background(false)
+        .show(ui, |ui| {
+            ui.add_space(2.0);
+            contents(ui);
+        });
 }
 
 /// What the panels say when what is in them was read at an earlier stop, which is every
 /// frame drawn while the harts are running.
 fn stale(ui: &mut Ui) {
-    ui.label(
-        eframe::egui::RichText::new("as of the last stop")
-            .weak()
-            .italics(),
-    );
+    ui.label(theme::legend("as of the last stop"));
 }
 
 /// The rows of the picture a frame's dirty pages fall in.

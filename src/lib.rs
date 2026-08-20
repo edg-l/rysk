@@ -58,6 +58,9 @@ pub mod pci;
 pub mod plic;
 pub mod rvc;
 pub mod shared;
+// The window's palette and type scale, behind the same feature as the window.
+#[cfg(feature = "gui")]
+pub mod theme;
 pub mod trap;
 pub mod uart;
 pub mod usb;

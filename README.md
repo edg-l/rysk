@@ -37,14 +37,23 @@ hart took.
 
 ### Boot Linux
 
-Rysk stands in for a boot rom, so it leaves what firmware expects: the hart id in
-`a0`, the device tree in `a1`, and in `a2` a structure naming the next stage.
+```bash
+scripts/boot-linux.sh          # fetches a kernel, an initramfs and OpenSBI, then boots
+scripts/boot-linux.sh --gui    # the same, with a screen and the panels beside it
+```
+
+None of that is in the repository — a kernel and an initramfs are tens of megabytes
+and belong to Debian — so the script fetches them once, pinned to versions rysk has
+booted, and runs the build beside it. By hand it is:
 
 ```bash
 rysk -m 1024 -smp 4 --aia aplic-imsic \
      --initrd initrd.gz --append "console=ttyS0 rdinit=/bin/sh" \
      fw_dynamic.bin vmlinux@0x80200000
 ```
+
+Rysk stands in for a boot rom, so it leaves what firmware expects: the hart id in
+`a0`, the device tree in `a1`, and in `a2` a structure naming the next stage.
 
 OpenSBI comes up, hands off to the kernel in supervisor mode, and the kernel
 enumerates the PCI bus, brings up the other harts and reaches a shell.
