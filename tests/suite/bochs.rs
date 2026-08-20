@@ -524,6 +524,19 @@ fn a_write_to_the_framebuffer_marks_the_page_it_landed_in_and_no_other() {
     assert!(!dirty.touched(PAGE, PAGE), "nothing was written here");
 }
 
+/// What a frontend asks between frames, since presenting a picture nobody drew costs a
+/// frame's work and asking costs a bit per page.
+#[test]
+fn asking_whether_anything_was_drawn_does_not_take_it() {
+    let (program, screen) = card(&[sd(T4, T1, 0)]);
+    program.run();
+
+    assert!(screen.vram().drawn());
+    assert!(screen.vram().drawn(), "asking is not taking");
+    assert!(screen.vram().take_dirty().any());
+    assert!(!screen.vram().drawn(), "and taking it is");
+}
+
 #[test]
 fn taking_the_dirty_pages_clears_them() {
     let (program, screen) = card(&[sd(T4, T1, 0)]);

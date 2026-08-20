@@ -74,6 +74,14 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
 
-      # The tracing is compiled out by default, so it is only ever built here.
-      - name: Check the trace feature still builds
-        run: cargo check --locked --features trace
+      # The window is built by the two steps above, since it is on by default, and is
+      # never run: this runner has no display. It needs no X11 or wayland package to be
+      # built either, since every dependency that reaches one opens it at runtime rather
+      # than linking against it.
+      #
+      # These two are what is not built by default, so they are only ever built here:
+      # the tracing, and the headless build that leaves the window out.
+      - name: Check what the default build leaves out
+        run: |
+          cargo check --locked --features trace
+          cargo check --locked --no-default-features

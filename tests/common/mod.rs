@@ -179,7 +179,7 @@ impl Program {
 
     fn run_to_trap(self) -> (Machine, Trap) {
         let mut machine = self.build();
-        let halt = machine.run();
+        let halt = machine.run().expect("nothing asked this machine to stop");
         (machine, halt.trap)
     }
 

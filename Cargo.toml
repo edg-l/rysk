@@ -4,11 +4,29 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["gui"]
+
 # Compile the instruction and memory tracing in. Off by default: the spans and
 # their fields cost several times what the interpretation itself does.
 trace = []
 
+# Compile the window in. A feature as well as a flag, so that a build with no use for
+# one -- a machine on a server driven through its serial port, or a runner with no
+# display -- can leave a whole GPU stack out with `--no-default-features`. Running is
+# still headless unless `--gui` asks: this only decides what is compiled.
+gui = ["dep:eframe"]
+
 [dependencies]
+# The window, its event loop and its GPU backend, already assembled, on every platform
+# rysk builds for. `glow` rather than `wgpu` because what is drawn here is a texture and
+# some panels; the rest of the default features are an accessibility tree and a
+# persisted window position, neither of which this has anything to say to.
+eframe = { version = "0.36.1", optional = true, default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

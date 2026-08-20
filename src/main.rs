@@ -4,7 +4,7 @@ use rysk::{
     bochs,
     dram::DRAM_SIZE,
     elf, htif, machine,
-    machine::{Aia, Machine, Schedule, Storage, Usb, Video},
+    machine::{Aia, Halt, Machine, Schedule, Storage, Usb, Video},
 };
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -41,6 +41,33 @@ fn handoff(machine: &mut Machine) {
     }
 }
 
+/// How a run ended, for the line printed after it. A run that was asked to stop
+/// reached no trap, so there is nothing to name but the asking.
+fn describe(machine: &Machine, halt: Option<Halt>) -> String {
+    match halt {
+        Some(halt) => format!("{halt}, pc {:#x}", machine.harts[halt.hart].pc),
+        None => "asked to stop".to_owned(),
+    }
+}
+
+/// Run the machine behind a window, which is a thing only a build that was asked for
+/// one can do.
+#[cfg(feature = "gui")]
+fn window(
+    machine: &mut Machine,
+    screen: Option<rysk::bochs::Screen>,
+) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
+    Ok(rysk::gui::run(machine, screen)?)
+}
+
+#[cfg(not(feature = "gui"))]
+fn window(
+    _machine: &mut Machine,
+    _screen: Option<rysk::bochs::Screen>,
+) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
+    Err("--gui: this rysk was built without a window, which is `--features gui`".into())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(
         FmtSubscriber::builder()
@@ -64,8 +91,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut schedule = None;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
+    let mut gui = false;
     let mut at = 0;
-    while at + 1 < args.len() {
+    while at < args.len() {
+        // The only option that is not a pair. Everything else names a thing the
+        // machine is built with; this one names who is driving it.
+        if args[at] == "--gui" {
+            gui = true;
+            at += 1;
+            continue;
+        }
+        if at + 1 >= args.len() {
+            break;
+        }
         let value = args[at + 1].clone();
         match args[at].as_str() {
             "-m" => memory = value.parse::<u64>().expect("a size in mebibytes") * 1024 * 1024,
@@ -98,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              [--append <args>] [--aia none|aplic|aplic-imsic] \
              [--display none|bochs] [--usb none|hid] \
              [--disk none|<file>|<n>M] \
-             [--schedule turns|threads] \
+             [--schedule turns|threads] [--gui] \
              <image> [image@address ...]"
         );
     };
@@ -179,11 +217,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => Schedule::Threads,
     });
 
-    let stopped = match tohost {
-        Some(tohost) => htif::run(&mut machine, tohost, MAX_STEPS).to_string(),
-        None => {
+    let stopped = match (tohost, gui) {
+        (Some(tohost), _) => htif::run(&mut machine, tohost, MAX_STEPS).to_string(),
+        (None, true) => {
+            let halt = window(&mut machine, frontend.screen.clone())?;
+            describe(&machine, halt)
+        }
+        (None, false) => {
             let halt = machine.run();
-            format!("{halt}, pc {:#x}", machine.harts[halt.hart].pc)
+            describe(&machine, halt)
         }
     };
 

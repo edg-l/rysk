@@ -219,6 +219,17 @@ impl Vram {
         }
     }
 
+    /// Whether anything has been written since the last `take_dirty`, without taking
+    /// it.
+    ///
+    /// This is what a host asks between frames. Presenting one is a picture laid out,
+    /// converted and handed to a renderer; asking whether there is a picture to present
+    /// is one bit per page. A machine being driven through its serial port draws
+    /// nothing at all, and a window open on it should cost what it is showing.
+    pub fn drawn(&self) -> bool {
+        self.dirty.iter().any(|word| word.load(Relaxed) != 0)
+    }
+
     /// Which pages have been written since this was last asked, clearing them as it
     /// goes so that the next caller is told about the next frame's writes and not this
     /// one's.

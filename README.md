@@ -148,6 +148,27 @@ The `trace` feature is off by default because the spans and their fields cost
 several times what interpreting the instruction does; without it the tracing
 compiles to nothing.
 
+### A window
+
+`--gui` puts the guest's screen in one, scaled to fit and nearest-neighbour, with
+the mode it is in and whether the machine is still running above it. Closing the
+window stops the machine at an instruction boundary, so the run ends the way it
+does headless.
+
+```bash
+cargo run --release -- --display bochs --gui bench/display.bin
+```
+
+A run is headless unless `--gui` asks for a window, since that is what the
+corpus, the benchmarks and CI run. Whether the window is *compiled* is a separate
+question and a cargo feature: `gui` is on by default, and
+`--no-default-features` leaves a whole GPU stack out of a build that will never
+open one.
+
+Nothing repaints on a timer. A thread asks the card whether a page of video
+memory moved, which is a bit per page, and only then is a frame laid out and
+presented, so a machine drawing nothing costs nothing.
+
 ### Booting Linux
 
 Rysk stands in for a boot rom, so it leaves what firmware expects: the hart id in
@@ -226,6 +247,7 @@ src/
   pci.rs       a root complex: config space, the windows, INTx, MSI-X and Express
   uart.rs      a 16550
   bochs.rs     a display: a framebuffer, the registers that shape it, and which pages moved
+  gui.rs       the window, and the machine running on a thread behind it
   edid.rs      the block a monitor answers with, generated rather than modelled
   xhci.rs      a USB host controller: its rings, its contexts, and its ports
   usb.rs       what a device is from the controller's side
@@ -259,7 +281,8 @@ Working, and not finished. What is missing, roughly in the order it matters:
 
 | missing | where it stands |
 |---|---|
-| **A window** | the machine has no frontend, so nothing presents the framebuffer and nothing pushes a keystroke into the keyboard: output goes to stdout and the terminal is still line buffered, so typing at a guest shell arrives a line at a time |
+| **Input, and a raw terminal** | `--gui` presents the framebuffer, but nothing pushes a keystroke into the USB keyboard yet, and the serial port's terminal is still line buffered, so typing at a guest shell arrives a line at a time |
+| **Panels** | the window shows the guest's screen and nothing about the machine behind it, so a black screen is still a mystery rather than a `pc` and a trap |
 | **A network** | there is no interface on the bus, so a guest has no way off the machine |
 | **Determinism** | no run repeats another yet. `--schedule turns` fixes the order the harts run in, which is the half of it that threads give up, but the devices still advance with the wall clock rather than with retired instructions |
 | **Debug triggers** | the one corpus test that does not pass, `rv64mi-p-breakpoint`, wants them |

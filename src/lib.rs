@@ -33,6 +33,11 @@ pub mod edid;
 pub mod elf;
 pub mod fdt;
 pub mod fpu;
+// The window. On by default, and a feature so that a build with no use for one can
+// leave a whole GPU stack out; whether a window actually opens is `--gui`, which is a
+// separate question and off by default.
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod hid;
 pub mod htif;
 pub mod imsic;

@@ -8,7 +8,7 @@
 use std::{
     io,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{
             AtomicBool, AtomicUsize,
             Ordering::{Relaxed, SeqCst},
@@ -371,6 +371,9 @@ pub struct Machine {
     /// long. It is a property of the machine rather than of the loop so that a
     /// frontend which needs one run to repeat another can fix it.
     pub quantum: u64,
+    /// Whether the harts are to go on running. A frontend holding a clone of this is
+    /// how a machine running on a thread of its own is asked to stop.
+    pub running: Running,
 }
 
 /// The default for `Machine::quantum`.
@@ -411,6 +414,39 @@ impl std::str::FromStr for Schedule {
     }
 }
 
+/// Whether the harts are to go on running, for something outside them that may want
+/// them to stop: the first hart to reach a trap nothing handles, a window being
+/// closed, or a control channel being told to.
+///
+/// It is read between quanta rather than between instructions, so stopping is a
+/// request rather than a halt: whatever a hart is part way through finishes first, and
+/// the machine is left at an instruction boundary either way.
+///
+/// A machine that has been stopped stays stopped. Asking a stopped machine to run
+/// answers immediately, which is what a frontend pausing one wants and is why this is
+/// a handle rather than an argument to `run`.
+#[derive(Debug, Clone)]
+pub struct Running(Arc<AtomicBool>);
+
+impl Default for Running {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl Running {
+    /// Ask for the machine to stop, at the end of whatever quantum each hart is in.
+    pub fn stop(&self) {
+        self.0.store(false, SeqCst);
+    }
+
+    /// Whether it is still to run, which is what a frontend watching a machine on a
+    /// thread of its own asks.
+    pub fn going(&self) -> bool {
+        self.0.load(Relaxed)
+    }
+}
+
 impl Machine {
     /// A machine with `memory` bytes of dram and `harts` harts, running `code` placed
     /// at the bottom of memory.
@@ -425,6 +461,7 @@ impl Machine {
             bus: Bus::new(Dram::with_size(code, memory), harts),
             schedule: Schedule::default(),
             quantum: QUANTUM,
+            running: Running::default(),
         };
         for hart in &mut machine.harts {
             hart.regs[2] = DRAM_BASE + memory;
@@ -452,21 +489,25 @@ impl Machine {
     }
 
     /// Run until a trap that nothing is installed to handle, and say which hart raised
-    /// it.
+    /// it, or until something asked the machine to stop, which is no halt at all.
     ///
     /// Which of the two schedules gives them their turns is the machine's to say.
-    pub fn run(&mut self) -> Halt {
-        match self.schedule {
+    pub fn run(&mut self) -> Option<Halt> {
+        let halt = match self.schedule {
             Schedule::RoundRobin => self.run_in_turn(),
             Schedule::Threads => self.run_on_threads(),
-        }
+        };
+        // However it ended, it has ended: a run that came back is not still going, and
+        // a frontend watching the flag is what says so.
+        self.running.stop();
+        halt
     }
 
     /// The harts take turns a quantum at a time on one host thread, so a switch only
     /// ever happens between whole instructions. The schedule itself is fixed, though a
     /// run is not yet reproducible, since the devices still advance with the wall clock.
-    fn run_in_turn(&mut self) -> Halt {
-        loop {
+    fn run_in_turn(&mut self) -> Option<Halt> {
+        while self.running.going() {
             self.bus.poll();
             let mut ran = false;
             for hart in 0..self.harts.len() {
@@ -475,7 +516,7 @@ impl Machine {
                 }
                 ran = true;
                 if let Some(halt) = self.run_hart(hart, self.quantum) {
-                    return halt;
+                    return Some(halt);
                 }
             }
             // Every hart is parked, so nothing but a device can change what any of
@@ -484,6 +525,7 @@ impl Machine {
                 std::hint::spin_loop();
             }
         }
+        None
     }
 
     /// A host thread for each hart, and one more that polls the devices, since polling
@@ -496,22 +538,21 @@ impl Machine {
     /// The first hart to reach a trap nothing handles stops the rest, so the machine
     /// halts on the same thing it would have halted on taking turns, even though which
     /// hart gets there first is no longer fixed.
-    fn run_on_threads(&mut self) -> Halt {
-        let (bus, quantum) = (&self.bus, self.quantum);
-        let stop = AtomicBool::new(false);
+    fn run_on_threads(&mut self) -> Option<Halt> {
+        let (bus, quantum, running) = (&self.bus, self.quantum, &self.running);
         let first: Mutex<Option<Halt>> = Mutex::new(None);
 
         thread::scope(|scope| {
             scope.spawn(|| {
-                while !stop.load(Relaxed) {
+                while running.going() {
                     bus.poll();
                     thread::sleep(IDLE);
                 }
             });
             for (hart, cpu) in self.harts.iter_mut().enumerate() {
-                let (stop, first) = (&stop, &first);
+                let first = &first;
                 scope.spawn(move || {
-                    while !stop.load(Relaxed) {
+                    while running.going() {
                         // A parked hart waits rather than spinning. Only a device or
                         // another hart can change what it will do next, and both of
                         // them end in the word `ready` looks at.
@@ -522,7 +563,7 @@ impl Machine {
                         if let Some(halt) = run_quantum(cpu, bus, quantum, hart) {
                             let mut held = first.lock().unwrap_or_else(|h| h.into_inner());
                             held.get_or_insert(halt);
-                            stop.store(true, SeqCst);
+                            running.stop();
                             return;
                         }
                     }
@@ -530,10 +571,7 @@ impl Machine {
             }
         });
 
-        first
-            .into_inner()
-            .unwrap_or_else(|h| h.into_inner())
-            .expect("a hart stopped the machine")
+        first.into_inner().unwrap_or_else(|h| h.into_inner())
     }
 
     /// Run every hart on a host thread of its own until all of them have parked.
