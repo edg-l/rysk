@@ -537,3 +537,180 @@ fn a_vector_raised_while_masked_waits_and_goes_when_it_is_unmasked() {
         "and it is not waiting now"
     );
 }
+
+/// A function with both capabilities, so that a test can walk from one to the next.
+/// Nothing else about it matters: it has one window because a vector table has to live
+/// somewhere, and it never answers an access to it.
+const INTEGRATED: usize = 4;
+
+#[derive(Debug)]
+struct Integrated;
+
+impl Function for Integrated {
+    fn header(&self) -> Header {
+        Header {
+            vendor: 0x1af4,
+            device: 0x1053,
+            class: 0x00ff_0000,
+            bars: [
+                Bar::Memory {
+                    size: 0x1000,
+                    prefetchable: false,
+                    wide: false,
+                },
+                Bar::None,
+                Bar::None,
+                Bar::None,
+                Bar::None,
+                Bar::None,
+            ],
+            msix: Some(MsiX {
+                vectors: VECTORS,
+                table: (0, TABLE),
+                pending: (0, PENDING),
+            }),
+            express: true,
+            ..Header::default()
+        }
+    }
+
+    fn load(&mut self, _bar: usize, offset: u64, _size: u64) -> Result<u64, Exception> {
+        Err(Exception::LoadAccessFault(offset))
+    }
+
+    fn store(
+        &mut self,
+        _bar: usize,
+        offset: u64,
+        _size: u64,
+        _value: u64,
+    ) -> Result<(), Exception> {
+        Err(Exception::StoreAmoAccessFault(offset))
+    }
+}
+
+/// Config space of a function with both capabilities. `t0` is where the list starts.
+fn integrated(code: &[u32]) -> Program {
+    let root = Root::new(std::array::from_fn(|_| Line::default()), Msi::default());
+    root.plug(0, Box::new(HostBridge));
+    root.plug(1, Box::new(Probe::default()));
+    root.plug(INTEGRATED, Box::new(Integrated));
+    prog(code)
+        .device(pci::ECAM, pci::ECAM_SIZE, Box::new(root.config()))
+        .reg(T0, config(INTEGRATED))
+        .reg(T1, config(1))
+}
+
+/// Where the capability list puts each of them: message-signalled interrupts first,
+/// twelve bytes of it, then the Express capability.
+const FIRST: i32 = MSIX_CONTROL;
+const SECOND: i32 = FIRST + 12;
+const EXPRESS_FLAGS: i32 = SECOND;
+const EXPRESS_DEVCAP: i32 = SECOND + 0x04;
+const EXPRESS_DEVCTL: i32 = SECOND + 0x08;
+const EXPRESS_LNKCAP: i32 = SECOND + 0x0c;
+const EXPRESS_DEVCTL2: i32 = SECOND + 0x28;
+
+#[test]
+fn the_capability_list_chains_one_capability_to_the_next() {
+    let machine = integrated(&[
+        lwu(A0, T0, CAPABILITIES),
+        lwu(A1, T0, FIRST),
+        lwu(A2, T0, SECOND),
+        // And a function with no capabilities at all points at nothing.
+        lwu(A3, T1, CAPABILITIES),
+    ])
+    .run();
+
+    assert_eq!(
+        machine.reg(A0),
+        FIRST as u64,
+        "the list starts after the header"
+    );
+    assert_eq!(
+        machine.reg(A1) & 0xffff,
+        0x11 | ((SECOND as u64) << 8),
+        "message-signalled interrupts, and the Express capability after it"
+    );
+    assert_eq!(
+        machine.reg(A2) & 0xffff,
+        0x10,
+        "Express, and nothing after it"
+    );
+    assert_eq!(machine.reg(A3), 0, "a function with no capabilities");
+}
+
+#[test]
+fn status_says_there_is_a_list_only_when_there_is_one() {
+    let machine = integrated(&[lwu(A0, T0, COMMAND), lwu(A1, T1, COMMAND)]).run();
+
+    assert_ne!(machine.reg(A0) >> 16 & (1 << 4), 0);
+    assert_eq!(
+        machine.reg(A1) >> 16 & (1 << 4),
+        0,
+        "or software follows a pointer into nothing"
+    );
+}
+
+#[test]
+fn an_express_function_says_which_kind_of_express_device_it_is() {
+    let machine = integrated(&[lwu(A0, T0, EXPRESS_FLAGS)]).run();
+
+    assert_eq!(
+        machine.reg(A0) >> 16,
+        0x0092,
+        "version two, and a root complex integrated endpoint"
+    );
+}
+
+#[test]
+fn an_express_function_offers_no_reset_and_no_link() {
+    let machine = integrated(&[lwu(A0, T0, EXPRESS_DEVCAP), lwu(A1, T0, EXPRESS_LNKCAP)]).run();
+
+    assert_eq!(
+        machine.reg(A0),
+        0,
+        "128-byte payloads, and no function level reset, which is not implemented"
+    );
+    assert_eq!(
+        machine.reg(A1),
+        0,
+        "an endpoint on the root complex's own bus has no link below it"
+    );
+}
+
+#[test]
+fn device_control_is_storage_but_for_the_reset_that_is_not_offered() {
+    let machine = integrated(&[
+        lwu(A0, T0, EXPRESS_DEVCTL),
+        sw(T4, T0, EXPRESS_DEVCTL),
+        lwu(A1, T0, EXPRESS_DEVCTL),
+        sw(T4, T0, EXPRESS_DEVCTL2),
+        lwu(A2, T0, EXPRESS_DEVCTL2),
+        lwu(A3, T0, EXPRESS_DEVCTL),
+    ])
+    .reg(T4, u64::MAX)
+    .run();
+
+    assert_eq!(
+        machine.reg(A0),
+        0x2000,
+        "reads of up to 512 bytes, which is what it comes out of reset asking for"
+    );
+    assert_eq!(
+        machine.reg(A1) & 0xffff,
+        0x7fff,
+        "every bit but the one that would start a reset"
+    );
+    assert_eq!(machine.reg(A1) >> 16, 0, "device status detects nothing");
+    assert_eq!(
+        machine.reg(A2) & 0xffff,
+        0xffff,
+        "the second one is storage"
+    );
+    assert_eq!(
+        machine.reg(A3) & 0xffff,
+        0x7fff,
+        "and writing it leaves the first alone"
+    );
+}

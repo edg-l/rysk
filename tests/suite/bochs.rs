@@ -160,6 +160,26 @@ fn the_windows_are_a_prefetchable_framebuffer_and_registers_beside_it() {
 }
 
 #[test]
+fn the_card_is_a_root_complex_integrated_endpoint() {
+    // The capability list, which is one capability long for a card that never
+    // interrupts, and what it says the card is.
+    let (program, _) = card(&[lwu(A0, T0, 0x34), lwu(A1, T0, 0x40)]);
+    let machine = program.run();
+
+    assert_eq!(machine.reg(A0), 0x40, "the list starts after the header");
+    assert_eq!(
+        machine.reg(A1) & 0xff,
+        0x10,
+        "PCI Express, and nothing after"
+    );
+    assert_eq!(
+        machine.reg(A1) >> 16,
+        0x0092,
+        "version two, root complex integrated endpoint, which is what qemu reports"
+    );
+}
+
+#[test]
 fn the_identity_register_says_this_is_a_bochs_display() {
     let (program, _) = card(&[lhu(A0, T2, reg(INDEX_ID))]);
     assert_eq!(program.run().reg(A0), 0xb0c5);

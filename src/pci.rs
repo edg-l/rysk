@@ -58,16 +58,44 @@ const INTERRUPT: u64 = 0x3c;
 /// list begins because there is nowhere else for it to go.
 const HEADER_END: u64 = 0x40;
 
-/// The capability every function here that interrupts by message has, and the three
-/// registers it is made of: what it is and how big, and where in the function's own
-/// windows the vector table and the pending array were put.
+/// The capability a function that interrupts by message has, and the three registers it
+/// is made of: what it is and how big, and where in the function's own windows the
+/// vector table and the pending array were put.
 /// PCI Local Bus Specification 3.0, 6.8.2.
-const MSIX: u64 = HEADER_END;
 const MSIX_ID: u32 = 0x11;
-const MSIX_CONTROL: u64 = MSIX;
-const MSIX_TABLE: u64 = MSIX + 4;
-const MSIX_PBA: u64 = MSIX + 8;
-const MSIX_END: u64 = MSIX + 12;
+const MSIX_SIZE_BYTES: u64 = 12;
+const MSIX_CONTROL: u64 = 0;
+const MSIX_TABLE: u64 = 4;
+const MSIX_PBA: u64 = 8;
+
+/// The capability that says a function is a PCI Express device rather than a
+/// conventional one, and the registers of it that mean anything here.
+///
+/// Everything below is version two of the capability, which is 0x3c bytes whether or
+/// not the registers in it apply. Most do not: a root complex integrated endpoint has
+/// no link, no slot and no root port below it, so the link, slot and root registers are
+/// not implemented and read as zero, which is what the specification requires of them.
+/// PCI Express Base Specification, 7.5.3.
+const EXPRESS_ID: u32 = 0x10;
+const EXPRESS_SIZE_BYTES: u64 = 0x3c;
+const EXPRESS_FLAGS: u64 = 0;
+const EXPRESS_DEVCAP: u64 = 0x04;
+const EXPRESS_DEVCTL: u64 = 0x08;
+const EXPRESS_DEVCTL2: u64 = 0x28;
+/// Version two of the capability, and the one kind of device this root complex can
+/// hold: an endpoint on the root complex's own bus, with no link between it and the
+/// host. PCI Express Base Specification, 7.5.3.2.
+const EXPRESS_VERSION: u32 = 2;
+const EXPRESS_TYPE_RC_END: u32 = 0x9;
+const EXPRESS_CAPABILITIES: u32 = EXPRESS_VERSION | (EXPRESS_TYPE_RC_END << 4);
+/// Device control's reset value: errors unreported, payloads of 128 bytes, and reads of
+/// up to 512, which is what the specification says a function powers up asking for.
+/// PCI Express Base Specification, 7.5.3.4.
+const EXPRESS_DEVCTL_RESET: u32 = 0x2000;
+/// The one bit of device control that is not storage. It starts a function level reset,
+/// which this root complex does not offer and does not advertise in device
+/// capabilities, so it reads back as zero however it is written.
+const EXPRESS_DEVCTL_FLR: u32 = 1 << 15;
 /// Message control: how many vectors there are, one less than the number, and the two
 /// bits software turns the whole thing on and off with.
 const MSIX_SIZE: u32 = 0x7ff;
@@ -150,6 +178,14 @@ pub struct Header {
     pub pin: u8,
     /// The messages it can send instead, if it can send any.
     pub msix: Option<MsiX>,
+    /// Whether this function is a PCI Express device rather than a conventional one.
+    ///
+    /// Everything on this root complex sits on its own bus with no link in between, so
+    /// the only kind of Express device it can hold is a root complex integrated
+    /// endpoint: saying yes says which. What it buys a driver is the link speeds,
+    /// payload sizes and error reporting that live in the capability, none of which
+    /// mean anything without a link, and the answer to `pci_is_pcie`.
+    pub express: bool,
 }
 
 /// What a function's message-signalled interrupts look like: how many there are, and
@@ -176,6 +212,7 @@ impl Default for Header {
             bars: [Bar::None; 6],
             pin: 0,
             msix: None,
+            express: false,
         }
     }
 }
@@ -210,6 +247,10 @@ struct Slot {
     /// What software wrote in the function's message control register: whether it may
     /// send messages at all, and whether every one of them is masked.
     msix_control: u32,
+    /// What it wrote in the Express capability's two device control registers, the
+    /// second in the high half. Nothing here reads them: payload sizes and error
+    /// reporting describe a link, and there is no link below a root complex's own bus.
+    express_control: u32,
     /// One entry per vector, four words each, and a bit per vector for the ones that
     /// were raised while masked.
     vectors: Vec<[u32; 4]>,
@@ -256,6 +297,67 @@ enum Region {
 /// PCI Local Bus Specification 3.0, 6.8.2.
 fn place((bar, offset): (usize, u64)) -> u32 {
     offset as u32 | bar as u32
+}
+
+/// One of the capabilities a function can have, beyond the header every function has.
+///
+/// Which of them a function has is its own to say, in its `Header`. Where each one goes
+/// in config space and which one follows it is the root complex's, the same way a
+/// function says how big a window it wants and software says where that goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capability {
+    MsiX,
+    Express,
+}
+
+impl Capability {
+    /// How many bytes of config space it takes. Every capability is a whole number of
+    /// doublewords long, since the pointer to one cannot address anything finer.
+    const fn size(self) -> u64 {
+        match self {
+            Self::MsiX => MSIX_SIZE_BYTES,
+            Self::Express => EXPRESS_SIZE_BYTES,
+        }
+    }
+
+    /// The byte that says what it is, which is the first of it.
+    const fn id(self) -> u32 {
+        match self {
+            Self::MsiX => MSIX_ID,
+            Self::Express => EXPRESS_ID,
+        }
+    }
+}
+
+/// Every capability a header declares, in the order they are chained, each with where
+/// it starts: packed one after another from the end of the header, since there is
+/// nowhere else for them to go and no reason to leave gaps.
+fn capabilities(header: &Header) -> impl Iterator<Item = (u64, Capability)> + '_ {
+    [
+        header.msix.map(|_| Capability::MsiX),
+        header.express.then_some(Capability::Express),
+    ]
+    .into_iter()
+    .flatten()
+    .scan(HEADER_END, |at, capability| {
+        let start = *at;
+        *at += capability.size();
+        Some((start, capability))
+    })
+}
+
+/// Which capability a register in the list belongs to: the capability, how far into it
+/// the register is, and where the one after it starts, which is what the list is
+/// threaded on. Nothing means the register is past the end of the list.
+fn in_capability(header: &Header, reg: u64) -> Option<(Capability, u64, u64)> {
+    let mut list = capabilities(header).peekable();
+    while let Some((at, capability)) = list.next() {
+        if (at..at + capability.size()).contains(&reg) {
+            let next = list.peek().map_or(0, |(at, _)| *at);
+            return Some((capability, reg - at, next));
+        }
+    }
+    None
 }
 
 /// The root complex, and everything below it.
@@ -364,6 +466,7 @@ impl Complex {
             command: 0,
             interrupt_line: 0,
             msix_control: 0,
+            express_control: EXPRESS_DEVCTL_RESET,
             // A vector starts masked, which is what stops a function interrupting
             // before software has said where to send it.
             // PCI Local Bus Specification 3.0, 6.8.2.9.
@@ -385,7 +488,7 @@ impl Complex {
         match reg {
             VENDOR => (header.vendor as u32) | ((header.device as u32) << 16),
             COMMAND => {
-                let status = match header.msix {
+                let status = match capabilities(header).next() {
                     Some(_) => STATUS_CAPABILITIES,
                     None => 0,
                 };
@@ -398,10 +501,7 @@ impl Complex {
             // Where the capability list starts, or nothing. The status register says
             // the same thing, and the two have to agree or software follows a pointer
             // into nothing.
-            CAPABILITIES => match header.msix {
-                Some(_) => MSIX as u32,
-                None => 0,
-            },
+            CAPABILITIES => capabilities(header).next().map_or(0, |(at, _)| at as u32),
             INTERRUPT => (slot.interrupt_line as u32) | ((header.pin as u32) << 8),
             _ if (BAR0..BAR0 + 24).contains(&reg) => {
                 let n = ((reg - BAR0) / 4) as usize;
@@ -412,24 +512,45 @@ impl Complex {
                 }
             }
             _ if reg < HEADER_END => 0,
-            // Beyond the header is the capability list, which is one capability long
-            // and only exists for a function that has messages to send.
-            MSIX..MSIX_END => match header.msix {
-                Some(msix) => match reg {
-                    // The identity, no next capability, and how many vectors there are,
-                    // reported one less than there are.
-                    MSIX_CONTROL => {
-                        MSIX_ID
-                            | ((msix.vectors as u32 - 1) << 16)
-                            | (slot.msix_control & MSIX_WRITABLE)
+            // Beyond the header is the capability list. Every capability starts with
+            // what it is and where the next one is, and each one says the rest itself.
+            _ => match in_capability(header, reg) {
+                Some((capability, at, next)) => {
+                    let chain = capability.id() | (next as u32) << 8;
+                    match (capability, at) {
+                        (Capability::MsiX, MSIX_CONTROL) => {
+                            let vectors = header.msix.expect("a capability it declared").vectors;
+                            // How many vectors there are, reported one less than there
+                            // are, and the two bits software has written.
+                            chain
+                                | ((vectors as u32 - 1) << 16)
+                                | (slot.msix_control & MSIX_WRITABLE)
+                        }
+                        (Capability::MsiX, MSIX_TABLE) => {
+                            place(header.msix.expect("a capability it declared").table)
+                        }
+                        (Capability::MsiX, MSIX_PBA) => {
+                            place(header.msix.expect("a capability it declared").pending)
+                        }
+                        // What kind of Express device this is, and which version of the
+                        // capability says so.
+                        (Capability::Express, EXPRESS_FLAGS) => {
+                            chain | (EXPRESS_CAPABILITIES << 16)
+                        }
+                        // Payloads of 128 bytes, no function level reset, and none of
+                        // the slot power or indicator fields, which need a slot.
+                        (Capability::Express, EXPRESS_DEVCAP) => 0,
+                        // Device control is storage; device status, above it, reports
+                        // errors that nothing here detects.
+                        (Capability::Express, EXPRESS_DEVCTL) => slot.express_control & 0xffff,
+                        (Capability::Express, EXPRESS_DEVCTL2) => slot.express_control >> 16,
+                        // The link, slot and root registers, which a root complex
+                        // integrated endpoint does not implement.
+                        _ => 0,
                     }
-                    MSIX_TABLE => place(msix.table),
-                    MSIX_PBA => place(msix.pending),
-                    _ => 0,
-                },
+                }
                 None => 0,
             },
-            _ => 0,
         }
     }
 
@@ -442,11 +563,31 @@ impl Complex {
         let merge = |old: u32| (old & !mask) | (value & mask);
         match reg {
             COMMAND => slot.command = merge(slot.command as u32) as u16 & COMMAND_MASK,
-            // Only the two bits that turn messages on and off are software's; the rest
-            // of the capability describes what the function is.
-            MSIX_CONTROL if slot.header.msix.is_some() => {
-                slot.msix_control = merge(slot.msix_control) & MSIX_WRITABLE;
-                self.release(device);
+            _ if reg >= HEADER_END => {
+                let Some((capability, at, _)) = in_capability(&slot.header, reg) else {
+                    return;
+                };
+                match (capability, at) {
+                    // Only the two bits that turn messages on and off are software's;
+                    // the rest of the capability describes what the function is.
+                    (Capability::MsiX, MSIX_CONTROL) => {
+                        slot.msix_control = merge(slot.msix_control) & MSIX_WRITABLE;
+                        self.release(device);
+                    }
+                    // Device control is storage but for the bit that would start a
+                    // reset this root complex does not offer, and device status above
+                    // it is written to clear errors nothing here ever set.
+                    (Capability::Express, EXPRESS_DEVCTL) => {
+                        let control = merge(slot.express_control & 0xffff) & 0xffff;
+                        slot.express_control =
+                            (slot.express_control & !0xffff) | (control & !EXPRESS_DEVCTL_FLR);
+                    }
+                    (Capability::Express, EXPRESS_DEVCTL2) => {
+                        let control = merge(slot.express_control >> 16) & 0xffff;
+                        slot.express_control = (slot.express_control & 0xffff) | (control << 16);
+                    }
+                    _ => {}
+                }
             }
             INTERRUPT => slot.interrupt_line = merge(slot.interrupt_line as u32) as u8,
             _ if (BAR0..BAR0 + 24).contains(&reg) => {

@@ -400,6 +400,7 @@ impl Function for Bochs {
             // and there is no scanout to be told about.
             pin: 0,
             msix: None,
+            express: true,
         }
     }
 
