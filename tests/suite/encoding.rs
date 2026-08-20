@@ -65,8 +65,10 @@ fn encoder_matches_the_toolchain() {
 
     let bytes = std::fs::read("tests/encodings.bin").expect("run `make test_files`");
     let actual: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
         .collect();
 
     assert_eq!(actual.len(), expected.len(), "instruction count");
@@ -105,8 +107,10 @@ fn compressed_encoder_matches_the_toolchain() {
 
     let bytes = std::fs::read("tests/compressed.bin").expect("run `make test_files`");
     let actual: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|h| u16::from_le_bytes(h.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|h| u16::from_le_bytes(*h))
         .collect();
 
     assert_eq!(actual.len(), expected.len(), "instruction count");

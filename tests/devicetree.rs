@@ -64,8 +64,10 @@ fn parse(blob: &[u8]) -> HashMap<String, Vec<u8>> {
 
 fn cells(value: &[u8]) -> Vec<u32> {
     value
-        .chunks_exact(4)
-        .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_be_bytes(*c))
         .collect()
 }
 

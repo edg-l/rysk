@@ -347,22 +347,22 @@ fn rows(bytes: &[u8], mode: &Mode, band: Range<u32>) -> ColorImage {
         // the card to keep its pixels in.
         Format::Xrgb8888 { big_endian: false } => {
             for y in band.clone() {
-                let row = row(y).chunks_exact(4);
-                pixels.extend(row.map(|p| Color32::from_rgb(p[2], p[1], p[0])));
+                let (row, _) = row(y).as_chunks::<4>();
+                pixels.extend(row.iter().map(|p| Color32::from_rgb(p[2], p[1], p[0])));
             }
         }
         Format::Xrgb8888 { big_endian: true } => {
             for y in band.clone() {
-                let row = row(y).chunks_exact(4);
-                pixels.extend(row.map(|p| Color32::from_rgb(p[1], p[2], p[3])));
+                let (row, _) = row(y).as_chunks::<4>();
+                pixels.extend(row.iter().map(|p| Color32::from_rgb(p[1], p[2], p[3])));
             }
         }
         // Five, six and five bits in a native-order word. Each is widened by repeating
         // its own top bits, so that all ones is white rather than nearly white.
         Format::R5g6b5 => {
             for y in band.clone() {
-                let row = row(y).chunks_exact(2);
-                pixels.extend(row.map(|p| {
+                let (row, _) = row(y).as_chunks::<2>();
+                pixels.extend(row.iter().map(|p| {
                     let word = u16::from_le_bytes([p[0], p[1]]);
                     let (red, green, blue) = (word >> 11, (word >> 5) & 0x3f, word & 0x1f);
                     Color32::from_rgb(
