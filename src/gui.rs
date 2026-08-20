@@ -238,6 +238,10 @@ struct Window {
     /// guest something, and a machine being watched closely is one a person has
     /// usually stopped anyway.
     live: bool,
+    /// Whether the pause the machine is sitting in is one this window asked for to
+    /// read it. Only those are let go of again: a machine a person stopped stays
+    /// stopped, however current they also asked the panels to be.
+    borrowed: Borrowed,
     /// Which hart the panels are about.
     hart: usize,
     /// What is typed in the memory panel's address box.
@@ -275,6 +279,7 @@ impl Window {
             view: View::default(),
             pending: Vec::new(),
             live: false,
+            borrowed: Borrowed::default(),
             hart: 0,
             at: String::new(),
             picture: None,
@@ -296,12 +301,18 @@ impl Window {
         // queued behind it would be waiting on exactly the thing it is asking to stop.
         let mut pending = std::mem::take(&mut self.pending);
         pending.retain(|action| match action {
+            // Either of these settles what the machine is to do, so the window no
+            // longer owes it a resume: a pause a person asked for outranks one this
+            // window took to read with, and without this the next read would hand
+            // back a pause that was never the window's to give.
             Action::Run => {
                 self.running.resume();
+                self.borrowed.settled();
                 false
             }
             Action::Pause => {
                 self.running.pause();
+                self.borrowed.settled();
                 false
             }
             _ => true,
@@ -312,6 +323,7 @@ impl Window {
         // hart.
         if self.live && self.running.state() == State::Running {
             self.running.pause();
+            self.borrowed.take();
         }
         let Ok(mut session) = self.session.try_lock() else {
             // Everything else needs the machine itself, so it waits for a frame that
@@ -348,7 +360,8 @@ impl Window {
             self.at = format!("{:#x}", self.view.at);
         }
         self.view.read(&mut session, self.hart);
-        if self.live && !self.running.halted() {
+        // Only a pause this window took to read the machine is one it gives back.
+        if self.borrowed.give_back() && !self.running.halted() {
             session.running().resume();
         }
     }
@@ -458,6 +471,19 @@ impl Window {
         Some(mode)
     }
 
+    /// What the machine is doing as far as a person is concerned, which is not always
+    /// what the flag says. A window keeping its panels current stops the machine for a
+    /// moment many times a second, and a control that reported each of those would
+    /// flicker between `run` and `pause` and do whichever it happened to be showing
+    /// when it was clicked. A pause the window is holding reads as running, because
+    /// that is what it is about to go back to being.
+    fn showing(&self) -> State {
+        match (self.running.state(), self.borrowed.owed()) {
+            (State::Paused, true) => State::Running,
+            (state, _) => state,
+        }
+    }
+
     /// What the window says about the machine above the picture: what to ask of it,
     /// what it is doing, and the mode the guest asked for.
     fn status(&mut self, ui: &mut Ui, mode: Option<Mode>) {
@@ -470,7 +496,7 @@ impl Window {
             ),
         };
         let mut actions = Vec::new();
-        panels::controls(ui, &self.view, self.running.state(), &mut actions);
+        panels::controls(ui, &self.view, self.showing(), &mut actions);
         ui.horizontal(|ui| {
             ui.label(showing);
             ui.separator();
@@ -515,6 +541,40 @@ impl eframe::App for Window {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.running.halt();
+    }
+}
+
+/// Whether the window is holding a pause of its own.
+///
+/// A window keeping its panels current pauses the machine to read it and lets it go
+/// again, and only a pause it took that way is one it gives back. A pause a person
+/// asked for settles what the machine is to do and cancels the debt: without that
+/// difference the next read hands back a pause that was never the window's to give, and
+/// the machine a person stopped carries on running.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Borrowed(bool);
+
+impl Borrowed {
+    /// The window paused the machine to read it, and owes it a resume.
+    fn take(&mut self) {
+        self.0 = true;
+    }
+
+    /// Something decided what the machine is to do, so nothing is owed either way.
+    fn settled(&mut self) {
+        self.0 = false;
+    }
+
+    /// Whether to let the machine go again, which is only so if this window is what
+    /// stopped it. Asking clears the debt.
+    fn give_back(&mut self) -> bool {
+        std::mem::take(&mut self.0)
+    }
+
+    /// Whether a resume is still owed, without taking it. What the controls ask, so
+    /// that a machine this window stopped for a moment still reads as running.
+    fn owed(self) -> bool {
+        self.0
     }
 }
 
@@ -616,6 +676,36 @@ fn rows(bytes: &[u8], mode: &Mode, band: Range<u32>) -> ColorImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window keeping its panels current is what makes this distinction necessary:
+    /// it stops the machine every frame to read it, and a person pressing pause in the
+    /// middle of that has to be able to make the pause stick.
+    #[test]
+    fn only_a_pause_the_window_took_is_one_it_gives_back() {
+        let mut borrowed = Borrowed::default();
+        assert!(!borrowed.give_back(), "it never took one");
+
+        borrowed.take();
+        assert!(
+            borrowed.give_back(),
+            "this one is the window's to give back"
+        );
+        assert!(!borrowed.give_back(), "and only once");
+    }
+
+    /// The bug this is here for: a pause taken to read with, then a person pressing
+    /// pause before the read happened, used to leave the window owing a resume it had
+    /// no right to give, and the machine carried on running.
+    #[test]
+    fn a_pause_somebody_asked_for_cancels_one_the_window_took() {
+        let mut borrowed = Borrowed::default();
+        borrowed.take();
+        borrowed.settled();
+        assert!(
+            !borrowed.give_back(),
+            "the machine stays stopped, however current the panels were asked to be"
+        );
+    }
     use crate::{
         bochs::{Bochs, VGAMEM},
         pci::Function,
