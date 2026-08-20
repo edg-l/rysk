@@ -53,19 +53,32 @@ fn describe(machine: &Machine, halt: Option<Halt>) -> String {
 /// Run the machine behind a window, which is a thing only a build that was asked for
 /// one can do.
 #[cfg(feature = "gui")]
+fn ends(frontend: &machine::Frontend) -> rysk::gui::Ends {
+    rysk::gui::Ends {
+        screen: frontend.screen.clone(),
+        keys: frontend.keys.clone(),
+        pointer: frontend.pointer.clone(),
+    }
+}
+
+#[cfg(feature = "gui")]
 fn window(
     machine: &mut Machine,
-    screen: Option<rysk::bochs::Screen>,
+    ends: rysk::gui::Ends,
 ) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
-    Ok(rysk::gui::run(machine, screen)?)
+    Ok(rysk::gui::run(machine, ends)?)
 }
 
 #[cfg(not(feature = "gui"))]
-fn window(
-    _machine: &mut Machine,
-    _screen: Option<rysk::bochs::Screen>,
-) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
-    Err("--gui: this rysk was built without a window, which is `--features gui`".into())
+fn ends(_frontend: &machine::Frontend) {}
+
+#[cfg(not(feature = "gui"))]
+fn window(_machine: &mut Machine, _ends: ()) -> Result<Option<Halt>, Box<dyn std::error::Error>> {
+    Err(
+        "--gui: this rysk was built without a window, which is what \
+         `--no-default-features` leaves out"
+            .into(),
+    )
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -200,6 +213,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // being a hart. The terminal is still in its usual line-buffered mode, so a line
     // arrives when it is finished rather than a key at a time: making it raw is the
     // frontend's job and the frontend is not written yet.
+    // The window's ends are taken first, since the serial port's end is moved out of
+    // the frontend just below and moving one field out ends the whole of it.
+    let ends = ends(&frontend);
     let keyboard = frontend.keyboard;
     std::thread::spawn(move || {
         let mut byte = [0u8; 1];
@@ -220,7 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stopped = match (tohost, gui) {
         (Some(tohost), _) => htif::run(&mut machine, tohost, MAX_STEPS).to_string(),
         (None, true) => {
-            let halt = window(&mut machine, frontend.screen.clone())?;
+            let halt = window(&mut machine, ends)?;
             describe(&machine, halt)
         }
         (None, false) => {

@@ -19,14 +19,26 @@
 use std::{ops::Range, thread, time::Duration};
 
 use eframe::egui::{
-    CentralPanel, Color32, ColorImage, Context, Image, Panel, TextureHandle, TextureOptions, Ui,
-    ViewportBuilder, load::SizedTexture,
+    CentralPanel, Color32, ColorImage, Context, Event, Image, Panel, TextureHandle, TextureOptions,
+    Ui, ViewportBuilder, load::SizedTexture,
 };
 
 use crate::{
     bochs::{Dirty, Format, Mode, PAGE, Screen},
+    hid::{Keys, Pointer},
+    input::{Keyboard, Mouse},
     machine::{Halt, Machine, Running},
 };
+
+/// The ends of the machine a window drives it through: what a frame is read out of,
+/// and what a keystroke and a mouse movement are pushed into. Every one of them is
+/// missing on a machine that was not built with the device behind it.
+#[derive(Debug, Default)]
+pub struct Ends {
+    pub screen: Option<Screen>,
+    pub keys: Option<Keys>,
+    pub pointer: Option<Pointer>,
+}
 
 /// How long the window leaves between asking the display what it is showing. A guest
 /// draws when it likes and says nothing about it, so a frontend has to look; sixty
@@ -45,8 +57,9 @@ const PIXELS: TextureOptions = TextureOptions::NEAREST;
 /// Open a window on `screen` and run `machine` behind it, until the window is closed
 /// or the machine reaches a trap nothing handles. Answers that trap, if that is how it
 /// ended.
-pub fn run(machine: &mut Machine, screen: Option<Screen>) -> Result<Option<Halt>, eframe::Error> {
+pub fn run(machine: &mut Machine, ends: Ends) -> Result<Option<Halt>, eframe::Error> {
     let running = machine.running.clone();
+    let screen = ends.screen;
     // Made here rather than by `eframe`, so that the thread watching the guest's screen
     // has something to wake the window through before there is a window.
     let ctx = Context::default();
@@ -69,7 +82,10 @@ pub fn run(machine: &mut Machine, screen: Option<Screen>) -> Result<Option<Halt>
             "rysk",
             options,
             Some(ctx.clone()),
-            Box::new(|_| Ok(Box::new(Window::new(screen, running.clone())))),
+            Box::new(|_| {
+                let window = Window::new(screen, ends.keys, ends.pointer, running.clone());
+                Ok(Box::new(window))
+            }),
         );
     });
 
@@ -124,6 +140,9 @@ struct Window {
     /// milestone can say. The panels that say the rest come later.
     running: Running,
     picture: Option<Picture>,
+    /// The guest's own keyboard and mouse, which the window presses and moves.
+    keyboard: Keyboard,
+    mouse: Mouse,
 }
 
 /// The texture the guest's picture is in, and the mode it was built for.
@@ -137,12 +156,54 @@ struct Picture {
 }
 
 impl Window {
-    fn new(screen: Option<Screen>, running: Running) -> Self {
+    fn new(
+        screen: Option<Screen>,
+        keys: Option<Keys>,
+        pointer: Option<Pointer>,
+        running: Running,
+    ) -> Self {
         Self {
             screen,
             running,
             picture: None,
+            keyboard: Keyboard::new(keys),
+            mouse: Mouse::new(pointer),
         }
+    }
+
+    /// Everything that happened at the window this frame, as the guest's own devices.
+    ///
+    /// The keys are taken by physical position rather than by what they produced, so
+    /// the keymap that applies is the guest's and not the host's. Movement is gathered
+    /// across the frame and sent once at the end, since a report carries one byte in
+    /// each direction and a frame holds many events.
+    fn input(&mut self, ctx: &Context) {
+        ctx.input(|input| {
+            for event in &input.events {
+                match event {
+                    Event::Key {
+                        physical_key: Some(key),
+                        pressed,
+                        ..
+                    } => {
+                        self.keyboard.key(*key, *pressed);
+                    }
+                    Event::MouseMoved(delta) => self.mouse.moved(*delta),
+                    Event::PointerButton {
+                        button, pressed, ..
+                    } => self.mouse.button(*button, *pressed),
+                    Event::MouseWheel { unit, delta, .. } => self.mouse.wheel(*unit, *delta),
+                    _ => {}
+                }
+            }
+            // A window nobody is typing at holds nothing down. Without this a key held
+            // as the window loses focus stays held in the guest for ever, since the
+            // release goes to whatever took the focus.
+            if !input.focused {
+                self.keyboard.released();
+            }
+        });
+        self.mouse.flush();
     }
 
     /// Bring the texture up to date with what the guest has drawn, and answer the mode
@@ -213,6 +274,7 @@ impl eframe::App for Window {
         // Nothing asks for the next frame here. `watch` is what does, once it has seen
         // that there is a next frame worth having.
         let ctx = ui.ctx().clone();
+        self.input(&ctx);
         let mode = self.refresh(&ctx);
         Panel::top("status").show(ui, |ui| self.status(ui, mode));
         CentralPanel::default().show(ui, |ui| {

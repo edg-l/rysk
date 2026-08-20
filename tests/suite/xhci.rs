@@ -322,6 +322,14 @@ impl Host {
 
     /// Put a transfer on an endpoint's ring and ring for it.
     fn transfer(&mut self, slot: usize, endpoint: usize, trbs: &[Trb]) -> Vec<Trb> {
+        let ring = self.transfer;
+        self.transfer_on(slot, endpoint, ring, trbs)
+    }
+
+    /// The same, on a ring said outright rather than on whichever one was configured
+    /// last, which is what a second device needs.
+    fn transfer_on(&mut self, slot: usize, endpoint: usize, ring: u64, trbs: &[Trb]) -> Vec<Trb> {
+        self.transfer = ring;
         for mut trb in trbs.iter().copied() {
             trb.control |= self.transfer_cycle as u32;
             self.put_trb(self.transfer, trb);
@@ -334,6 +342,12 @@ impl Host {
     /// Reset a port and take the slot the driver would: enable one, describe the device
     /// in an input context, and address it.
     fn attach(&mut self, port: u64) -> usize {
+        self.attach_at(port, TRANSFERS)
+    }
+
+    /// The same, with the control endpoint's ring said outright. A driver gives every
+    /// device rings of its own, so a test with more than one device has to as well.
+    fn attach_at(&mut self, port: u64, control: u64) -> usize {
         self.write_port(port, PORT_RESET);
         self.events();
 
@@ -350,7 +364,7 @@ impl Host {
         self.poke(INPUT + 36, &((port as u32) << 16).to_le_bytes());
         // A control endpoint, eight bytes at a time, and the ring it reads.
         self.poke(INPUT + 64 + 4, &((4u32 << 3) | (8 << 16)).to_le_bytes());
-        self.poke(INPUT + 64 + 8, &(TRANSFERS | 1).to_le_bytes());
+        self.poke(INPUT + 64 + 8, &(control | 1).to_le_bytes());
 
         let answer = self.one(trb(ADDRESS_DEVICE, INPUT, 0, (slot as u32) << 24));
         assert_eq!(answer.code(), SUCCESS, "addressing the device");
@@ -1141,6 +1155,54 @@ fn a_report_is_spread_over_the_blocks_a_transfer_was_chained_from() {
     );
 }
 
+/// A driver enumerates everything that is plugged in, so a machine with a keyboard and
+/// a mouse has two slots, two endpoints and two outstanding transfers at once. Every
+/// other test here drives one device at a time, which is the one shape a real driver
+/// never leaves the controller in.
+#[test]
+fn two_devices_each_report_on_their_own_ring() {
+    let mut host = host();
+    host.start();
+    host.events();
+
+    let keyboard = host.attach_at(1, TRANSFERS);
+    host.configure_reports_at(keyboard, TRANSFERS + 0x1000);
+    let mouse = host.attach_at(2, TRANSFERS + 0x2000);
+    host.configure_reports_at(mouse, TRANSFERS + 0x3000);
+
+    // One transfer left outstanding on each, which is what usbhid does to every device
+    // it binds: ask, and be told when there is something to tell.
+    host.transfer_on(
+        keyboard,
+        REPORTS,
+        TRANSFERS + 0x1000,
+        &[trb(NORMAL, BUFFER, 8, IOC)],
+    );
+    host.transfer_on(
+        mouse,
+        REPORTS,
+        TRANSFERS + 0x3000,
+        &[trb(NORMAL, BUFFER + 64, 8, IOC | SHORT)],
+    );
+
+    host.keys.typed(0, 0x04);
+    host.pointer.moved(1, 5, -5, 0);
+    host.xhci.poll();
+    let events = host.events();
+
+    assert_eq!(events.len(), 2, "both devices had something to say");
+    assert_eq!(
+        host.peek(BUFFER, 8),
+        [0, 0, 4, 0, 0, 0, 0, 0],
+        "the keyboard's report"
+    );
+    assert_eq!(
+        host.peek(BUFFER + 64, 4),
+        [1, 5, 0xfb, 0],
+        "and the mouse's, which the keyboard's slot must not have swallowed"
+    );
+}
+
 /// The mouse reports four bytes and the transfer asks for eight, so every report it
 /// sends is a short one.
 #[test]
@@ -1342,6 +1404,10 @@ impl Host {
     /// Add the endpoint the reports come in on, which a driver does when it chooses a
     /// configuration.
     fn configure_reports(&mut self, slot: usize) {
+        self.configure_reports_at(slot, TRANSFERS + 0x1000);
+    }
+
+    fn configure_reports_at(&mut self, slot: usize, ring: u64) {
         self.poke(INPUT, &0u32.to_le_bytes());
         self.poke(INPUT + 4, &(1u32 | (1 << REPORTS)).to_le_bytes());
         self.poke(
@@ -1350,11 +1416,11 @@ impl Host {
         );
         self.poke(
             INPUT + (REPORTS as u64 + 1) * 32 + 8,
-            &((TRANSFERS + 0x1000) | 1).to_le_bytes(),
+            &(ring | 1).to_le_bytes(),
         );
         let answer = self.one(trb(CONFIGURE_ENDPOINT, INPUT, 0, (slot as u32) << 24));
         assert_eq!(answer.code(), SUCCESS, "configuring the endpoint");
-        self.transfer = TRANSFERS + 0x1000;
+        self.transfer = ring;
     }
 }
 

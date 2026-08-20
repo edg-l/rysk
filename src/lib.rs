@@ -39,8 +39,12 @@ pub mod fpu;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod hid;
+// The host's end of the keyboard and the mouse: which physical key is which usage
+// code. Only a window has one, so it goes where the window goes.
 pub mod htif;
 pub mod imsic;
+#[cfg(feature = "gui")]
+pub mod input;
 pub mod inst;
 pub mod machine;
 pub mod mmu;
