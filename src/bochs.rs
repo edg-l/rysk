@@ -18,6 +18,10 @@
 //! The registers are the Bochs VBE interface as QEMU's `bochs-display` implements it,
 //! which is the definition the driver was written against: there is no standards
 //! document for them. Where a comment below cites an offset it is citing that model.
+//!
+//! Below the registers sits the block a monitor would answer with, which `edid` builds
+//! and this card only places: a card with nothing plugged into it still has to say what
+//! it can show, and a driver reading no block falls back to a list it invented.
 
 use std::sync::{
     Arc, Mutex,
@@ -25,6 +29,7 @@ use std::sync::{
 };
 
 use crate::{
+    edid,
     pci::{Bar, Function, Header},
     shared::Bytes,
     trap::Exception,
@@ -48,6 +53,21 @@ const CLASS: u32 = 0x0380_0002;
 
 /// The window the registers answer in, and how big it is.
 const MMIO: u64 = 0x1000;
+
+/// What the monitor on the other end of this card says it is. There is no other end,
+/// so the card is what has to say: a driver reads the block at the bottom of the
+/// register window and takes its modes from there rather than guessing at a list.
+pub const MONITOR: edid::Monitor = edid::Monitor {
+    vendor: *b"RSK",
+    name: "rysk display",
+    width: 1280,
+    height: 800,
+};
+
+/// Where that block is, which is the bottom of the register window. A driver reads it
+/// one 128-byte block at a time and stops at the first offset past this that the
+/// window would not answer for.
+const EDID_END: u64 = edid::SIZE as u64;
 
 /// Where the sixteen-bit registers are in that window, and how many there are. Ten of
 /// them are storage; the eleventh reports how much video memory there is and is not.
@@ -106,6 +126,9 @@ struct Vbe {
 struct Card {
     vram: Vram,
     vbe: Mutex<Vbe>,
+    /// What the monitor answers when asked what it is. Generated once, since nothing
+    /// about it changes and nothing writes to it.
+    edid: [u8; edid::SIZE],
 }
 
 /// The framebuffer: bytes any hart may write and the host may read, and a bit per page
@@ -251,8 +274,9 @@ impl Dirty {
 pub struct Mode {
     pub width: u32,
     pub height: u32,
-    /// Four for the 32-bit format, two for the 16-bit one, which is `r5g6b5`.
-    pub depth: u32,
+    /// What one pixel of it is made of, which is the whole of what a host needs to
+    /// read one out.
+    pub format: Format,
     /// How many bytes one row occupies, which is the virtual width rather than the
     /// visible one: a driver pans by making the picture wider than the screen.
     pub stride: u32,
@@ -260,9 +284,35 @@ pub struct Mode {
     pub offset: u64,
     /// How many bytes the whole picture occupies from there.
     pub size: u64,
-    /// Which end of a pixel its bytes start at. The driver picks this from the format
-    /// its own framebuffer is in and tells the card through the extended registers.
-    pub big_endian: bool,
+}
+
+/// What the bytes of one pixel are, of the two arrangements this card can be driven in.
+///
+/// The depth register picks between them and nothing else does, so a format is a depth
+/// plus whatever else that depth needs said about it. At thirty-two bits that is which
+/// end of the pixel its bytes start at, which the driver sets through the extended
+/// registers to match the format of its own framebuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// Four bytes: blue, green, red and one the card ignores, or the reverse of that.
+    Xrgb8888 { big_endian: bool },
+    /// Two bytes: five bits of red, six of green and five of blue, in one sixteen-bit
+    /// word of the host's own order.
+    ///
+    /// The byte order register says nothing about this one. A driver asking for the
+    /// other order at this depth is asking for something the card has no arrangement
+    /// for, and QEMU's model answers the same way: native order only.
+    R5g6b5,
+}
+
+impl Format {
+    /// How many bytes one pixel of it takes.
+    pub fn bytes(self) -> u32 {
+        match self {
+            Self::Xrgb8888 { .. } => 4,
+            Self::R5g6b5 => 2,
+        }
+    }
 }
 
 impl Vbe {
@@ -291,11 +341,14 @@ impl Vbe {
         if self.regs[INDEX_ENABLE] & ENABLED == 0 {
             return None;
         }
-        let depth = match self.regs[INDEX_BPP] {
-            16 => 2,
-            32 => 4,
+        let format = match self.regs[INDEX_BPP] {
+            16 => Format::R5g6b5,
+            32 => Format::Xrgb8888 {
+                big_endian: self.big_endian,
+            },
             _ => return None,
         };
+        let depth = format.bytes();
         let width = self.regs[INDEX_XRES] as u32;
         let height = self.regs[INDEX_YRES] as u32;
         // A virtual width narrower than the visible one would make a row shorter than
@@ -310,11 +363,10 @@ impl Vbe {
         Some(Mode {
             width,
             height,
-            depth,
+            format,
             stride,
             offset,
             size,
-            big_endian: self.big_endian,
         })
     }
 }
@@ -333,6 +385,7 @@ impl Bochs {
         Self(Arc::new(Card {
             vram: Vram::new(vgamem),
             vbe: Mutex::new(Vbe::default()),
+            edid: edid::generate(&MONITOR),
         }))
     }
 
@@ -342,14 +395,14 @@ impl Bochs {
     }
 
     /// A byte of the register window. Everything the model does not answer for reads as
-    /// all ones, which is what an access to a window with nothing behind it gives and
-    /// is how the driver tells that this card has no EDID blob to read.
+    /// all ones, which is what an access to a window with nothing behind it gives.
     ///
     /// The registers arrive already held, so that every byte of one access sees the
     /// same ones: a read of a sixteen-bit register that took the two halves separately
     /// could be torn in half by a write between them.
     fn register(&self, vbe: &Vbe, offset: u64) -> u8 {
         match offset {
+            ..EDID_END => self.0.edid[offset as usize],
             DISPI..DISPI_END => {
                 let at = offset - DISPI;
                 vbe.read((at / 2) as usize, self.0.vram.size())

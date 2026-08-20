@@ -3,7 +3,7 @@
 
 use crate::common::*;
 use rysk::{
-    bochs::{self, Bochs, PAGE, Screen},
+    bochs::{self, Bochs, Format, PAGE, Screen},
     device::{Line, Msi},
     pci::{self, Root},
 };
@@ -233,15 +233,54 @@ fn a_byte_written_to_half_a_register_leaves_the_other_half() {
 
 #[test]
 fn the_window_reads_as_all_ones_where_the_card_answers_for_nothing() {
-    // The first of these is where an EDID blob would be, and reading it as all ones is
-    // exactly how the driver tells that this card has none. The second is the window a
-    // VGA-compatible card would answer its ports in, which this one is not.
-    let (program, _) = card(&[lwu(A0, T2, 0), lbu(A1, T2, 0x400), lhu(A2, T2, 0x516)]);
+    // The first of these is past the monitor's block, in the window a VGA-compatible
+    // card would answer its ports in, which this one is not. The second is past the
+    // last sixteen-bit register.
+    let (program, _) = card(&[lbu(A0, T2, 0x400), lhu(A1, T2, 0x516)]);
     let machine = program.run();
 
-    assert_eq!(machine.reg(A0), 0xffff_ffff);
-    assert_eq!(machine.reg(A1), 0xff);
-    assert_eq!(machine.reg(A2), 0xffff);
+    assert_eq!(machine.reg(A0), 0xff);
+    assert_eq!(machine.reg(A1), 0xffff);
+}
+
+/// What the driver reads first, and the only thing it checks before believing the rest:
+/// it takes eight bytes from the bottom of the window and gives up on the block if they
+/// are not the header every one of them starts with.
+#[test]
+fn the_bottom_of_the_window_is_the_block_a_monitor_answers_with() {
+    let (program, _) = card(&[lwu(A0, T2, 0), lwu(A1, T2, 4), lbu(A2, T2, 126)]);
+    let machine = program.run();
+
+    assert_eq!(machine.reg(A0), 0xffff_ff00);
+    assert_eq!(machine.reg(A1), 0x00ff_ffff);
+    assert_eq!(machine.reg(A2), 1, "and one extension block follows it");
+}
+
+/// Every byte of it, as the driver reads it: one 128-byte block at a time, out of the
+/// same window the registers are in.
+#[test]
+fn the_whole_block_reads_back_as_the_card_generated_it() {
+    let (program, _) = card(&[lbu(A0, T2, 0x80), lbu(A1, T2, 0xff)]);
+    let machine = program.run();
+
+    let block = rysk::edid::generate(&rysk::bochs::MONITOR);
+    assert_eq!(machine.reg(A0), block[0x80] as u64, "the extension's first");
+    assert_eq!(machine.reg(A1), block[0xff] as u64, "and its checksum");
+}
+
+/// The mode the block says it would rather be driven in, which is the one a driver
+/// takes as preferred and sizes its console by.
+#[test]
+fn the_monitor_prefers_the_mode_the_card_was_built_with() {
+    let block = rysk::edid::generate(&rysk::bochs::MONITOR);
+    let desc = &block[54..72];
+    let width = desc[2] as u32 | ((desc[4] as u32 & 0xf0) << 4);
+    let height = desc[5] as u32 | ((desc[7] as u32 & 0xf0) << 4);
+
+    assert_eq!(
+        (width, height),
+        (rysk::bochs::MONITOR.width, rysk::bochs::MONITOR.height)
+    );
 }
 
 #[test]
@@ -285,7 +324,10 @@ fn the_byte_order_a_driver_asked_for_reaches_the_host() {
     );
     program.run();
 
-    assert!(screen.mode().expect("a mode").big_endian);
+    assert_eq!(
+        screen.mode().expect("a mode").format,
+        Format::Xrgb8888 { big_endian: true }
+    );
 }
 
 #[test]
@@ -316,11 +358,83 @@ fn a_mode_is_only_a_mode_once_every_register_agrees() {
     let mode = screen.mode().expect("a mode, now that all of them have");
 
     assert_eq!((mode.width, mode.height), (1024, 768));
-    assert_eq!(mode.depth, 4, "thirty-two bits a pixel");
+    assert_eq!(
+        mode.format,
+        Format::Xrgb8888 { big_endian: false },
+        "thirty-two bits a pixel, in the order the card powers up in"
+    );
     assert_eq!(mode.stride, 1024 * 4);
     assert_eq!(mode.offset, 0);
     assert_eq!(mode.size, 1024 * 768 * 4);
-    assert!(!mode.big_endian);
+}
+
+/// The other depth the card has, which no in-tree driver asks for: two bytes a pixel,
+/// and every measurement of the picture halved by it.
+#[test]
+fn sixteen_bits_a_pixel_is_a_mode_of_two_byte_pixels() {
+    let (program, screen) = card(&[&setmode(1024, 768)[..], &set(INDEX_BPP, 16)[..]].concat());
+    program.run();
+    let mode = screen.mode().expect("a mode");
+
+    assert_eq!(mode.format, Format::R5g6b5);
+    assert_eq!(mode.format.bytes(), 2);
+    assert_eq!(mode.stride, 1024 * 2);
+    assert_eq!(mode.size, 1024 * 768 * 2);
+}
+
+/// And the byte order register says nothing about it: there is no other arrangement of
+/// a sixteen-bit pixel for the card to be put into, so asking for one changes nothing.
+#[test]
+fn the_byte_order_says_nothing_about_a_sixteen_bit_pixel() {
+    let (program, screen) = card(
+        &[
+            &li(T5, 0xbebe_bebe)[..],
+            &[sw(T5, T2, QEXT_BYTEORDER)],
+            &setmode(1024, 768)[..],
+            &set(INDEX_BPP, 16)[..],
+        ]
+        .concat(),
+    );
+    program.run();
+
+    assert_eq!(screen.mode().expect("a mode").format, Format::R5g6b5);
+}
+
+/// A picture drawn in it, which is what nothing had ever done: three pixels of red,
+/// green and blue, written as the sixteen-bit words they are and read back as bytes.
+#[test]
+fn a_picture_drawn_in_two_byte_pixels_reaches_the_host() {
+    /// Red, green and blue at full strength, five bits, six bits and five bits.
+    const RED: u32 = 0xf800;
+    const GREEN: u32 = 0x07e0;
+    const BLUE: u32 = 0x001f;
+
+    let (program, screen) = card(
+        &[
+            &setmode(1024, 768)[..],
+            &set(INDEX_BPP, 16)[..],
+            &li(T5, RED)[..],
+            &[sh(T5, T1, 0)],
+            &li(T5, GREEN)[..],
+            &[sh(T5, T1, 2)],
+            &li(T5, BLUE)[..],
+            &[sh(T5, T1, 4)],
+        ]
+        .concat(),
+    );
+    program.run();
+
+    let mode = screen.mode().expect("a mode");
+    let pixels = unsafe { screen.vram().as_slice() };
+    let at = |n: usize| {
+        let at = mode.offset as usize + n * mode.format.bytes() as usize;
+        u16::from_le_bytes(pixels[at..at + 2].try_into().unwrap())
+    };
+
+    assert_eq!(
+        [at(0), at(1), at(2)],
+        [RED as u16, GREEN as u16, BLUE as u16]
+    );
 }
 
 #[test]

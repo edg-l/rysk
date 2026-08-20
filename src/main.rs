@@ -192,10 +192,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(mode) => {
                 let drawn = screen.vram().take_dirty().pages().count() as u64 * bochs::PAGE;
                 println!(
-                    "display: {}x{} at {} bytes a pixel, {} KiB of a {} KiB picture drawn",
+                    "display: {}x{} in {:?}, {} KiB of a {} KiB picture drawn",
                     mode.width,
                     mode.height,
-                    mode.depth,
+                    mode.format,
                     drawn / 1024,
                     mode.size / 1024,
                 );

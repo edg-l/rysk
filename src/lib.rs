@@ -28,6 +28,7 @@ pub mod cpu;
 pub mod csr;
 pub mod device;
 pub mod dram;
+pub mod edid;
 pub mod elf;
 pub mod fdt;
 pub mod fpu;
