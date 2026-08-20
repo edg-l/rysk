@@ -11,7 +11,7 @@
 
 use crate::{
     csr::{MEIP, SEIP},
-    device::{Device, Line, Pending},
+    device::{Device, Line, Pending, Report, Value, field},
     trap::Exception,
 };
 
@@ -161,6 +161,26 @@ impl Plic {
 impl Device for Plic {
     /// A read is not always a question: claiming a source stops it being offered, so
     /// every access here ends by saying again what the contexts have.
+    fn describe(&self) -> Report {
+        let raised: Vec<String> = self
+            .lines
+            .iter()
+            .filter(|(_, line)| line.is_raised())
+            .map(|(source, _)| source.to_string())
+            .collect();
+        let claimed = self.claimed.iter().filter(|held| **held).count();
+        Report::new(
+            "plic",
+            vec![
+                field("sources", Value::Count(self.priority.len() as u64)),
+                field("contexts", Value::Count(self.threshold.len() as u64)),
+                field("raised", Value::Count(raised.len() as u64)),
+                field("raised sources", Value::Text(raised.join(", "))),
+                field("being serviced", Value::Count(claimed as u64)),
+            ],
+        )
+    }
+
     fn load(&mut self, offset: u64, _size: u64) -> Result<u64, Exception> {
         let word = (offset / 4) as usize;
         let value = match offset {

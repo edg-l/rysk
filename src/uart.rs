@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    device::{Device, Line},
+    device::{Device, Line, Report, Value, field},
     trap::Exception,
 };
 
@@ -134,6 +134,22 @@ impl Uart {
 }
 
 impl Device for Uart {
+    fn describe(&self) -> Report {
+        Report::new(
+            "uart",
+            vec![
+                field("typed waiting", Value::Flag(self.keyboard.waiting())),
+                field("lsr", Value::Bits(u64::from(self.status()))),
+                field("ier", Value::Bits(u64::from(self.ier))),
+                field("lcr", Value::Bits(u64::from(self.lcr))),
+                field("mcr", Value::Bits(u64::from(self.mcr))),
+                field("scr", Value::Bits(u64::from(self.scr))),
+                field("divisor", Value::Count(u64::from(self.divisor))),
+                field("interrupting", Value::Flag(self.line.is_raised())),
+            ],
+        )
+    }
+
     fn load(&mut self, offset: u64, _size: u64) -> Result<u64, Exception> {
         let latched = self.lcr & LCR_DLAB != 0;
         let value = match offset {

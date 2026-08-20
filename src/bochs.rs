@@ -29,6 +29,7 @@ use std::sync::{
 };
 
 use crate::{
+    device::{Field, Value, field},
     edid,
     pci::{Bar, Function, Header},
     shared::Bytes,
@@ -435,6 +436,31 @@ impl Bochs {
 }
 
 impl Function for Bochs {
+    fn describe(&self) -> Vec<Field> {
+        let vbe = self.0.vbe.lock().unwrap_or_else(|held| held.into_inner());
+        let mut fields = vec![
+            field("video memory", Value::Count(self.0.vram.size())),
+            field(
+                "byte order",
+                Value::Text(match vbe.big_endian {
+                    true => "big endian".to_owned(),
+                    false => "little endian".to_owned(),
+                }),
+            ),
+        ];
+        match vbe.mode(self.0.vram.size()) {
+            None => fields.push(field("showing", Value::Text("nothing".to_owned()))),
+            Some(mode) => fields.extend([
+                field("width", Value::Count(u64::from(mode.width))),
+                field("height", Value::Count(u64::from(mode.height))),
+                field("format", Value::Text(format!("{:?}", mode.format))),
+                field("stride", Value::Count(u64::from(mode.stride))),
+                field("offset", Value::Bits(mode.offset)),
+            ]),
+        }
+        fields
+    }
+
     fn header(&self) -> Header {
         Header {
             vendor: VENDOR,

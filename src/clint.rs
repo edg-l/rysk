@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crate::{
     csr::{MSIP, MTIP},
-    device::{Device, Pending},
+    device::{Device, Pending, Report, Value, field},
     trap::Exception,
 };
 
@@ -132,6 +132,20 @@ impl Clint {
 }
 
 impl Device for Clint {
+    fn describe(&self) -> Report {
+        let mut fields = vec![
+            field("mtime", Value::Count(self.mtime())),
+            field("sampled", Value::Count(self.sampled)),
+        ];
+        for (hart, deadline) in self.mtimecmp.iter().enumerate() {
+            fields.push(field(format!("mtimecmp {hart}"), Value::Count(*deadline)));
+        }
+        for (hart, raised) in self.msip.iter().enumerate() {
+            fields.push(field(format!("msip {hart}"), Value::Flag(*raised)));
+        }
+        Report::new("clint", fields)
+    }
+
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {
         Ok(match self.decode(offset, size) {
             Some(Register::Msip(hart)) => self.msip[hart] as u64,

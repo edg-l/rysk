@@ -1,7 +1,7 @@
 use crate::common::*;
 use rysk::{
     csr::{MEIP, MIP},
-    device::{Device, Line, Pending},
+    device::{Device, Line, Pending, Report},
     trap::Exception,
 };
 
@@ -21,6 +21,10 @@ struct Fake {
 }
 
 impl Device for Fake {
+    fn describe(&self) -> Report {
+        Report::new("fake", Vec::new())
+    }
+
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {
         Ok(match offset {
             _ if offset == WITNESS as u64 => self.written,
@@ -120,6 +124,10 @@ fn two_devices_may_not_claim_the_same_address() {
 struct Wired(Line);
 
 impl Device for Wired {
+    fn describe(&self) -> Report {
+        Report::new("wired", Vec::new())
+    }
+
     fn load(&mut self, _offset: u64, _size: u64) -> Result<u64, Exception> {
         Ok(0)
     }
@@ -139,6 +147,10 @@ struct Controller {
 }
 
 impl Device for Controller {
+    fn describe(&self) -> Report {
+        Report::new("controller", Vec::new())
+    }
+
     fn load(&mut self, _offset: u64, _size: u64) -> Result<u64, Exception> {
         Ok(0)
     }

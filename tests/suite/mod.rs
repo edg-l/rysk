@@ -10,6 +10,7 @@ mod device;
 mod encoding;
 mod fusion;
 mod hid;
+mod inspect;
 mod integer;
 mod interrupt;
 mod memory;

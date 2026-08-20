@@ -26,6 +26,7 @@ pub mod bus;
 pub mod clint;
 pub mod cpu;
 pub mod csr;
+pub mod debug;
 pub mod device;
 pub mod disk;
 pub mod dram;

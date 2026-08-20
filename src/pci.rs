@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    device::{Device, Line, Msi},
+    device::{Device, Field, Line, Msi, Report, Value, field},
     trap::Exception,
 };
 
@@ -257,6 +257,12 @@ pub trait Function: std::fmt::Debug + Send {
     /// device on the bus is, and through the same call: config space is polled and it
     /// polls what is below it.
     fn poll(&mut self) {}
+
+    /// Say what this function is doing, as named values, without changing any of it.
+    /// The same bargain `Device::describe` makes, one level down: config space is
+    /// reached through the complex, and what is behind a base address register is
+    /// reached through here.
+    fn describe(&self) -> Vec<Field>;
 
     /// What it is asserting, taken. Asked after anything that could have changed it,
     /// which is an access to it and a poll of it.
@@ -804,6 +810,63 @@ pub fn swizzle(device: usize, pin: u8) -> usize {
 #[derive(Debug, Clone)]
 pub struct Root(Arc<Mutex<Complex>>);
 
+impl Complex {
+    /// What every function plugged into this bus is doing, as the reports they sit
+    /// under. The complex answers for the configuration it keeps on their behalf, and
+    /// each function for itself.
+    fn describe(&self) -> Vec<Report> {
+        self.plugged
+            .iter()
+            .filter_map(|device| Some((*device, self.slots[*device].as_ref()?)))
+            .map(|(device, slot)| {
+                let header = &slot.header;
+                let mut fields = vec![
+                    field("device", Value::Count(device as u64)),
+                    field(
+                        "vendor:device",
+                        Value::Bits((u64::from(header.vendor) << 16) | u64::from(header.device)),
+                    ),
+                    field("class", Value::Bits(u64::from(header.class))),
+                    field("command", Value::Bits(u64::from(slot.command))),
+                    field("express", Value::Flag(header.express)),
+                    field("pin", Value::Count(u64::from(header.pin))),
+                    field("asserting pin", Value::Flag(slot.pin)),
+                ];
+                if header.msix.is_some() {
+                    fields.push(field(
+                        "msix control",
+                        Value::Bits(u64::from(slot.msix_control)),
+                    ));
+                    fields.push(field("vectors", Value::Count(slot.vectors.len() as u64)));
+                    fields.push(field(
+                        "vectors blocked",
+                        Value::Count(slot.blocked.iter().filter(|held| **held).count() as u64),
+                    ));
+                }
+                for (which, bar) in slot.bars.iter().enumerate() {
+                    if *bar != 0 {
+                        fields.push(field(format!("bar {which}"), Value::Bits(*bar)));
+                    }
+                }
+                fields.extend(slot.function.describe());
+                Report::new(name_of(header), fields)
+            })
+            .collect()
+    }
+}
+
+/// What to call a function, which is what its class code says it is. A person reading a
+/// device map wants to know it is a display before they want to know it is 1234:1111.
+fn name_of(header: &Header) -> &'static str {
+    match header.class >> 16 {
+        0x0300 => "display",
+        0x0c03 => "usb controller",
+        0x0108 => "nvme controller",
+        0x0600 => "host bridge",
+        _ => "pci function",
+    }
+}
+
 impl Root {
     /// A root complex driving `lines`, which are the four wires its functions
     /// interrupt on, and posting through `msi`, which is where the ones that send
@@ -854,6 +917,24 @@ impl Ecam {
 }
 
 impl Device for Ecam {
+    fn describe(&self) -> Report {
+        let complex = self.0.0.lock().unwrap_or_else(|held| held.into_inner());
+        Report::new(
+            "pcie root complex",
+            vec![
+                field("functions", Value::Count(complex.plugged.len() as u64)),
+                field(
+                    "wires raised",
+                    Value::Count(
+                        complex.lines.iter().filter(|line| line.is_raised()).count() as u64
+                    ),
+                ),
+                field("messaging", Value::Flag(complex.msi.wired())),
+            ],
+        )
+        .behind(complex.describe())
+    }
+
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {
         if !matches!(size, 8 | 16 | 32) {
             return Err(Exception::LoadAccessFault(offset));
@@ -909,6 +990,13 @@ pub struct Window {
 }
 
 impl Device for Window {
+    /// The window itself has nothing to say: what is behind it is the functions, and
+    /// they say it under the root complex where they are plugged in rather than once
+    /// per window they happen to answer through.
+    fn describe(&self) -> Report {
+        Report::new("pci window", vec![field("base", Value::Bits(self.base))])
+    }
+
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {
         let addr = self.base + offset;
         let mut complex = self.root.0.lock().unwrap();
@@ -1001,6 +1089,10 @@ fn blocked(vectors: &[bool], byte: u64, size: u64) -> u64 {
 pub struct Ports;
 
 impl Device for Ports {
+    fn describe(&self) -> Report {
+        Report::new("pci io ports", Vec::new())
+    }
+
     fn load(&mut self, _offset: u64, size: u64) -> Result<u64, Exception> {
         Ok(u64::MAX >> (64 - size))
     }
@@ -1017,6 +1109,12 @@ impl Device for Ports {
 pub struct HostBridge;
 
 impl Function for HostBridge {
+    /// It is the bus rather than anything on it, so what it has to say is said by the
+    /// complex that holds it.
+    fn describe(&self) -> Vec<Field> {
+        Vec::new()
+    }
+
     fn header(&self) -> Header {
         Header {
             // The identity QEMU's generic PCIe host bridge reports, which is what a

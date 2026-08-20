@@ -14,7 +14,7 @@ use std::{
 use tracing::instrument;
 
 use crate::{
-    device::{Device, Dma, Pending, Wires},
+    device::{Device, Dma, Pending, Report, Wires},
     dram::Dram,
     trap::Exception,
 };
@@ -458,6 +458,22 @@ impl Bus {
         }
         self.break_reservations(addr, size);
         Ok(true)
+    }
+
+    /// What every device on the bus is doing, in the order they answer at.
+    ///
+    /// Each is asked rather than read: a device says what it is doing through
+    /// `Device::describe`, and its registers are never touched, because on this bus
+    /// reading a register is often an action. The range comes from here, since a device
+    /// is handed an offset and never learns where it sits.
+    pub fn describe(&self) -> Vec<Report> {
+        self.devices
+            .iter()
+            .map(|(range, device)| {
+                let device = device.lock().unwrap_or_else(|held| held.into_inner());
+                device.describe().at(range.clone())
+            })
+            .collect()
     }
 
     /// Whether `size` bits at `addr` fall inside dram.

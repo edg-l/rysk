@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     csr::{MEIP, SEIP},
-    device::{Device, Level, Pending},
+    device::{Device, Level, Pending, Report, Value, field},
     trap::Exception,
 };
 
@@ -322,6 +322,37 @@ pub struct Files {
 }
 
 impl Device for Files {
+    fn describe(&self) -> Report {
+        let inner = self.imsic.0.lock().unwrap_or_else(|held| held.into_inner());
+        let mut fields = Vec::new();
+        for (hart, files) in inner.files.iter().enumerate() {
+            let file = &files[self.level as usize];
+            fields.push(field(
+                format!("hart {hart} delivery"),
+                Value::Flag(file.delivery),
+            ));
+            fields.push(field(
+                format!("hart {hart} threshold"),
+                Value::Count(u64::from(file.threshold)),
+            ));
+            fields.push(field(
+                format!("hart {hart} top identity"),
+                Value::Count(u64::from(file.best().unwrap_or(0))),
+            ));
+            fields.push(field(
+                format!("hart {hart} signalling"),
+                Value::Flag(file.signalling()),
+            ));
+        }
+        Report::new(
+            match self.level {
+                Level::Machine => "imsic (machine)",
+                Level::Supervisor => "imsic (supervisor)",
+            },
+            fields,
+        )
+    }
+
     /// Every readable byte of a file's page reads as zero, including the write port
     /// itself. The RISC-V Advanced Interrupt Architecture, 3.5.
     fn load(&mut self, offset: u64, size: u64) -> Result<u64, Exception> {

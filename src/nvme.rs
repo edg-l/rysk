@@ -19,7 +19,7 @@
 //! `include/linux/nvme.h` is the same layout as a driver reads it.
 
 use crate::{
-    device::Dma,
+    device::{Dma, Field, Value, field as says},
     disk::{BLOCK, Disk},
     pci::{Asserted, Bar, Function, Header, MsiX},
     trap::Exception,
@@ -853,6 +853,27 @@ fn independent() -> Vec<u8> {
 }
 
 impl Function for Nvme {
+    fn describe(&self) -> Vec<Field> {
+        let live = |queues: usize| Value::Count(queues as u64);
+        vec![
+            says("blocks", Value::Count(self.disk.blocks())),
+            says("cc", Value::Bits(u64::from(self.cc))),
+            says("csts", Value::Bits(u64::from(self.csts))),
+            says("admin queue attributes", Value::Bits(u64::from(self.aqa))),
+            says("admin submission queue", Value::Bits(self.asq)),
+            says("admin completion queue", Value::Bits(self.acq)),
+            says(
+                "submission queues",
+                live(self.submissions.iter().flatten().count()),
+            ),
+            says(
+                "completion queues",
+                live(self.completions.iter().flatten().count()),
+            ),
+            says("messages masked", Value::Bits(u64::from(self.masked))),
+        ]
+    }
+
     fn header(&self) -> Header {
         Header {
             vendor: VENDOR,

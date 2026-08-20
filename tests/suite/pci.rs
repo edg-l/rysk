@@ -3,7 +3,7 @@
 
 use crate::common::*;
 use rysk::{
-    device::{Device, Msi, Wires},
+    device::{Device, Field, Msi, Wires},
     pci::{self, Bar, Function, Header, HostBridge, MsiX, Root},
     trap::Exception,
 };
@@ -33,6 +33,10 @@ const PROBE_BAR0: u64 = 0x1000;
 const PROBE_BAR1: u64 = 0x2_0000;
 
 impl Function for Probe {
+    fn describe(&self) -> Vec<Field> {
+        Vec::new()
+    }
+
     fn header(&self) -> Header {
         Header {
             vendor: 0xabcd,
@@ -116,6 +120,10 @@ const PENDING: u64 = 0x800;
 struct Messenger;
 
 impl Function for Messenger {
+    fn describe(&self) -> Vec<Field> {
+        Vec::new()
+    }
+
     fn header(&self) -> Header {
         Header {
             vendor: 0x1af4,
@@ -551,6 +559,10 @@ const INTEGRATED: usize = 4;
 struct Integrated;
 
 impl Function for Integrated {
+    fn describe(&self) -> Vec<Field> {
+        Vec::new()
+    }
+
     fn header(&self) -> Header {
         Header {
             vendor: 0x1af4,

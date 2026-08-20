@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     csr::{MEIP, SEIP},
-    device::{Device, Level, Line, Msi, Pending},
+    device::{Device, Level, Line, Msi, Pending, Report, Value, field},
     imsic::PAGE,
     trap::Exception,
 };
@@ -733,6 +733,43 @@ pub struct Region {
 }
 
 impl Device for Region {
+    fn describe(&self) -> Report {
+        let inner = self.aplic.0.lock().unwrap_or_else(|held| held.into_inner());
+        let domain = inner.domain(self.level);
+        let ready: Vec<String> = (1..SOURCES)
+            .filter(|source| {
+                inner.pending(*source)
+                    && inner.owner(*source).is_some_and(|(at, _)| at == self.level)
+            })
+            .map(|source| source.to_string())
+            .collect();
+        let raised: Vec<String> = inner
+            .lines
+            .iter()
+            .filter(|(_, line)| line.is_raised())
+            .map(|(source, _)| source.to_string())
+            .collect();
+        Report::new(
+            match self.level {
+                Level::Machine => "aplic (machine)",
+                Level::Supervisor => "aplic (supervisor)",
+            },
+            vec![
+                field("enabled", Value::Flag(domain.enabled)),
+                field(
+                    "delivers by",
+                    Value::Text(match domain.forwards {
+                        true => "message".to_owned(),
+                        false => "wire".to_owned(),
+                    }),
+                ),
+                field("harts", Value::Count(domain.idc.len() as u64)),
+                field("wires raised", Value::Text(raised.join(", "))),
+                field("pending", Value::Text(ready.join(", "))),
+            ],
+        )
+    }
+
     /// Only aligned words are an access to this region. Anything else is reported as a
     /// fault, which is what the specification asks an implementation to prefer over
     /// ignoring it. The RISC-V Advanced Interrupt Architecture, 4.5.

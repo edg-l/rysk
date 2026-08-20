@@ -211,6 +211,82 @@ impl fmt::Debug for Msi {
     }
 }
 
+/// One value a device has to say about itself.
+///
+/// Values rather than text, since what reads these is a panel, a socket and a debugger
+/// and none of them wants the others' formatting. The one distinction kept is between a
+/// number that counts something and a number whose bits mean separate things, because
+/// only the device knows which of the two a register is and nothing downstream can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    /// A quantity: how many bytes are waiting, how many interrupts have been sent.
+    Count(u64),
+    /// A register, whose bits are what matter.
+    Bits(u64),
+    Flag(bool),
+    /// A name, for the things a device knows that are not numbers at all: which file is
+    /// behind a disk, what a mode is called.
+    Text(String),
+}
+
+/// One named thing a device says. Borrowed where the name is fixed, which is most of
+/// them, and owned where the device counts them out: one deadline per hart, one
+/// priority per source.
+pub type Field = (std::borrow::Cow<'static, str>, Value);
+
+/// A named value, however its name was come by.
+pub fn field(name: impl Into<std::borrow::Cow<'static, str>>, value: Value) -> Field {
+    (name.into(), value)
+}
+
+/// What a device is doing, and where it sits.
+///
+/// `behind` is what a device that is a bus of its own reports: a root complex says what
+/// it is, and the functions plugged into it say what they are underneath it. Nothing
+/// else nests, and nothing has to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub name: &'static str,
+    pub base: u64,
+    pub size: u64,
+    pub fields: Vec<Field>,
+    pub behind: Vec<Report>,
+}
+
+impl Report {
+    /// A report for a device that answers from `base` for `size` bytes, with nothing
+    /// behind it. The bus fills the range in, since a device never learns its own base.
+    pub fn new(name: &'static str, fields: Vec<Field>) -> Self {
+        Self {
+            name,
+            base: 0,
+            size: 0,
+            fields,
+            behind: Vec::new(),
+        }
+    }
+
+    /// The same, placed, which is what the bus does to it on the way out.
+    pub fn at(mut self, range: std::ops::Range<u64>) -> Self {
+        self.base = range.start;
+        self.size = range.end - range.start;
+        self
+    }
+
+    pub fn behind(mut self, behind: Vec<Report>) -> Self {
+        self.behind = behind;
+        self
+    }
+
+    /// What one field holds, for a caller that wants one thing rather than the list.
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.fields
+            .iter()
+            .find(|(named, _)| named == name)
+            .map(|(_, value)| value)
+    }
+}
+
 /// `Send`, because phase 10 puts the window on the main thread and the harts on
 /// another, and a machine cannot cross a thread boundary if the things on its bus
 /// cannot. Everything here already qualifies; saying so is what keeps it that way.
@@ -236,6 +312,17 @@ pub trait Device: std::fmt::Debug + Send {
     fn wire(&mut self, _pending: &Pending) -> bool {
         false
     }
+
+    /// Say what this device is and what it is currently doing, as named values.
+    ///
+    /// A question rather than an action, which is the whole reason it exists: half the
+    /// registers on this bus do something when they are read, so an inspector that
+    /// polled them would consume the guest's input and claim its interrupts. Nothing
+    /// here may change what the device does.
+    ///
+    /// It takes `&self` for the same reason. A device that cannot answer this without
+    /// mutating is a device an inspector must not be allowed to ask.
+    fn describe(&self) -> Report;
 
     /// Notice anything that has changed without an access to notice it at: a byte
     /// typed at a serial port whose backend is not the hart, a timer that a frontend

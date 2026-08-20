@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    device::Dma,
+    device::{Dma, Field, Value, field},
     pci::{Asserted, Bar, Function, Header, MsiX},
     trap::Exception,
     usb::{self, Setup},
@@ -1502,6 +1502,27 @@ fn segment_length(dma: &Dma, set: &Interrupter, segment: u64) -> Option<u64> {
 }
 
 impl Function for Xhci {
+    fn describe(&self) -> Vec<Field> {
+        let connected = self
+            .ports
+            .iter()
+            .filter(|port| port.device.is_some())
+            .count();
+        vec![
+            field("usbcmd", Value::Bits(u64::from(self.usbcmd))),
+            field("usbsts", Value::Bits(u64::from(self.usbsts))),
+            field("command ring", Value::Flag(self.command.is_some())),
+            field("device context base", Value::Bits(self.dcbaap)),
+            field("ports", Value::Count(self.ports.len() as u64)),
+            field("attached", Value::Count(connected as u64)),
+            field(
+                "slots in use",
+                Value::Count(self.slots.iter().filter(|taken| **taken).count() as u64),
+            ),
+            field("endpoints waiting", Value::Count(self.waiting.len() as u64)),
+        ]
+    }
+
     fn header(&self) -> Header {
         Header {
             vendor: VENDOR,

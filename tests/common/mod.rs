@@ -195,6 +195,13 @@ impl Program {
     }
 
     /// The machine this program describes, before it has run.
+    /// The machine this program describes, before anything has run on it. What a test
+    /// of the inspection surface starts from, since that surface is about a machine
+    /// sitting still rather than about what a finished run left behind.
+    pub fn machine(self) -> Machine {
+        self.build()
+    }
+
     fn build(self) -> Machine {
         let mut machine = Machine::new(self.code, DRAM_SIZE, self.harts);
         machine.bus.wires = self.wires;
