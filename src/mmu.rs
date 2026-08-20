@@ -59,20 +59,27 @@ const PTE_D: u64 = 1 << 7;
 /// them is asking for something this machine does not do.
 const PTE_UNSUPPORTED: u64 = 0x7fc0_0000_0000_0000;
 
-/// One remembered walk: the leaf entry a page number resolved to, and the level it was
-/// found at, since a superpage answers for a range rather than for one page.
+/// One remembered walk: the leaf entry a page number resolved to, and the frame that
+/// page number lands in.
 ///
 /// What is remembered is the reads the walk made, not the decision it reached. The
 /// permission and accessed-bit checks happen again on every hit, which is what it
 /// means for the cache to hold the results of step 2 alone: the mode, `SUM`, `MXR` and
 /// what the access is for can all have changed since.
 ///
+/// The frame is the one thing the entry may keep already worked out. A superpage
+/// answers for a range of page numbers and takes the levels it did not translate from
+/// the address, but this is keyed by the whole page number, so which frame this page
+/// number lands in cannot change while the entry lives.
+///
 /// The RISC-V Instruction Set Manual Volume II, 12.3.2.
 #[derive(Debug, Clone, Copy)]
 struct Translation {
     vpn: u64,
     pte: u64,
-    level: u64,
+    /// The physical address the page starts at, with the superpage bits already taken
+    /// from the address that was walked.
+    frame: u64,
 }
 
 /// A direct-mapped cache of them, indexed by the low bits of the page number.
@@ -193,10 +200,15 @@ impl Cpu {
             if ppn & ((1 << (9 * level)) - 1) != 0 {
                 return Err(access.fault(va));
             }
+            // The levels the entry did not translate are taken from the address, which
+            // is what makes a superpage one page rather than many.
+            let ppn = (pte >> 10) & 0xfff_ffff_ffff;
+            let page = (ppn >> (9 * level)) << (9 * level)
+                | (va >> PAGE_BITS) & ((1 << (9 * level)) - 1);
             let entry = Translation {
                 vpn: va >> PAGE_BITS,
                 pte,
-                level,
+                frame: page * PAGE_SIZE,
             };
             let translated = self.finish(va, entry, access)?;
             self.tlb.insert(entry);
@@ -207,8 +219,9 @@ impl Cpu {
 
     /// What a remembered walk still has to do: whether this access is allowed through
     /// this entry, and where in the frame it lands.
+    #[inline]
     fn finish(&self, va: u64, entry: Translation, access: Access) -> Result<u64, Exception> {
-        let Translation { pte, level, .. } = entry;
+        let Translation { pte, frame, .. } = entry;
         let mode = self.effective_mode(access);
         self.permitted(pte, mode, access)
             .map_err(|()| access.fault(va))?;
@@ -222,12 +235,7 @@ impl Cpu {
             return Err(access.fault(va));
         }
 
-        // The levels the entry did not translate are taken from the address, which is
-        // what makes a superpage one page rather than many.
-        let ppn = (pte >> 10) & 0xfff_ffff_ffff;
-        let translated =
-            (ppn >> (9 * level)) << (9 * level) | (va >> PAGE_BITS) & ((1 << (9 * level)) - 1);
-        Ok((translated * PAGE_SIZE) | (va & (PAGE_SIZE - 1)))
+        Ok(frame | (va & (PAGE_SIZE - 1)))
     }
 
     /// Whether the page a leaf entry describes may be reached this way.
