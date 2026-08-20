@@ -163,8 +163,9 @@ fn a_wire_raised_during_an_access_reaches_a_controller_attached_before_it() {
     // The controller goes on first and the device driving its line goes on underneath,
     // so the bus holds them the other way round: a controller found by where it was
     // attached rather than by where it ended up is the wrong device to ask.
-    let line = Line::default();
-    let machine = prog(&[sw(ZERO, T0, 0), csrrs(A0, MIP as u32, ZERO)])
+    let program = prog(&[sw(ZERO, T0, 0), csrrs(A0, MIP as u32, ZERO)]);
+    let line = program.wires().line();
+    let machine = program
         .reg(T0, 0x0200_0000)
         .device(
             0x0c00_0000,

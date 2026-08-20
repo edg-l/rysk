@@ -9,7 +9,7 @@ pub use asm::*;
 use rysk::{
     bus::DRAM_BASE,
     csr::Mode,
-    device::{Device, Level},
+    device::{Device, Level, Wires},
     dram::DRAM_SIZE,
     imsic::Imsic,
     machine::{Machine, Schedule},
@@ -32,6 +32,9 @@ pub struct Program {
     harts: usize,
     hart_regs: Vec<(usize, u32, u64)>,
     imsic: Option<Imsic>,
+    /// The wires of the machine this will build, made here rather than there because a
+    /// test wires its devices together before it has a machine to put them in.
+    wires: Wires,
 }
 
 /// Assemble `code` into a program starting from a zeroed register file.
@@ -56,6 +59,7 @@ fn image(code: Vec<u8>) -> Program {
         harts: 1,
         hart_regs: Vec::new(),
         imsic: None,
+        wires: Wires::default(),
     }
 }
 
@@ -100,6 +104,13 @@ impl Program {
     }
 
     /// Put a device on the bus, answering for `size` bytes from `base`.
+    /// The wires of the machine this will build, to take a device's line from. A line
+    /// from anywhere else is one no access would be seen to move, so it would only
+    /// reach a controller at the next round's poll.
+    pub fn wires(&self) -> Wires {
+        self.wires.clone()
+    }
+
     pub fn device(mut self, base: u64, size: u64, device: Box<dyn Device>) -> Self {
         self.devices.push((base, size, device));
         self
@@ -186,6 +197,7 @@ impl Program {
     /// The machine this program describes, before it has run.
     fn build(self) -> Machine {
         let mut machine = Machine::new(self.code, DRAM_SIZE, self.harts);
+        machine.bus.wires = self.wires;
         for cpu in &mut machine.harts {
             for (reg, value) in &self.regs {
                 cpu.regs[*reg as usize] = *value;

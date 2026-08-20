@@ -2,7 +2,6 @@ use crate::common::*;
 use rysk::{
     bus::DRAM_BASE,
     csr::{MEIE, MEIP, MIE, MIP, MSTATUS, MSTATUS_MIE, MTVEC},
-    device::Line,
     plic::{self, Plic},
     trap::{Exception, INTERRUPT, Interrupt},
     uart::{self, Keyboard, Uart},
@@ -43,8 +42,9 @@ fn serial(code: &[u32], typed: Option<u8>) -> (Program, Printed) {
     if let Some(byte) = typed {
         keyboard.typed(&[byte]);
     }
-    let port = Uart::new(Line::default(), keyboard, Box::new(printed.clone()));
-    let program = prog(code)
+    let started = prog(code);
+    let port = Uart::new(started.wires().line(), keyboard, Box::new(printed.clone()));
+    let program = started
         .device(uart::BASE, uart::SIZE, Box::new(port))
         .reg(T0, uart::BASE);
     (program, printed)
@@ -131,7 +131,8 @@ const CONTEXT_STRIDE: u64 = 0x1000;
 /// A machine with a serial port wired to source 10 of a controller. `t0` is the port,
 /// `t1` the controller, `t2` its enable word and `t3` its machine context.
 fn wired(code: &[u32], typed: Option<u8>) -> Program {
-    let line = Line::default();
+    let program = prog(code);
+    let line = program.wires().line();
     let mut controller = Plic::new(1);
     controller.connect(UART_IRQ as usize, line.clone());
     let keyboard = Keyboard::default();
@@ -139,7 +140,7 @@ fn wired(code: &[u32], typed: Option<u8>) -> Program {
         keyboard.typed(&[byte]);
     }
     let port = Uart::new(line, keyboard, Box::new(io::sink()));
-    prog(code)
+    program
         .device(uart::BASE, uart::SIZE, Box::new(port))
         .device(plic::BASE, plic::SIZE, Box::new(controller))
         .reg(T0, uart::BASE)

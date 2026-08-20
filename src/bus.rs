@@ -14,7 +14,7 @@ use std::{
 use tracing::instrument;
 
 use crate::{
-    device::{Device, Dma, Pending},
+    device::{Device, Dma, Pending, Wires},
     dram::Dram,
     trap::Exception,
 };
@@ -71,9 +71,12 @@ pub struct Bus {
     pending: Pending,
     /// Where in `devices` the interrupt controllers are. A wire moves when the device
     /// driving it is accessed, which is an access the controller on the other end
-    /// never sees, so the controllers are asked to look again after every access that
-    /// was not dram.
+    /// never sees, so the controllers are asked to look again when one has moved.
     controllers: Vec<usize>,
+    /// Every wire in the machine, and how many times one has moved. Lines are taken
+    /// from here, so that an access can be told to have moved one by reading a single
+    /// word either side of itself rather than by asking every controller.
+    pub wires: Wires,
     /// The bytes each hart reserved with its last load-reserved, invalidated by any
     /// store that overlaps them. A hart has at most one reservation, and the set of
     /// them belongs to the memory system rather than to any hart: a store has to
@@ -113,6 +116,7 @@ impl Bus {
             devices: Vec::new(),
             pending: Pending::new(harts),
             controllers: Vec::new(),
+            wires: Wires::default(),
             reservations: (0..harts).map(|_| AtomicU64::new(UNRESERVED)).collect(),
             reserved_data: (0..harts).map(|_| AtomicU64::new(0)).collect(),
             reserved: AtomicUsize::new(0),
@@ -167,6 +171,24 @@ impl Bus {
         for at in &self.controllers {
             self.held(*at).poll();
         }
+    }
+
+    /// Run an access to a device, and let the controllers look again if it moved a
+    /// wire.
+    ///
+    /// The condition is the whole point. Resampling is a walk over every source, enable,
+    /// priority and threshold in the machine, and it exists because a device may raise
+    /// its line inside its own access -- not because an access happened. A store to a
+    /// framebuffer moves nothing, and there are three hundred thousand of them in a
+    /// frame. What is left is one load either side.
+    #[inline]
+    fn stirring<T>(&self, access: impl FnOnce() -> T) -> T {
+        let before = self.wires.moves();
+        let answer = access();
+        if self.wires.moves() != before {
+            self.resample();
+        }
+        answer
     }
 
     /// The device at `at`, held for as long as the access lasts. Nothing a device does
@@ -236,15 +258,13 @@ impl Bus {
 
     #[inline(never)]
     fn device_load(&self, addr: u64, size: u64) -> Result<u64, Exception> {
-        let answer = match self.device(addr, size) {
+        self.stirring(|| match self.device(addr, size) {
             Some(at) => {
                 let offset = addr - self.devices[at].0.start;
                 self.held(at).load(offset, size).map_err(|e| e.at(addr))
             }
             None => Err(Exception::LoadAccessFault(addr)),
-        };
-        self.resample();
-        answer
+        })
     }
 
     /// Write the low `size` bits of `value` at `addr`, with the same split.
@@ -326,7 +346,7 @@ impl Bus {
         size: u64,
         mut change: impl FnMut(u64) -> u64,
     ) -> Result<u64, Exception> {
-        let answer = match self.device(addr, size) {
+        self.stirring(|| match self.device(addr, size) {
             Some(at) => {
                 let offset = addr - self.devices[at].0.start;
                 let mut device = self.held(at);
@@ -339,14 +359,12 @@ impl Bus {
                 }
             }
             None => Err(Exception::StoreAmoAccessFault(addr)),
-        };
-        self.resample();
-        answer
+        })
     }
 
     #[inline(never)]
     fn device_store(&self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
-        let answer = match self.device(addr, size) {
+        self.stirring(|| match self.device(addr, size) {
             Some(at) => {
                 let offset = addr - self.devices[at].0.start;
                 self.held(at)
@@ -354,9 +372,7 @@ impl Bus {
                     .map_err(|e| e.at(addr))
             }
             None => Err(Exception::StoreAmoAccessFault(addr)),
-        };
-        self.resample();
-        answer
+        })
     }
 
     /// Release every reservation the bytes written by a store overlap, whichever hart

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rysk::{
     bus::DRAM_BASE,
-    device::{Device, Dma, Line, Msi},
+    device::{Device, Dma, Msi, Wires},
     disk::{BLOCK, Memory},
     dram::Dram,
     nvme::Nvme,
@@ -281,7 +281,10 @@ impl Host {
 
 #[test]
 fn enumeration_finds_a_non_volatile_memory_controller() {
-    let root = Root::new(std::array::from_fn(|_| Line::default()), Msi::default());
+    // No machine here: config space is driven directly, so these wires are counted by
+    // nothing and nothing is asking.
+    let wires = Wires::default();
+    let root = Root::new(std::array::from_fn(|_| wires.line()), Msi::default());
     let memory = Arc::new(Dram::with_size(Vec::new(), 1024));
     root.plug(
         3,

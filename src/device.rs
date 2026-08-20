@@ -24,22 +24,66 @@ use crate::{
     trap::Exception,
 };
 
+/// Every wire in one machine, and how many times any of them has moved.
+///
+/// A controller has to look again when a wire moves, and a device moves one from inside
+/// its own access, which is an access the controller never sees. Asking every controller
+/// after every access answers that, and is what a framebuffer cannot afford: three
+/// hundred thousand stores a frame to a card whose interrupt pin is zero, each one
+/// costing a walk over every source, enable, priority and threshold in the machine.
+///
+/// So the wires are counted. Reading this either side of an access says whether the
+/// access moved one, which is the question `resample` was always really asking.
+#[derive(Debug, Clone, Default)]
+pub struct Wires(Arc<AtomicU64>);
+
+impl Wires {
+    /// A wire nothing has raised yet, whose movements this counts.
+    pub fn line(&self) -> Line {
+        Line {
+            raised: Arc::new(AtomicBool::new(false)),
+            moves: self.0.clone(),
+        }
+    }
+
+    /// How many times a wire has moved. `Acquire`, against the `Release` in
+    /// `Line::set`, so that seeing the movement means seeing the wire that made it.
+    #[inline]
+    pub fn moves(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// The wire between a device and an interrupt controller. The device drives it and the
 /// controller reads it, and neither knows anything else about the other: which line a
 /// device got, and which controller it runs to, are the machine's to decide.
 ///
 /// It is shared rather than polled so that swapping the controller a line runs to is a
-/// change to how the machine is built and to nothing else.
-#[derive(Debug, Clone, Default)]
-pub struct Line(Arc<AtomicBool>);
+/// change to how the machine is built and to nothing else. There is no way to make one
+/// on its own: a wire nothing counts is one no access would ever notice moving, and it
+/// would only be seen at the next round's `poll`.
+#[derive(Debug, Clone)]
+pub struct Line {
+    raised: Arc<AtomicBool>,
+    moves: Arc<AtomicU64>,
+}
 
 impl Line {
+    /// Raise or drop the wire. A write that changes nothing counts as nothing, since
+    /// what a controller has to be told about is the change and not the write: a serial
+    /// port holding its line up over a hundred bytes moves it once.
+    ///
+    /// A swap rather than a load and a store, so that two devices sharing a wire cannot
+    /// both read it before either writes and between them lose one of the two answers.
+    /// The exchange is what makes the count exact rather than nearly right.
     pub fn set(&self, raised: bool) {
-        self.0.store(raised, Ordering::Relaxed);
+        if self.raised.swap(raised, Ordering::Relaxed) != raised {
+            self.moves.fetch_add(1, Ordering::Release);
+        }
     }
 
     pub fn is_raised(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.raised.load(Ordering::Relaxed)
     }
 }
 

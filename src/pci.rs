@@ -461,11 +461,20 @@ impl Complex {
         };
         let messaging = slot.msix_control & MSIX_ENABLE != 0;
         let asserted = slot.function.asserted(messaging);
+        // A function that is asserting what it already was, and has nothing to send, has
+        // nothing for the complex to do. This is almost every access there is: a card
+        // being drawn into is written three hundred thousand times a frame and interrupts
+        // never, and working out all four wires afresh each time is most of what having a
+        // display costs.
+        if asserted.messages == 0 && asserted.pin == slot.pin {
+            return;
+        }
         slot.pin = asserted.pin;
-        for vector in 0..u64::BITS as usize {
-            if asserted.messages & (1 << vector) != 0 {
-                self.message(device, vector);
-            }
+        let mut messages = asserted.messages;
+        while messages != 0 {
+            let vector = messages.trailing_zeros() as usize;
+            messages &= messages - 1;
+            self.message(device, vector);
         }
         self.wires();
     }

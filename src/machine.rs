@@ -749,12 +749,12 @@ pub fn virt(
 ) -> Frontend {
     let harts = machine.harts.len();
     let bus = &mut machine.bus;
-    let serial = Line::default();
+    let serial = bus.wires.line();
     let keyboard = Keyboard::default();
 
     // The four wires the root complex swizzles its functions onto, in the order the
     // tree's `interrupt-map` lists them.
-    let pins: [Line; pci::PINS] = std::array::from_fn(|_| Line::default());
+    let pins: [Line; pci::PINS] = std::array::from_fn(|_| bus.wires.line());
     let wires = || {
         std::iter::once((UART_IRQ, serial.clone())).chain(
             pins.iter()

@@ -3,7 +3,7 @@
 
 use crate::common::*;
 use rysk::{
-    device::{Device, Line, Msi},
+    device::{Device, Msi, Wires},
     pci::{self, Bar, Function, Header, HostBridge, MsiX, Root},
     trap::Exception,
 };
@@ -85,11 +85,12 @@ fn pcie(code: &[u32]) -> Program {
 /// The same, with somewhere for a message to go and the root complex handed back so a
 /// test can make a function raise one.
 fn posted(code: &[u32], msi: Msi) -> (Program, Root) {
-    let root = Root::new(std::array::from_fn(|_| Line::default()), msi);
+    let started = prog(code);
+    let root = Root::new(std::array::from_fn(|_| started.wires().line()), msi);
     root.plug(0, Box::new(HostBridge));
     root.plug(1, Box::new(Probe::default()));
     root.plug(MESSENGER, Box::new(Messenger));
-    let program = prog(code)
+    let program = started
         .device(pci::ECAM, pci::ECAM_SIZE, Box::new(root.config()))
         .device(pci::MMIO, pci::MMIO_SIZE, Box::new(root.window(pci::MMIO)))
         .device(
@@ -494,7 +495,10 @@ fn a_masked_vector_waits_rather_than_being_dropped() {
 #[test]
 fn a_vector_raised_while_masked_waits_and_goes_when_it_is_unmasked() {
     let (msi, posted) = recorder();
-    let root = Root::new(std::array::from_fn(|_| Line::default()), msi);
+    // No machine here: config space and the window are driven directly, so these wires
+    // are counted by nothing and nothing is asking.
+    let wires = Wires::default();
+    let root = Root::new(std::array::from_fn(|_| wires.line()), msi);
     root.plug(MESSENGER, Box::new(Messenger));
     let mut config = root.config();
     let mut window = root.window(pci::MMIO);
@@ -591,11 +595,15 @@ impl Function for Integrated {
 
 /// Config space of a function with both capabilities. `t0` is where the list starts.
 fn integrated(code: &[u32]) -> Program {
-    let root = Root::new(std::array::from_fn(|_| Line::default()), Msi::default());
+    let started = prog(code);
+    let root = Root::new(
+        std::array::from_fn(|_| started.wires().line()),
+        Msi::default(),
+    );
     root.plug(0, Box::new(HostBridge));
     root.plug(1, Box::new(Probe::default()));
     root.plug(INTEGRATED, Box::new(Integrated));
-    prog(code)
+    started
         .device(pci::ECAM, pci::ECAM_SIZE, Box::new(root.config()))
         .reg(T0, config(INTEGRATED))
         .reg(T1, config(1))

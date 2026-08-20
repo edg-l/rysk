@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rysk::{
     bus::DRAM_BASE,
-    device::{Device, Dma, Line, Msi},
+    device::{Device, Dma, Msi, Wires},
     dram::Dram,
     hid::{Hid, Keys, Pointer},
     pci::{self, Asserted, Function, Root},
@@ -389,7 +389,10 @@ fn descriptor(kind: u8, index: u8, length: u16) -> [u8; 8] {
 
 #[test]
 fn enumeration_finds_a_usb_controller_speaking_xhci() {
-    let root = Root::new(std::array::from_fn(|_| Line::default()), Msi::default());
+    // No machine here: config space is driven directly, so these wires are counted by
+    // nothing and nothing is asking.
+    let wires = Wires::default();
+    let root = Root::new(std::array::from_fn(|_| wires.line()), Msi::default());
     let memory = Arc::new(Dram::with_size(Vec::new(), 1024 * 1024));
     root.plug(2, Box::new(Xhci::new(Dma::new(memory), Vec::new())));
     let mut config = root.config();

@@ -290,9 +290,10 @@ fn the_top_interrupt_is_nothing_when_nothing_is_both_pending_and_enabled() {
 /// which delivers rather than forwards. `t0` is the machine-level control region.
 fn wired(code: &[u32], msi: Msi) -> (Program, Line) {
     let aplic = Aplic::new(1, msi);
-    let line = Line::default();
+    let started = prog(code);
+    let line = started.wires().line();
     aplic.connect(SOURCE, line.clone());
-    let program = prog(code)
+    let program = started
         .device(
             aplic::MACHINE,
             aplic::SIZE,

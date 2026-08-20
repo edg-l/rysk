@@ -4,7 +4,7 @@
 use crate::common::*;
 use rysk::{
     bochs::{self, Bochs, Format, PAGE, Screen},
-    device::{Line, Msi},
+    device::Msi,
     pci::{self, Root},
 };
 
@@ -96,14 +96,19 @@ fn setmode(width: u32, height: u32) -> Vec<u32> {
 /// `t0` is the card's config space, `t1` the framebuffer, `t2` the registers, `t3` the
 /// bit that turns the windows on and `t4` all ones.
 fn card(code: &[u32]) -> (Program, Screen) {
-    let root = Root::new(std::array::from_fn(|_| Line::default()), Msi::default());
+    // Where software decided the windows go, and the write that makes them answer.
+    let placed = [sw(T1, T0, BAR0), sw(T2, T0, BAR2), sw(T3, T0, COMMAND)];
+    let started = prog(&[&placed[..], code].concat());
+
+    let root = Root::new(
+        std::array::from_fn(|_| started.wires().line()),
+        Msi::default(),
+    );
     let display = Bochs::new(bochs::VGAMEM);
     let screen = display.screen();
     root.plug(CARD, Box::new(display));
 
-    // Where software decided the windows go, and the write that makes them answer.
-    let placed = [sw(T1, T0, BAR0), sw(T2, T0, BAR2), sw(T3, T0, COMMAND)];
-    let program = prog(&[&placed[..], code].concat())
+    let program = started
         .device(pci::ECAM, pci::ECAM_SIZE, Box::new(root.config()))
         .device(pci::MMIO, pci::MMIO_SIZE, Box::new(root.window(pci::MMIO)))
         .reg(T0, config(CARD))
