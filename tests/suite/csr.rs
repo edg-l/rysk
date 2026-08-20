@@ -1,7 +1,8 @@
 use crate::common::*;
 use rysk::csr::{
-    MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE, MSTATUS_SXL,
-    MSTATUS_UXL, MSTATUS_XL_64, MTIP, Mode, S_INTERRUPTS, SEIP, SSIP, STIP, misa_extension,
+    MCOUNTINHIBIT, MCYCLE, MINSTRET, MISA, MISA_MXL_64, MSTATUS_MIE, MSTATUS_MPP,
+    MSTATUS_MPP_SHIFT, MSTATUS_SIE, MSTATUS_SXL, MSTATUS_UXL, MSTATUS_XL_64, MTIP, Mode,
+    S_INTERRUPTS, SEIP, SSIP, STIP, misa_extension,
 };
 
 // ------------------------------------------------------------------ zicsr
@@ -256,4 +257,52 @@ fn writing_sstatus_leaves_the_machine_fields_of_mstatus_alone() {
         0,
         "while the supervisor fields did take the write"
     );
+}
+
+// ---------------------------------------------------------------- zicntr
+
+#[test]
+fn minstret_counts_what_retired_before_it_was_read() {
+    // Two instructions retire, and the one that reads the counter names it, so it says
+    // what the counter holds rather than counting itself.
+    // The RISC-V Instruction Set Manual Volume II, 3.3.1.
+    let machine = prog(&[
+        addi(A0, ZERO, 1),
+        addi(A0, A0, 1),
+        csrrs(A1, MINSTRET as u32, ZERO),
+    ])
+    .run();
+    assert_eq!(
+        machine.reg(A1),
+        2,
+        "the two that had retired, and not itself"
+    );
+}
+
+#[test]
+fn mcycle_counts_the_instruction_that_reads_it() {
+    // Unlike `minstret`, a cycle is spent on the read as well.
+    let machine = prog(&[
+        addi(A0, ZERO, 1),
+        addi(A0, A0, 1),
+        csrrs(A1, MCYCLE as u32, ZERO),
+    ])
+    .run();
+    assert_eq!(machine.reg(A1), 3);
+}
+
+#[test]
+fn an_inhibited_counter_holds_still() {
+    // The write that inhibits it is itself counted, since a counter is held from the
+    // instruction after the one that stops it.
+    // The RISC-V Instruction Set Manual Volume II, 3.1.12.
+    let machine = prog(&[
+        csrrw(ZERO, MCOUNTINHIBIT as u32, T0),
+        addi(A0, ZERO, 1),
+        addi(A0, A0, 1),
+        csrrs(A1, MINSTRET as u32, ZERO),
+    ])
+    .reg(T0, 0b100)
+    .run();
+    assert_eq!(machine.reg(A1), 1, "the write itself, and nothing after it");
 }
