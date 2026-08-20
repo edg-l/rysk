@@ -240,7 +240,7 @@ fn describe(stop: &Stop) -> String {
         Stop::Paused => "held".to_owned(),
         Stop::Breakpoint { pc, .. } => format!("breakpoint {pc:#x}"),
         Stop::Watchpoint { at, was, now, .. } => {
-            format!("{:#x}: {was:#x} → {now:#x}", at.addr())
+            format!("{:#x}: {was:#x} to {now:#x}", at.addr())
         }
         Stop::Stepped { retired, .. } => match retired {
             1 => "stepped".to_owned(),
@@ -636,7 +636,7 @@ pub fn traps(ui: &mut Ui, view: &View, symbols: &Symbols) {
                     ui.label(theme::data(place(symbols, taken.pc)));
                     // The pair of modes is the thing neither `mcause` nor `mepc`
                     // records, and the usual reason a handler never runs.
-                    ui.label(theme::legend(format!("{} → {}", taken.from, taken.to)));
+                    ui.label(theme::legend(format!("{} to {}", taken.from, taken.to)));
                     ui.label(theme::faint(place(symbols, taken.handler)));
                 });
             }
