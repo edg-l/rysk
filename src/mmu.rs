@@ -42,8 +42,8 @@ const MODE: u64 = 0xf << 60;
 const SV39: u64 = 8 << 60;
 
 const LEVELS: u64 = 3;
-const PAGE_BITS: u64 = 12;
-const PAGE_SIZE: u64 = 1 << PAGE_BITS;
+pub const PAGE_BITS: u64 = 12;
+pub const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 
 /// The bits of a page table entry. `RSW` at 9:8 is software's to use and hardware
 /// never reads it. The RISC-V Instruction Set Manual Volume II, 12.3.1.

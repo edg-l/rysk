@@ -1,7 +1,7 @@
 use crate::common::*;
 use rysk::{
     bus::DRAM_BASE,
-    csr::{MSTATUS, MSTATUS_MPP_SHIFT, MSTATUS_MPRV, MSTATUS_MXR, MSTATUS_SUM, Mode, SATP},
+    csr::{MEPC, MSTATUS, MSTATUS_MPP_SHIFT, MSTATUS_MPRV, MSTATUS_MXR, MSTATUS_SUM, Mode, SATP},
     trap::Exception,
 };
 
@@ -370,5 +370,75 @@ fn an_sfence_vma_on_one_hart_says_nothing_about_anothers_translations() {
         machine.load(LEAF + 8, 8),
         pte(FRAME2, V | R | W | A | D),
         "the table really had been changed the whole time"
+    );
+}
+
+/// The ninth page of the second gigabyte, which is where dram is, so that the same
+/// address means a frame of dram to machine mode and a page to look up to a supervisor.
+const AT: u64 = DRAM_BASE + 0x8000;
+
+#[test]
+fn the_page_a_fetch_came_from_is_not_reused_across_a_change_of_mode() {
+    // Machine mode does not translate, so an address there is already the frame. The
+    // same address in supervisor mode is a page number, and it can name a different
+    // frame entirely. A fetch that trusted the page the last one came from would run
+    // whichever of the two it happened to have looked up first.
+    let machine = prog(&[
+        csrrw(ZERO, SATP as u32, T1),
+        csrrw(ZERO, MSTATUS as u32, T2),
+        csrrw(ZERO, MEPC as u32, T3),
+        // Machine mode fetches from the frame at `AT` here, which is the page that is
+        // about to mean something else.
+        jalr(ZERO, T3, 0),
+    ])
+    // `AT` walks to `FRAME`: gigabyte two, its first two-megabyte range, page eight.
+    .memory(ROOT + 2 * 8, pte(MID, V))
+    .memory(MID, pte(LEAF, V))
+    .memory(LEAF + 8 * 8, pte(FRAME, V | R | X | A))
+    // What is at that address physically: the return to supervisor mode, at the very
+    // address being returned to.
+    .memory(AT, mret() as u64)
+    // And what is in the frame it is mapped to, which is what a supervisor must fetch.
+    .memory(FRAME, addi(A0, ZERO, 1) as u64)
+    .reg(T1, sv39(ROOT))
+    .reg(T2, (Mode::Supervisor as u64) << MSTATUS_MPP_SHIFT)
+    .reg(T3, AT)
+    .run();
+    assert_eq!(
+        machine.reg(A0),
+        1,
+        "the supervisor fetched through its mapping rather than out of the frame \
+         machine mode had been running in"
+    );
+}
+
+#[test]
+fn the_page_a_fetch_came_from_is_not_reused_across_a_fence() {
+    // A supervisor executing out of a page remaps that very page and fences. Where it
+    // jumps next is an address inside the page it is already in, so a fetch that
+    // trusted the page it came from would never look at the tables again and would go
+    // on running the frame that address no longer names.
+    let machine = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
+        // What the mapped page holds: point the leaf at the other frame, say so, and
+        // jump to an address in this same page.
+        .memory(
+            FRAME,
+            sd(T2, T1, 0) as u64 | ((sfence_vma(ZERO, ZERO) as u64) << 32),
+        )
+        // The jump itself is in both frames, since the fence takes effect at the very
+        // next fetch and that fetch is this one. Only where it lands differs.
+        .memory(FRAME + 8, jalr(ZERO, T3, 0) as u64)
+        .memory(FRAME2 + 8, jalr(ZERO, T3, 0) as u64)
+        // Where that jump lands, in each of the two frames.
+        .memory(FRAME + 0x10, addi(A0, ZERO, 2) as u64)
+        .memory(FRAME2 + 0x10, addi(A0, ZERO, 1) as u64)
+        .reg(T1, LEAF + 8)
+        .reg(T2, pte(FRAME2, V | R | X | A))
+        .reg(T3, VA + 0x10)
+        .run();
+    assert_eq!(
+        machine.reg(A0),
+        1,
+        "the fence sent the fetch back to the tables, which now name the other frame"
     );
 }

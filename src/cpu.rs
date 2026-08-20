@@ -10,10 +10,16 @@ use crate::{
     icache::{Decoded, Icache},
     imsic::{self, Imsic},
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
-    mmu::{Access, Tlb},
+    mmu::{Access, PAGE_BITS, PAGE_SIZE, Tlb},
     rvc,
     trap::{Exception, Interrupt, Trap},
 };
+
+/// A `fetch_page` naming no page, so that a fetch translates rather than believing it.
+/// The top page number is one no fetch reaches: a virtual address has to repeat its
+/// sign above bit 38 to translate at all, and an untranslated one is a physical address
+/// of thirty-four page-number bits.
+const NO_PAGE: (u64, u64) = (u64::MAX, 0);
 
 #[derive(Debug)]
 pub struct Cpu {
@@ -49,6 +55,17 @@ pub struct Cpu {
     /// because on a machine with more than one hart the interrupt that ends the wait
     /// is usually one another hart has to send.
     pub waiting: bool,
+    /// The page `pc` was last fetched from: its page number, and the physical address
+    /// that page starts at. Straight-line code stays inside one, and while it does a
+    /// fetch is a compare rather than a walk of the translation cache and the
+    /// permission rules again for an answer that has not moved.
+    ///
+    /// It is forgotten wherever that answer could change: a different address space, a
+    /// fence saying the tables moved, or a different privilege mode, since a machine
+    /// mode that translates nothing and a supervisor that does are not the same
+    /// question. `MPRV`, `SUM` and `MXR` do not come into it, because none of the three
+    /// says anything about a fetch.
+    fetch_page: (u64, u64),
     /// What the controllers and `mvip` were last seen driving into `mip`. The
     /// controllers publish rather than being asked, so the usual answer before an
     /// instruction is the same one as before the last, and writing it into `mip` again
@@ -72,6 +89,7 @@ impl Cpu {
             hart,
             imsic: None,
             waiting: false,
+            fetch_page: NO_PAGE,
             driven: 0,
         };
 
@@ -274,6 +292,7 @@ impl Cpu {
                     | (sie << MSTATUS_SPIE)
                     | ((self.mode as u64) << MSTATUS_SPP);
             self.mode = Mode::Supervisor;
+            self.fetch_page = NO_PAGE;
             self.pc = entry;
             return true;
         }
@@ -288,6 +307,7 @@ impl Cpu {
             | (mie << MSTATUS_MPIE)
             | ((self.mode as u64) << MSTATUS_MPP_SHIFT);
         self.mode = Mode::Machine;
+        self.fetch_page = NO_PAGE;
 
         self.pc = entry;
         true
@@ -320,6 +340,7 @@ impl Cpu {
             }
         };
         self.mode = previous;
+        self.fetch_page = NO_PAGE;
         self.next_pc = epc;
     }
 
@@ -515,6 +536,7 @@ impl Cpu {
                     self.csrs[SATP] = value;
                     // A different table, or none, is a different set of answers.
                     self.tlb.flush();
+                    self.fetch_page = NO_PAGE;
                 }
             }
             // The bits a device drives are read-only here: a write cannot argue with a
@@ -586,7 +608,16 @@ impl Cpu {
     /// there would fault on bytes it does not have.
     #[inline]
     fn fetch(&mut self, bus: &mut Bus) -> Result<Decoded, Exception> {
-        let pa = self.translate(bus, self.pc, Access::Fetch)?;
+        // Where the last instruction came from answers for the whole page it was in,
+        // and most instructions are in the page the one before them was.
+        let vpn = self.pc >> PAGE_BITS;
+        let pa = if vpn == self.fetch_page.0 {
+            self.fetch_page.1 | (self.pc & (PAGE_SIZE - 1))
+        } else {
+            let pa = self.translate(bus, self.pc, Access::Fetch)?;
+            self.fetch_page = (vpn, pa & !(PAGE_SIZE - 1));
+            pa
+        };
         if let Some(decoded) = self.icache.get(pa) {
             return Ok(decoded);
         }
@@ -941,6 +972,7 @@ impl Cpu {
                     return Err(Exception::IllegalInstruction(encoding as u64));
                 }
                 self.tlb.flush();
+                self.fetch_page = NO_PAGE;
             }
 
             // A reservation is broken by a store, so the wait is for another hart, and
