@@ -4,8 +4,8 @@
 
 **A RISC-V emulator, written in Rust.**
 
-RV64GC with privilege modes, Sv39 paging, several harts and enough devices that
-OpenSBI and Linux both boot on it.
+RV64GC with privilege modes, Sv39 paging, several harts, and a PCI bus with a
+display, a keyboard, a mouse and a disk on it that stock Linux drivers bind to.
 
 [![Rust](https://github.com/edg-l/rysk/actions/workflows/rust.yml/badge.svg)](https://github.com/edg-l/rysk/actions/workflows/rust.yml)
 
@@ -60,6 +60,10 @@ this machine had extensions it does not have, and then used one.
    16550 ───────────────────┤                 0x1000_0000
    pcie ecam ───────────────┤                 0x3000_0000   256 buses
         windows ────────────┘                 0x4000_0000, 0x4_0000_0000
+             │
+             ├── bochs display   1234:1111   a framebuffer and a monitor
+             ├── xhci            1b36:000d   a keyboard and a mouse
+             └── nvme            1b36:0010   a disk
 ```
 
 **More than one hart.** `-smp N` gives the guest N harts sharing one bus, each on
@@ -86,9 +90,30 @@ the walk is what keeps most walks from happening.
 
 **A bus the guest enumerates.** A PCIe root complex with config space at ECAM, a
 32-bit and a 64-bit window that base address registers are handed addresses
-from, and INTx swizzled onto four wires. A function that sends messages instead
-carries an MSI-X capability, with its vector table and pending array inside one
-of its own windows.
+from, and INTx swizzled onto four wires. A function declares its capabilities in
+a list the complex places and chains: MSI-X, with its vector table and pending
+array inside one of the function's own windows, and PCI Express, which is what
+makes the kernel call these root complex integrated endpoints. A function that
+masters the bus reaches guest memory directly rather than through the bus that is
+holding it, and one that interrupts says what it is asserting and lets the
+complex deliver it, since the complex is what would have to send the message.
+
+**Things on it that drivers bind to**, all off unless asked for:
+
+```bash
+rysk --display bochs     # a framebuffer, and a monitor it answers for
+rysk --usb hid           # an xHCI controller, a keyboard and a mouse
+rysk --disk disk.img     # an NVMe controller with that file behind it
+rysk --disk 64M          # or that many mebibytes of memory, gone when the run ends
+```
+
+`drm/tiny/bochs.c` finds sixteen mebibytes of framebuffer and reads the modes out
+of a generated EDID block; `xhci-pci`, `usbhid` and `hid-generic` enumerate the
+two devices and register them under `/dev/input`; `nvme` finds `/dev/nvme0n1`,
+and a filesystem mounted on it writes through to the file on the host. None of
+them is patched, and each was checked by booting the same kernel under
+`qemu-system-riscv64` with the equivalent `-device` and diffing what the driver
+printed.
 
 **Two interrupt architectures**, picked the way QEMU picks them:
 
@@ -135,7 +160,9 @@ rysk -m 1024 -smp 4 --aia aplic-imsic \
 ```
 
 OpenSBI comes up, hands off to the kernel in supervisor mode, and the kernel
-enumerates the PCI bus, brings up the other harts and reaches a shell.
+enumerates the PCI bus, brings up the other harts and reaches a shell. Add
+`--display bochs --usb hid --disk disk.img` and it finds a card, two input
+devices and a disk on the way.
 
 ## Testing
 
@@ -191,15 +218,23 @@ src/
   block.rs     the decoded instructions, as the straight-line runs they were decoded as
   machine.rs   what a machine is made of, and the two ways its harts get to run
   bus.rs       address decode: dram, then a binary search over the devices
-  device.rs    the Device trait, and the Line and Msi a device raises
+  device.rs    the Device trait, the Line and Msi a device raises, and the Dma it transfers through
   clint.rs     the timer and the software-interrupt bit, one of each per hart
   plic.rs      wired external interrupts, claimed and completed
   aplic.rs     their replacement: domains, source modes, and forwarding
   imsic.rs     interrupt files: what a message arrives in
-  pci.rs       a root complex: config space, the windows, INTx and MSI-X
+  pci.rs       a root complex: config space, the windows, INTx, MSI-X and Express
   uart.rs      a 16550
+  bochs.rs     a display: a framebuffer, the registers that shape it, and which pages moved
+  edid.rs      the block a monitor answers with, generated rather than modelled
+  xhci.rs      a USB host controller: its rings, its contexts, and its ports
+  usb.rs       what a device is from the controller's side
+  hid.rs       the keyboard and the mouse, and what a frontend presses
+  nvme.rs      a disk controller: queue pairs in guest memory, and the pointers into it
+  disk.rs      where the blocks actually are, which is a file or some bytes
   fdt.rs       the device tree, built from the same table that builds the bus
   dram.rs      the bytes every hart shares, behind sized load and store helpers
+  shared.rs    those bytes, and the argument for reaching them without a lock
   elf.rs       enough ELF64 to place an image and find its symbols
   htif.rs      how the riscv-tests corpus reports pass or fail
   main.rs      argv, tracing, run, dump
@@ -224,8 +259,8 @@ Working, and not finished. What is missing, roughly in the order it matters:
 
 | missing | where it stands |
 |---|---|
-| **Real devices** | nothing is plugged into the PCI bus yet, so BAR routing and MSI-X are proven by test functions rather than by a driver. A display, xHCI with a USB keyboard, and NVMe are next |
-| **A window** | the machine has no frontend: output goes to stdout and the terminal is still line buffered, so typing at a guest shell arrives a line at a time |
+| **A window** | the machine has no frontend, so nothing presents the framebuffer and nothing pushes a keystroke into the keyboard: output goes to stdout and the terminal is still line buffered, so typing at a guest shell arrives a line at a time |
+| **A network** | there is no interface on the bus, so a guest has no way off the machine |
 | **Determinism** | no run repeats another yet. `--schedule turns` fixes the order the harts run in, which is the half of it that threads give up, but the devices still advance with the wall clock rather than with retired instructions |
 | **Debug triggers** | the one corpus test that does not pass, `rv64mi-p-breakpoint`, wants them |
 | **The hypervisor extension** | no H, so no VS mode and no guest interrupt files |
