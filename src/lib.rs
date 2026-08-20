@@ -21,6 +21,7 @@ pub const ISA: &str =
 
 pub mod aplic;
 pub mod block;
+pub mod bochs;
 pub mod bus;
 pub mod clint;
 pub mod cpu;
@@ -38,5 +39,6 @@ pub mod mmu;
 pub mod pci;
 pub mod plic;
 pub mod rvc;
+pub mod shared;
 pub mod trap;
 pub mod uart;

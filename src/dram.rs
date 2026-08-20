@@ -1,41 +1,22 @@
-use std::{
-    cell::UnsafeCell,
-    fmt, slice,
-    sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst},
-};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst};
 
-use crate::bus::DRAM_BASE;
+use crate::{bus::DRAM_BASE, shared::Bytes};
 
 /// How much memory a machine has when nothing says otherwise. Enough for a kernel and
 /// the room it wants after itself, and small enough to allocate without thinking.
 pub const DRAM_SIZE: u64 = 1024 * 1024 * 128;
 
-/// The memory every hart shares.
+/// The memory every hart shares: a `shared::Bytes` placed at `DRAM_BASE`, plus the
+/// host atomics an atomic instruction needs.
 ///
-/// The bytes are `UnsafeCell` and are reached through raw pointers, so that harts on
-/// different host threads can load and store at the same time. This is the one place in
-/// rysk that is unsound by Rust's rules and deliberate about it: two threads accessing
-/// the same byte without synchronisation is a data race, and a data race is undefined
-/// behaviour whatever the hardware underneath would have done. There is no sound
-/// alternative that keeps the machine's shape. A byte-wise atomic backing store turns an
-/// eight-byte load into eight loads and shifts, and a word-wise one makes every sub-word
-/// store a read-modify-write and takes away the contiguous `&[u8]` that a display's
-/// framebuffer and a disk's transfer both want. Every emulator that runs guests on host
-/// threads makes this same trade.
-///
-/// What keeps it honest is that guest memory is only ever reached through `load` and
-/// `store` here, both of which check their bounds, and that the guest's own memory model
-/// is what says when a racing access means anything: RVWMO orders accesses with `fence`
-/// and the atomics, and a guest that races without them may read whatever it likes, which
-/// is what a real machine gives it too.
+/// The argument for reaching those bytes from several threads without a lock is in
+/// `shared`, and it is the same argument here. What this type adds is where memory
+/// begins, so that a guest address is checked once and turned into an index once, and
+/// the four widths of indivisible access an atomic instruction can ask for.
+#[derive(Debug)]
 pub struct Dram {
-    bytes: Box<[UnsafeCell<u8>]>,
+    bytes: Bytes,
 }
-
-/// Sound only under the contract above: the bytes are shared, the guest's own barriers
-/// are what order them, and nothing hands out a reference that outlives an access.
-/// `Send` needs no such claim, since a `u8` behind an `UnsafeCell` already is one.
-unsafe impl Sync for Dram {}
 
 impl Dram {
     pub fn new(code: Vec<u8>) -> Dram {
@@ -46,31 +27,15 @@ impl Dram {
     /// machine rather than of the emulator, so it is asked for rather than assumed:
     /// a kernel image is tens of megabytes before it has run an instruction.
     pub fn with_size(code: Vec<u8>, size: u64) -> Dram {
-        let mut bytes = vec![0u8; size as usize];
-        bytes.splice(..code.len(), code);
-        // `UnsafeCell<u8>` is `repr(transparent)` over `u8`, so this is the same
-        // allocation seen as the same bytes, and the zeroed pages the allocator handed
-        // over stay untouched rather than being copied into a second buffer.
-        let bytes = Box::into_raw(bytes.into_boxed_slice()) as *mut [UnsafeCell<u8>];
-
         Self {
-            bytes: unsafe { Box::from_raw(bytes) },
+            bytes: Bytes::new(code, size),
         }
     }
 
     /// How much memory there is, in bytes.
     #[inline]
     pub fn size(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-
-    /// The first byte, as a pointer. Every access starts here.
-    ///
-    /// Writing through it is what `UnsafeCell` is for: a shared reference to one is
-    /// permission to mutate what is inside.
-    #[inline]
-    fn base(&self) -> *mut u8 {
-        self.bytes.as_ptr().cast::<u8>().cast_mut()
+        self.bytes.len()
     }
 
     /// Whether all `size` bits at `addr` are memory. This is what the bus asks to decide
@@ -106,7 +71,7 @@ impl Dram {
     /// meaningful to a caller that knows what else may be writing them.
     #[inline]
     pub unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.base(), self.bytes.len()) }
+        unsafe { self.bytes.as_slice() }
     }
 
     /// Place `bytes` at `addr` and zero `zeroes` bytes after them, as loading an image
@@ -118,12 +83,10 @@ impl Dram {
         let Some(end) = (start as usize).checked_add(bytes.len() + zeroes as usize) else {
             return false;
         };
-        if end > self.bytes.len() {
+        if end as u64 > self.size() {
             return false;
         }
-        // `&mut self` is exclusive access to the whole of memory, so this is the one
-        // path that may hold a slice of it: no hart can be running to race with it.
-        let memory = unsafe { slice::from_raw_parts_mut(self.base(), self.bytes.len()) };
+        let memory = self.bytes.as_mut_slice();
         let start = start as usize;
         memory[start..start + bytes.len()].copy_from_slice(bytes);
         memory[start + bytes.len()..end].fill(0);
@@ -131,10 +94,6 @@ impl Dram {
     }
 
     /// Read `size` bits at `addr`.
-    ///
-    /// The width is a constant at almost every call site, so each arm folds to the one
-    /// load it describes: an array of bytes is aligned to one, so the read answers for
-    /// an address the guest did not align and still becomes a single move.
     ///
     /// Deliberately not volatile. Volatile would stop the compiler moving one guest
     /// access across another, but RVWMO already permits exactly that for two ordinary
@@ -153,44 +112,13 @@ impl Dram {
     /// is what stops passing, by hanging, if a later compiler ever manages it.
     #[inline]
     pub fn load(&self, addr: u64, size: u64) -> u64 {
-        let index = self.offset(addr, size);
-        match size {
-            8 => u8::from_le_bytes(self.bytes(index)) as u64,
-            16 => u16::from_le_bytes(self.bytes(index)) as u64,
-            32 => u32::from_le_bytes(self.bytes(index)) as u64,
-            64 => u64::from_le_bytes(self.bytes(index)),
-            _ => unreachable!("load of {size} bits"),
-        }
+        self.bytes.load(self.offset(addr, size), size)
     }
 
     /// Write the low `size` bits of `value` at `addr`.
     #[inline]
     pub fn store(&self, addr: u64, size: u64, value: u64) {
-        let index = self.offset(addr, size);
-        match size {
-            8 => self.put(index, (value as u8).to_le_bytes()),
-            16 => self.put(index, (value as u16).to_le_bytes()),
-            32 => self.put(index, (value as u32).to_le_bytes()),
-            64 => self.put(index, value.to_le_bytes()),
-            _ => unreachable!("store of {size} bits"),
-        }
-    }
-
-    /// The `N` bytes at `index`, which `offset` has already found to be inside memory.
-    #[inline]
-    fn bytes<const N: usize>(&self, index: usize) -> [u8; N] {
-        unsafe { self.base().add(index).cast::<[u8; N]>().read_unaligned() }
-    }
-
-    /// Put `bytes` at `index`, which `offset` has already found to be inside memory.
-    #[inline]
-    fn put<const N: usize>(&self, index: usize, bytes: [u8; N]) {
-        unsafe {
-            self.base()
-                .add(index)
-                .cast::<[u8; N]>()
-                .write_unaligned(bytes)
-        }
+        self.bytes.store(self.offset(addr, size), size, value);
     }
 }
 
@@ -236,7 +164,7 @@ impl Dram {
             addr.is_multiple_of(size / 8),
             "an atomic of {size} bits at {addr:#x} is not aligned"
         );
-        unsafe { self.base().add(index) }
+        unsafe { self.bytes.at(index) }
     }
 
     /// Replace `size` bits at `addr` with what `change` makes of them, as one operation
@@ -275,11 +203,5 @@ impl Clone for Dram {
         let mut copy = Self::with_size(Vec::new(), self.size());
         copy.write(DRAM_BASE, unsafe { self.as_slice() }, 0);
         copy
-    }
-}
-
-impl fmt::Debug for Dram {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Dram").field("size", &self.size()).finish()
     }
 }
