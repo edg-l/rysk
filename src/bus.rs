@@ -3,7 +3,10 @@ use std::{
     ops::Range,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{
+            AtomicU64, AtomicUsize,
+            Ordering::{Relaxed, SeqCst},
+        },
     },
 };
 
@@ -23,6 +26,25 @@ pub const DRAM_BASE: u64 = 0x8000_0000;
 /// an access is given, since several harts hold the bus at once and only one of them may
 /// be inside a device at a time.
 type Attached = (Range<u64>, Mutex<Box<dyn Device>>);
+
+/// A word no reservation can be, so a hart holding none needs no second field to say so.
+const UNRESERVED: u64 = u64::MAX;
+
+/// What one hart has reserved, in a word: the address, with the low bit saying whether
+/// it took eight bytes or four. A load-reserved is four or eight bytes and traps unless
+/// it is naturally aligned, so the low bit is never the address's to use.
+/// The RISC-V Instruction Set Manual Volume I, 14.2.
+#[inline]
+fn reserved_word(addr: u64, size: u64) -> u64 {
+    addr | (size == 64) as u64
+}
+
+/// The bytes that word stands for.
+#[inline]
+fn reserved_bytes(word: u64) -> Range<u64> {
+    let base = word & !1;
+    base..base + if word & 1 == 1 { 8 } else { 4 }
+}
 
 /// Address decode: which device owns an address, and dram.
 ///
@@ -57,7 +79,11 @@ pub struct Bus {
     /// the stores go through can see them all.
     ///
     /// The RISC-V Instruction Set Manual Volume I, 14.2.
-    reservations: Mutex<Box<[Option<Range<u64>>]>>,
+    /// One word per hart rather than one lock over all of them, because the harts that
+    /// contend for these are exactly the ones contending for a lock the guest built out
+    /// of them, and making them queue behind each other here would be inventing the
+    /// contention the guest is trying to resolve.
+    reservations: Box<[AtomicU64]>,
     /// How many of them are live, so that a store which cannot break one does not look
     /// at them at all. Almost no store can: only the window between a load-reserved
     /// and its store-conditional has anything reserved.
@@ -72,7 +98,7 @@ impl Bus {
             devices: Vec::new(),
             pending: Pending::new(harts),
             controllers: Vec::new(),
-            reservations: Mutex::new(vec![None; harts].into_boxed_slice()),
+            reservations: (0..harts).map(|_| AtomicU64::new(UNRESERVED)).collect(),
             reserved: AtomicUsize::new(0),
         }
     }
@@ -212,10 +238,26 @@ impl Bus {
         if !self.in_dram(addr, size) {
             return self.device_store(addr, size, value);
         }
-        if self.reserved.load(Relaxed) != 0 {
+        self.dram.store(addr, size, value);
+        // After the write, not before it, and that order is the whole of what makes a
+        // store-conditional safe against another hart. Breaking first leaves a window
+        // where this hart sees no reservation, another hart takes one and reads the old
+        // value, this store lands, and its store-conditional then succeeds against
+        // memory that moved under it: two harts leaving the same lock believing they
+        // hold it. Breaking afterwards closes it the other way round, since a hart that
+        // reserved early enough to miss this scan also reserved early enough that its
+        // own read came before this write.
+        //
+        // What is left is the width of a store buffer. A hart that reserves while this
+        // store is still draining is neither seen by the scan nor sees the write, and
+        // only a barrier between the two would order them, which is what a real
+        // machine's cache coherence is and is not something a store can afford per
+        // store. A store-conditional is allowed to fail when it need not; this is the
+        // far rarer converse, and it is the bargain every emulator running harts on
+        // host threads makes.
+        if self.reserved.load(SeqCst) != 0 {
             self.break_reservations(addr, size);
         }
-        self.dram.store(addr, size, value);
         Ok(())
     }
 
@@ -240,32 +282,36 @@ impl Bus {
     #[inline(never)]
     fn break_reservations(&self, addr: u64, size: u64) {
         let written = addr..addr + size / 8;
-        for reservation in self.held_reservations().iter_mut() {
-            if reservation
-                .as_ref()
-                .is_some_and(|r| written.start < r.end && r.start < written.end)
+        for reservation in &self.reservations {
+            let word = reservation.load(SeqCst);
+            if word == UNRESERVED {
+                continue;
+            }
+            let held = reserved_bytes(word);
+            // Only the hart that takes the word away counts it away, so two stores
+            // breaking one reservation at once still only decrement once.
+            if written.start < held.end
+                && held.start < written.end
+                && reservation
+                    .compare_exchange(word, UNRESERVED, SeqCst, Relaxed)
+                    .is_ok()
             {
-                *reservation = None;
-                self.reserved.fetch_sub(1, Relaxed);
+                self.reserved.fetch_sub(1, SeqCst);
             }
         }
     }
 
-    /// The reservations, held for as long as they are being looked at.
-    #[inline]
-    fn held_reservations(&self) -> impl std::ops::DerefMut<Target = Box<[Option<Range<u64>>]>> {
-        self.reservations
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-    }
-
     /// Reserve, for `hart`, the bytes a load-reserved of `size` bits at `addr` reads.
+    ///
+    /// Published before the load it belongs to is answered, so a store about to break it
+    /// either sees it here or has already written what that load is about to read.
     pub fn reserve(&self, hart: usize, addr: u64, size: u64) {
-        if self.held_reservations()[hart]
-            .replace(addr..addr + size / 8)
-            .is_none()
-        {
-            self.reserved.fetch_add(1, Relaxed);
+        debug_assert!(
+            (size == 32 || size == 64) && addr.is_multiple_of(size / 8),
+            "a load-reserved of {size} bits at {addr:#x}"
+        );
+        if self.reservations[hart].swap(reserved_word(addr, size), SeqCst) == UNRESERVED {
+            self.reserved.fetch_add(1, SeqCst);
         }
     }
 
@@ -273,10 +319,12 @@ impl Bus {
     /// hart's reservation is released either way.
     pub fn take_reservation(&self, hart: usize, addr: u64, size: u64) -> bool {
         let written = addr..addr + size / 8;
-        let Some(reserved) = self.held_reservations()[hart].take() else {
+        let word = self.reservations[hart].swap(UNRESERVED, SeqCst);
+        if word == UNRESERVED {
             return false;
-        };
-        self.reserved.fetch_sub(1, Relaxed);
+        }
+        let reserved = reserved_bytes(word);
+        self.reserved.fetch_sub(1, SeqCst);
         reserved.start <= written.start && written.end <= reserved.end
     }
 
