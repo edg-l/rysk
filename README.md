@@ -31,9 +31,9 @@ on a board.
 
 | set | what it covers |
 |---|---|
-| **RV64I** | the base integer set, with `fence` as the no-op it is on one in-order hart and `fence.i` emptying the decoded instructions |
+| **RV64I** | the base integer set, with `fence` ordering the host as well, since a hart is a host thread, and `fence.i` emptying the decoded instructions |
 | **RV64M** | `mul`, `div`, `rem` and their unsigned and `W` forms |
-| **RV64A** | `lr`/`sc` against a reservation per hart, and the atomic memory operations |
+| **RV64A** | `lr`/`sc` against a reservation per hart, and atomic memory operations that are one host atomic rather than a load and a store |
 | **RV64FD** | single and double floating point, done in integers because no host rounds the five ways this machine can, with the arithmetic the host reaches the same way handed to it |
 | **RV64C** | the compressed instructions, expanded into what their 32-bit form would decode to |
 | **Zicsr, Zicntr** | the CSR instructions, and `cycle`, `time` and `instret` |
@@ -51,7 +51,7 @@ this machine had extensions it does not have, and then used one.
 ## The machine
 
 ```
-                       hart 0 … hart N        one host thread, a quantum each
+                       hart 0 … hart N        a host thread each, or turns
                             │
    dram ────────────────────┼──────────────── 0x8000_0000
    clint ───────────────────┤                 0x0200_0000   mtime, mtimecmp, msip
@@ -62,13 +62,23 @@ this machine had extensions it does not have, and then used one.
         windows ────────────┘                 0x4000_0000, 0x4_0000_0000
 ```
 
-**More than one hart.** `-smp N` gives the guest N harts sharing one bus, taking
-turns on one host thread a quantum of instructions at a time. A switch only
-happens between whole instructions, so an atomic is atomic because nothing can
-interleave with it. Each hart has its own `mhartid`, reservation,
-address-translation cache and decoded instructions, and no hart invalidates
-another's caches, which is what the architecture says: crossing harts is an IPI
-plus a local fence, which is what SBI's remote fences are.
+**More than one hart.** `-smp N` gives the guest N harts sharing one bus, each on
+a host thread of its own, so they really do run at once: a Linux boot to a shell
+on four harts is 1.31x what it is taking turns. Nothing in the machine orders one
+hart against another; the guest's own `fence` and its atomics are what do that,
+which is what they are for. Memory is shared without a lock and every atomic
+instruction is one the host carries out indivisibly.
+
+Taking turns is still there, a quantum of instructions each on one host thread,
+and `--schedule turns` asks for it. Two policies rather than one replacing the
+other, because threads are what make parallel guest work parallel and turns are
+what make one run repeat another, which a frontend that records and replays will
+need. QEMU draws the same line.
+
+Each hart has its own `mhartid`, reservation, address-translation cache and
+decoded instructions, and no hart invalidates another's caches, which is what the
+architecture says: crossing harts is an IPI plus a local fence, which is what
+SBI's remote fences are.
 
 **Paging.** Sv39 translates, permissions are checked against the mode the access
 is for, and `MPRV`, `TVM`, `TW` and `TSR` all mean something. A cache in front of
@@ -97,7 +107,8 @@ to and from the hart through `miselect`/`mireg`, `mtopei` and `mtopi`.
 ```bash
 cargo run -- tests/fib.bin                     # a flat binary, loaded at DRAM_BASE
 cargo run -- ~/.cache/rysk/isa/rv64ui-p-add    # or an ELF, started at its entry point
-cargo run --release -- -smp 4 prog.bin         # the same machine with four harts
+cargo run --release -- -smp 4 prog.bin         # four harts, a host thread each
+cargo run --release -- -smp 4 --schedule turns prog.bin   # or taking turns on one
 ```
 
 That prints the register file and the non-zero CSRs at the end of the run. To
@@ -178,7 +189,7 @@ src/
   fpu.rs       IEEE arithmetic in integers, and the host where it agrees
   mmu.rs       Sv39: the walk, the permission rules, and the cache in front
   block.rs     the decoded instructions, as the straight-line runs they were decoded as
-  machine.rs   what a machine is made of, and the loop that gives each hart a turn
+  machine.rs   what a machine is made of, and the two ways its harts get to run
   bus.rs       address decode: dram, then a binary search over the devices
   device.rs    the Device trait, and the Line and Msi a device raises
   clint.rs     the timer and the software-interrupt bit, one of each per hart
@@ -215,7 +226,7 @@ Working, and not finished. What is missing, roughly in the order it matters:
 |---|---|
 | **Real devices** | nothing is plugged into the PCI bus yet, so BAR routing and MSI-X are proven by test functions rather than by a driver. A display, xHCI with a USB keyboard, and NVMe are next |
 | **A window** | the machine has no frontend: output goes to stdout and the terminal is still line buffered, so typing at a guest shell arrives a line at a time |
-| **Determinism** | the schedule is fixed but a run is not reproducible, because the devices advance with the wall clock rather than with retired instructions |
+| **Determinism** | no run repeats another yet. `--schedule turns` fixes the order the harts run in, which is the half of it that threads give up, but the devices still advance with the wall clock rather than with retired instructions |
 | **Debug triggers** | the one corpus test that does not pass, `rv64mi-p-breakpoint`, wants them |
 | **The hypervisor extension** | no H, so no VS mode and no guest interrupt files |
 | **Threaded dispatch** | the interpreter is a `match`, and doing better wants guaranteed tail calls, which stable Rust does not have |
