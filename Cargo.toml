@@ -19,3 +19,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# A panic and a failing test both want a backtrace with file and line, and nothing here
+# is debugged by asking a debugger what a local holds. Line tables are what that costs;
+# full DWARF is several times the size of the binary it describes.
+[profile.dev]
+debug = "line-tables-only"
