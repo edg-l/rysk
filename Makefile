@@ -91,7 +91,7 @@ $(CORPUS)/.stamp: | $(CORPUS_SRC)
 
 # The interpreter benchmark. The .bin is committed like the test fixtures, so
 # profiling needs no cross toolchain.
-BENCHES = bench/loop.bin bench/paging.bin
+BENCHES = bench/loop.bin bench/paging.bin bench/float.bin bench/floatdiv.bin
 # hyperfine takes one -L value list, comma separated, where make holds a list as words.
 comma := ,
 space := $(subst ,, )
