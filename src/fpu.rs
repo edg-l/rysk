@@ -352,6 +352,10 @@ fn add_finite(f: Format, a: (bool, i32, u128), b: (bool, i32, u128), mode: Round
 }
 
 pub fn add(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
+    host::arith(host::Kind::Add, f, a, b, mode).unwrap_or_else(|| add_in_integers(f, a, b, mode))
+}
+
+fn add_in_integers(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
     let (a, b) = (unpack(f, a), unpack(f, b));
     if let Some(nan) = nan_result(f, a, b) {
         return nan;
@@ -389,6 +393,10 @@ pub fn add(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
 /// Subtraction is addition with the second operand's sign turned over, which is exact
 /// and so cannot be done any other way.
 pub fn sub(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
+    host::arith(host::Kind::Sub, f, a, b, mode).unwrap_or_else(|| sub_in_integers(f, a, b, mode))
+}
+
+fn sub_in_integers(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
     if unpack(f, b).is_nan() {
         return add(f, a, b, mode);
     }
@@ -396,6 +404,10 @@ pub fn sub(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
 }
 
 pub fn mul(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
+    host::arith(host::Kind::Mul, f, a, b, mode).unwrap_or_else(|| mul_in_integers(f, a, b, mode))
+}
+
+fn mul_in_integers(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
     let (a, b) = (unpack(f, a), unpack(f, b));
     if let Some(nan) = nan_result(f, a, b) {
         return nan;
@@ -421,6 +433,10 @@ pub fn mul(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
 }
 
 pub fn div(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
+    host::arith(host::Kind::Div, f, a, b, mode).unwrap_or_else(|| div_in_integers(f, a, b, mode))
+}
+
+fn div_in_integers(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
     let (a, b) = (unpack(f, a), unpack(f, b));
     if let Some(nan) = nan_result(f, a, b) {
         return nan;
@@ -462,6 +478,10 @@ pub fn div(f: Format, a: u64, b: u64, mode: Round) -> Outcome {
 }
 
 pub fn sqrt(f: Format, a: u64, mode: Round) -> Outcome {
+    host::arith(host::Kind::Sqrt, f, a, a, mode).unwrap_or_else(|| sqrt_in_integers(f, a, mode))
+}
+
+fn sqrt_in_integers(f: Format, a: u64, mode: Round) -> Outcome {
     let a = unpack(f, a);
     if a.is_nan() {
         return (f.canonical_nan(), if a.signalling() { NV } else { 0 });
@@ -779,4 +799,321 @@ pub fn sign_inject(f: Format, a: u64, b: u64, negate: bool, xor: bool) -> u64 {
         (true, _) => !f.trim(b) & f.sign_bit(),
     };
     (f.trim(a) & !f.sign_bit()) | sign
+}
+
+// --------------------------------------------------- the arithmetic the host shares
+
+/// The operations whose answer the host reaches by the same rule this module does,
+/// handed to the host instead of worked out in integers.
+///
+/// The rule is round to nearest with ties to even, which is the mode `frm` resets to
+/// and so the one every instruction naming the dynamic mode asks for. Nothing writes
+/// `frm`: a riscv64 libc and busybox between them hold a hundred and forty-five rounded
+/// floating-point instructions and not one instruction that changes the mode, and the
+/// nineteen that name a mode of their own all name round-towards-zero on a conversion,
+/// which is not one of these operations. The other four modes stay above, `RMM` for
+/// good, since no host has a ties-away-from-zero mode at all.
+///
+/// What the host will not hand back is *why*. Its accrued exception flags are
+/// unreachable: Rust assumes the default floating-point environment and reserves the
+/// right to fold and reorder arithmetic on that assumption, so `_mm_getcsr` is
+/// deprecated in favour of writing the arithmetic in assembly, which this does not do.
+/// The flags are therefore worked out from the operands and the result, which is exact
+/// and costs a handful of operations where the same answer in integers costs several
+/// hundred.
+///
+/// Only the ordinary case is taken. A NaN or an infinity either side of it, a subnormal,
+/// an overflow, an underflow, a division by zero, a root of a negative: every one of
+/// those is left to the software above, which already answers for it and owes `mtval`
+/// nothing this cannot reproduce.
+mod host {
+    use super::{F32, F64, Format, NX, Outcome, Round};
+
+    /// Which operation, since all five share the same guards and differ only in the
+    /// line that does the arithmetic and the line that says whether it was exact.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Sqrt,
+    }
+
+    /// The window an operand has to be in: two to the four hundred and fiftieth either
+    /// way, so that a product or a quotient of two of them can neither overflow nor
+    /// reach the subnormals, and neither can anything the exactness tests compute along
+    /// the way. Both ends are far outside what a number in a program reaches, and
+    /// anything past them is left to the software.
+    const BIG: f64 = f64::from_bits(1473 << 52);
+    const SMALL: f64 = f64::from_bits(573 << 52);
+
+    /// The window a result may be in, which is twice as wide because that is where a
+    /// product of two operands from the window above can land.
+    const BIG_RESULT: f64 = f64::from_bits(1923 << 52);
+    const SMALL_RESULT: f64 = f64::from_bits(123 << 52);
+
+    /// Whether an operand is in its window, or the zero that needs no room at all.
+    #[inline]
+    fn plain(value: f64) -> bool {
+        let size = value.abs();
+        value == 0.0 || (SMALL..=BIG).contains(&size)
+    }
+
+    /// The same of a result. A zero is left to the caller, which knows whether reaching
+    /// one was an underflow or an answer.
+    #[inline]
+    fn plain_result(value: f64) -> bool {
+        (SMALL_RESULT..=BIG_RESULT).contains(&value.abs())
+    }
+
+    /// The two halves a double splits into, each narrow enough that the product of two
+    /// of them is exact. Veltkamp's splitting, and the constant is two to the
+    /// twenty-seven plus one.
+    #[inline]
+    fn split(a: f64) -> (f64, f64) {
+        let t = 134_217_729.0 * a;
+        let high = t - (t - a);
+        (high, a - high)
+    }
+
+    /// Whether `p` is exactly `a * b` rather than the nearest double to it. Dekker's
+    /// product: the four partial products of the halves add up to the exact answer, so
+    /// what is left over after taking `p` away is the error, and an error of zero is an
+    /// exact product.
+    #[inline]
+    fn exact_product(a: f64, b: f64, p: f64) -> bool {
+        let ((ah, al), (bh, bl)) = (split(a), split(b));
+        ((ah * bh - p) + ah * bl + al * bh) + al * bl == 0.0
+    }
+
+    /// Whether `s` is exactly `a + b`. Knuth's two-sum, which is exact for any two
+    /// values that do not overflow, subnormals included.
+    #[inline]
+    fn exact_sum(a: f64, b: f64, s: f64) -> bool {
+        let bb = s - a;
+        (a - (s - bb)) + (b - bb) == 0.0
+    }
+
+    /// A single-precision operation, done in double precision.
+    ///
+    /// Rounding twice, once into the double and once back out, reaches the same answer
+    /// as rounding once: a double carries fifty-three bits where twice a single's
+    /// twenty-four plus two is fifty, which is the width at which the two cannot differ
+    /// (IEEE 754-2019, 4.3).
+    ///
+    /// Whether it was *exact* is a separate question and a narrower one. A product of
+    /// two singles is exact in a double, forty-eight bits into fifty-three, so for that
+    /// one the wide answer is the exact answer. A sum is not: two singles can be as far
+    /// apart as the smallest subnormal and the largest finite, which is two hundred and
+    /// seventy-seven bits between the ends of the exact sum, so the double rounds too
+    /// and has to be asked what it dropped. A quotient and a root are not exact either,
+    /// and are asked of the operands, which are narrow enough to answer exactly.
+    fn single(kind: Kind, a: u64, b: u64) -> Option<Outcome> {
+        let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+        if !plain(x as f64) || !plain(y as f64) {
+            return None;
+        }
+        let (x, y) = (x as f64, y as f64);
+        let wide = match kind {
+            Kind::Add => x + y,
+            Kind::Sub => x - y,
+            Kind::Mul => x * y,
+            Kind::Div if y == 0.0 => return None,
+            Kind::Div => x / y,
+            Kind::Sqrt if x < 0.0 => return None,
+            Kind::Sqrt => x.sqrt(),
+        };
+        let narrow = wide as f32;
+        // An overflow owes a flag of its own, and a subnormal single is where rounding
+        // twice stops being safe, since the second rounding is into fewer bits than the
+        // format usually has. Both are left to the software.
+        if !(narrow == 0.0 || (narrow.is_finite() && narrow.abs() >= f32::MIN_POSITIVE)) {
+            return None;
+        }
+        let value = narrow as f64;
+        let exact = match kind {
+            // Exact in the double outright, so the single is exact when it did not move.
+            Kind::Mul => value == wide,
+            // The double rounded too, so both roundings have to have been exact.
+            Kind::Add => value == wide && exact_sum(x, y, wide),
+            Kind::Sub => value == wide && exact_sum(x, -y, wide),
+            // Ask the operands: both are twenty-four bits, and a product of two of those
+            // is exact in a double.
+            Kind::Div => value * y == x,
+            Kind::Sqrt => value * value == x,
+        };
+        // A zero that had to be rounded to is an underflow rather than an answer.
+        if value == 0.0 && !exact {
+            return None;
+        }
+        Some((narrow.to_bits() as u64, if exact { 0 } else { NX }))
+    }
+
+    /// A double-precision operation, where there is nothing wider to check it against
+    /// and the exactness of each is asked of the operands directly.
+    fn double(kind: Kind, a: u64, b: u64) -> Option<Outcome> {
+        let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+        if !plain(x) || !plain(y) {
+            return None;
+        }
+        let (value, exact) = match kind {
+            Kind::Add => {
+                let s = x + y;
+                (s, exact_sum(x, y, s))
+            }
+            Kind::Sub => {
+                let s = x - y;
+                (s, exact_sum(x, -y, s))
+            }
+            Kind::Mul => {
+                let p = x * y;
+                (p, exact_product(x, y, p))
+            }
+            Kind::Div if y == 0.0 => return None,
+            Kind::Div => {
+                let q = x / y;
+                // The quotient is exact when multiplying it back gives the numerator.
+                (q, exact_product(q, y, x))
+            }
+            Kind::Sqrt if x < 0.0 => return None,
+            Kind::Sqrt => {
+                let r = x.sqrt();
+                (r, exact_product(r, r, x))
+            }
+        };
+        // A zero is an answer only where reaching one cost nothing: an exact
+        // cancellation, or an operand that was already zero. Anything else that arrives
+        // at zero got there by underflowing, which owes two flags this does not raise.
+        if !plain_result(value) && !(value == 0.0 && exact) {
+            return None;
+        }
+        Some((value.to_bits(), if exact { 0 } else { NX }))
+    }
+
+    /// The answer, where the host may give one.
+    #[inline]
+    pub fn arith(kind: Kind, f: Format, a: u64, b: u64, mode: Round) -> Option<Outcome> {
+        if mode != Round::Nearest {
+            return None;
+        }
+        match f {
+            F32 => single(kind, a, b),
+            F64 => double(kind, a, b),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Values worth trying either side of an operation: both zeros, the smallest and
+    /// largest of each kind, the powers of two the window guards are drawn at, and the
+    /// values whose arithmetic is exact so that an inexact answer stands out.
+    fn interesting(f: Format) -> Vec<u64> {
+        let mut values = vec![
+            0,
+            f.sign_bit(),
+            f.infinity(false),
+            f.infinity(true),
+            f.canonical_nan(),
+            f.canonical_nan() & !(1 << (f.sig - 2)) | 1, // a signalling nan
+            1,                                           // the smallest subnormal
+            f.sig_mask(),                                // the largest subnormal
+            f.sig_mask() + 1,                            // the smallest normal
+            f.exp_mask() - 1,                            // the largest finite
+        ];
+        // One, two, three and a half, and the neighbours of each: a significand with
+        // its lowest bit set is what makes a sum or a product inexact.
+        let one = ((f.bias() as u64) << (f.sig - 1)) & f.exp_mask();
+        for step in [0, 1, 2, 3, 7, 1 << (f.sig - 2)] {
+            for scale in [0i64, 1, -1, 40, -40, 900, -900] {
+                let exp = ((f.bias() as i64 + scale) as u64) << (f.sig - 1);
+                if exp & !f.exp_mask() != 0 {
+                    continue;
+                }
+                values.push(exp | step);
+                values.push(exp | step | f.sign_bit());
+            }
+        }
+        values.push(one);
+        values
+    }
+
+    /// A deterministic spread of bit patterns, so the sweep reaches values no list of
+    /// interesting ones would name.
+    fn spread(f: Format, count: usize) -> Vec<u64> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                f.trim(state)
+            })
+            .collect()
+    }
+
+    /// The host's arithmetic has to agree with the arithmetic in integers exactly: the
+    /// same bits and the same flags, or no answer at all. It is a fast path and not a
+    /// second implementation, so anywhere the two differ, one of them is wrong.
+    #[test]
+    fn the_host_agrees_with_the_arithmetic_in_integers() {
+        for f in [F32, F64] {
+            let mut values = interesting(f);
+            values.extend(spread(f, 400));
+            let mut taken = 0u64;
+            for &a in &values {
+                for &b in &values {
+                    for (kind, integers) in [
+                        (host::Kind::Add, add_in_integers as fn(_, _, _, _) -> _),
+                        (host::Kind::Sub, sub_in_integers),
+                        (host::Kind::Mul, mul_in_integers),
+                        (host::Kind::Div, div_in_integers),
+                    ] {
+                        let Some(fast) = host::arith(kind, f, a, b, Round::Nearest) else {
+                            continue;
+                        };
+                        taken += 1;
+                        assert_eq!(
+                            fast,
+                            integers(f, a, b, Round::Nearest),
+                            "{kind:?} of {a:#x} and {b:#x} in {} bits",
+                            f.bits
+                        );
+                    }
+                }
+                if let Some(fast) = host::arith(host::Kind::Sqrt, f, a, a, Round::Nearest) {
+                    taken += 1;
+                    assert_eq!(
+                        fast,
+                        sqrt_in_integers(f, a, Round::Nearest),
+                        "the root of {a:#x} in {} bits",
+                        f.bits
+                    );
+                }
+            }
+            assert!(
+                taken > 100_000,
+                "the fast path answered only {taken} times in {} bits, so this proves little",
+                f.bits
+            );
+        }
+    }
+
+    /// Every mode but round-to-nearest stays in the software, since the host has only
+    /// the one and cannot be asked for another without writing the arithmetic in
+    /// assembly.
+    #[test]
+    fn the_host_answers_for_no_other_rounding_mode() {
+        for mode in [Round::Zero, Round::Down, Round::Up, Round::NearestMax] {
+            for f in [F32, F64] {
+                let one = ((f.bias() as u64) << (f.sig - 1)) & f.exp_mask();
+                let three = one | (1 << (f.sig - 2));
+                assert!(host::arith(host::Kind::Div, f, one, three, mode).is_none());
+            }
+        }
+    }
 }

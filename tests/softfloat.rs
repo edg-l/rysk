@@ -3,6 +3,13 @@
 //! Round-to-nearest is the one mode a host also implements, so for that mode its
 //! answers are a reference: anything rysk computes differently is rysk being wrong.
 //! The modes a host cannot express are checked against what they mean instead.
+//!
+//! Round-to-nearest is also the mode `fpu` hands to the host itself now, so for the
+//! values the fast path accepts, this holds the host against the host and proves only
+//! that the handing over is faithful. What proves the two implementations agree is
+//! `the_host_agrees_with_the_arithmetic_in_integers` in `fpu`, which has both of them
+//! to call. The modes below are the ones only the software answers for, and they are
+//! the reason this file is still the wider test of the two.
 
 use rysk::fpu::{self, F32, F64, Round};
 
