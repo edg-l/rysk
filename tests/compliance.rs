@@ -8,7 +8,7 @@ use std::{fs, path::PathBuf};
 use rysk::{
     dram::DRAM_SIZE,
     elf, htif, machine,
-    machine::{Aia, Machine, Usb, Video},
+    machine::{Aia, Machine, Storage, Usb, Video},
 };
 
 /// Generous for a corpus test, which is a few thousand instructions, and short enough
@@ -63,7 +63,7 @@ fn run_group(group: &str) {
             .unwrap_or_else(|| panic!("{name} has no tohost symbol, so it cannot report"));
         let mut hart =
             Machine::from_elf(&image, DRAM_SIZE, 1).unwrap_or_else(|e| panic!("{name}: {e}"));
-        machine::virt(&mut hart, Aia::None, Video::None, Usb::None);
+        machine::virt(&mut hart, Aia::None, Video::None, Usb::None, &Storage::None);
 
         let waiting = WAITING
             .iter()

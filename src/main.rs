@@ -4,7 +4,7 @@ use rysk::{
     bochs,
     dram::DRAM_SIZE,
     elf, htif, machine,
-    machine::{Aia, Machine, Schedule, Usb, Video},
+    machine::{Aia, Machine, Schedule, Storage, Usb, Video},
 };
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut aia = Aia::default();
     let mut video = Video::default();
     let mut usb = Usb::default();
+    let mut storage = Storage::default();
     let mut schedule = None;
     let mut options = machine::Boot::default();
     let mut ramdisk = None;
@@ -78,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|why| panic!("--display {why}"))
             }
             "--usb" => usb = value.parse().unwrap_or_else(|why| panic!("--usb {why}")),
+            "--disk" => storage = value.parse().unwrap_or_else(|why| panic!("--disk {why}")),
             "--schedule" => {
                 schedule = Some(
                     value
@@ -95,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Usage: rysk [-m <mebibytes>] [-smp <harts>] [--initrd <file>] \
              [--append <args>] [--aia none|aplic|aplic-imsic] \
              [--display none|bochs] [--usb none|hid] \
+             [--disk none|<file>|<n>M] \
              [--schedule turns|threads] \
              <image> [image@address ...]"
         );
@@ -151,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         aia,
         video,
         usb,
+        &storage,
     );
     handoff(&mut machine);
 

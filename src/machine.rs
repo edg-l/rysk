@@ -25,11 +25,13 @@ use crate::{
     clint::{self, Clint},
     cpu::Cpu,
     device::{Level, Line, Msi},
+    disk::{self, Disk, Memory},
     dram::Dram,
     elf::{Error as ElfError, Image},
     fdt::Fdt,
     hid::{Hid, Keys, Pointer},
     imsic::{self, Imsic},
+    nvme::Nvme,
     pci::{self, HostBridge, Ports, Root},
     plic::{self, Plic},
     trap::Trap,
@@ -166,6 +168,8 @@ const HOST_BRIDGE: usize = 0;
 const DISPLAY: usize = 1;
 /// And the USB controller, which does interrupt and so is swizzled onto one.
 const CONTROLLER: usize = 2;
+/// And the disk controller.
+const STORAGE: usize = 3;
 
 /// The phandles the tree refers to its interrupt controllers by. A device says which
 /// controller its line runs to, so the controllers need names, and each hart has a
@@ -254,6 +258,52 @@ pub struct Boot {
     pub initrd: Option<(u64, u64)>,
 }
 
+/// What is behind the disk controller, if the machine has one.
+///
+/// A machine given a file has that file as its disk. A machine given a size has one of
+/// that many mebibytes in memory, which is somewhere for a guest to write that nothing
+/// outlives the run, and is what a test of a filesystem wants. Neither is the default:
+/// a machine booted from an initial ramdisk has no use for a second disk.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Storage {
+    #[default]
+    None,
+    File(String),
+    Mebibytes(u64),
+}
+
+impl std::str::FromStr for Storage {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "none" => Ok(Self::None),
+            _ => match name.strip_suffix('M').map(str::parse::<u64>) {
+                Some(Ok(mebibytes)) => Ok(Self::Mebibytes(mebibytes)),
+                Some(Err(_)) => Err(format!("{name}: not a number of mebibytes")),
+                None => Ok(Self::File(name.to_string())),
+            },
+        }
+    }
+}
+
+impl Storage {
+    /// The disk it describes, or nothing if there is none. A file that cannot be opened
+    /// is a machine that was asked for a disk it does not have, which is worth stopping
+    /// over rather than booting without one.
+    fn disk(&self) -> Option<Box<dyn Disk>> {
+        match self {
+            Self::None => None,
+            Self::Mebibytes(mebibytes) => {
+                Some(Box::new(Memory::new(mebibytes * 1024 * 1024 / disk::BLOCK)))
+            }
+            Self::File(path) => Some(Box::new(
+                disk::File::open(path).unwrap_or_else(|why| panic!("{path}: {why}")),
+            )),
+        }
+    }
+}
+
 /// Attach the machine's devices, describe them, and leave the description where the
 /// guest is told to look: `a0` is the hart reading it and `a1` is the tree, which is
 /// the handover every RISC-V kernel expects from whatever ran before it.
@@ -267,9 +317,10 @@ pub fn boot(
     aia: Aia,
     video: Video,
     usb: Usb,
+    storage: &Storage,
 ) -> Frontend {
     let harts = machine.harts.len();
-    let frontend = virt(machine, aia, video, usb);
+    let frontend = virt(machine, aia, video, usb, storage);
     let memory = machine.bus.dram.size();
     let at = fdt_base(memory);
     let tree = describe(isa, memory, harts, options, aia);
@@ -651,7 +702,13 @@ fn tick(cpu: &mut Cpu, bus: &Bus, max: u64) -> Result<u64, Trap> {
 /// attaches is not only on the bus: an interrupt file is a hart's own, reached by that
 /// hart's CSRs, and the page a message arrives at is the same registers seen from the
 /// other side.
-pub fn virt(machine: &mut Machine, aia: Aia, video: Video, usb: Usb) -> Frontend {
+pub fn virt(
+    machine: &mut Machine,
+    aia: Aia,
+    video: Video,
+    usb: Usb,
+    storage: &Storage,
+) -> Frontend {
     let harts = machine.harts.len();
     let bus = &mut machine.bus;
     let serial = Line::default();
@@ -746,6 +803,11 @@ pub fn virt(machine: &mut Machine, aia: Aia, video: Video, usb: Usb) -> Frontend
             (Some(keys), Some(pointer))
         }
     };
+
+    // And a disk, for a machine that was given one.
+    if let Some(disk) = storage.disk() {
+        root.plug(STORAGE, Box::new(Nvme::new(bus.memory(), disk)));
+    }
 
     bus.attach(clint::BASE, clint::SIZE, Box::new(Clint::new(harts)));
     bus.attach(

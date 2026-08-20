@@ -1316,6 +1316,13 @@ impl Xhci {
         // Which endpoint of the device this is: the identifier counts both directions
         // of every endpoint, and an address names the number and the direction.
         let address = ((endpoint as u8) / 2) | (((endpoint & 1) as u8) << 7);
+        // Nothing on this machine has an endpoint carrying data out, so a transfer on
+        // one is refused rather than left outstanding: a driver waiting forever for a
+        // transfer the controller has no way to make is worse than one told so.
+        if endpoint.is_multiple_of(2) {
+            self.transfer_event(trbs.last().copied(), slot, endpoint, TRB_ERROR, 0);
+            return Some(ring);
+        }
         let report = self.device(slot)?.read(address)?;
 
         let mut left = report.as_slice();

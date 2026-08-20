@@ -1075,6 +1075,37 @@ fn polling_with_nothing_typed_finishes_nothing() {
     assert!(host.events().is_empty());
 }
 
+/// Neither device behind this controller has an endpoint carrying data out, so a
+/// transfer on one is refused rather than left outstanding: a driver waiting forever for
+/// something the controller cannot do is worse than one told so.
+#[test]
+fn a_transfer_on_an_endpoint_going_out_is_refused() {
+    let mut host = host();
+    host.start();
+    host.events();
+    let slot = host.attach(1);
+    // Endpoint two, which is the same endpoint number going the other way.
+    let out = REPORTS - 1;
+    host.poke(INPUT, &0u32.to_le_bytes());
+    host.poke(INPUT + 4, &(1u32 | (1 << out)).to_le_bytes());
+    host.poke(
+        INPUT + (out as u64 + 1) * 32 + 4,
+        &((3u32 << 3) | (8 << 16)).to_le_bytes(),
+    );
+    host.poke(
+        INPUT + (out as u64 + 1) * 32 + 8,
+        &((TRANSFERS + 0x1000) | 1).to_le_bytes(),
+    );
+    let added = host.one(trb(CONFIGURE_ENDPOINT, INPUT, 0, (slot as u32) << 24));
+    assert_eq!(added.code(), SUCCESS);
+    host.transfer = TRANSFERS + 0x1000;
+
+    let events = host.transfer(slot, out, &[trb(NORMAL, BUFFER, 8, IOC)]);
+
+    assert_eq!(events.len(), 1, "answered rather than left waiting");
+    assert_eq!(events[0].code(), 5, "a block it could not carry out");
+}
+
 /// A transfer whose buffer is not one run of memory is as many blocks as it has runs,
 /// chained together, and what arrives is spread over them in order.
 #[test]
