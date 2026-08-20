@@ -209,3 +209,100 @@ impl std::fmt::Display for Trap {
         }
     }
 }
+
+/// A trap, as it was actually taken: what happened, where, and where control went.
+///
+/// The interesting part is the pair of modes. `mcause` says why a hart trapped and
+/// `mepc` says from where, but neither says whether `medeleg` sent it to a supervisor
+/// or kept it, and a guest whose handler never runs usually has a delegation that does
+/// not say what its author thought it said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    /// The instruction it happened on, which is what the epc was written with.
+    pub pc: u64,
+    pub trap: Trap,
+    /// The privilege it happened in.
+    pub from: Mode,
+    /// And the one that took it, which is what delegation decided.
+    pub to: Mode,
+    /// Where control went: the vector entry rather than the vector, so a vectored
+    /// interrupt says which entry of the table it reached.
+    pub handler: u64,
+    /// Which trap this was, counted from the machine's reset, and assigned by the log
+    /// rather than by whatever is recording the trap. Two entries a hundred apart came
+    /// a hundred traps apart even when nothing between them was kept.
+    pub seq: u64,
+}
+
+impl std::fmt::Display for Taken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#x}: {}, {} to {}, handler {:#x}",
+            self.pc, self.trap, self.from, self.to, self.handler
+        )
+    }
+}
+
+/// How many traps a hart remembers.
+///
+/// Enough to hold the run-up to whatever went wrong rather than a history: a guest that
+/// is trapping in a loop fills this in microseconds, and the last few dozen are what say
+/// which loop it is.
+const DEPTH: usize = 64;
+
+/// The traps a hart has taken lately, newest last, oldest forgotten.
+///
+/// A ring rather than a growing list, because the failure this exists for is a machine
+/// taking traps far faster than anything is reading them, and a log that grows without
+/// bound under exactly that load is a leak rather than a diagnostic.
+#[derive(Debug, Clone)]
+pub struct Log {
+    entries: [Option<Taken>; DEPTH],
+    /// Where the next one goes, which is also the oldest once the ring has wrapped.
+    next: usize,
+    /// How many have ever been taken, which is what numbers them and what says how
+    /// many were dropped.
+    taken: u64,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            entries: [None; DEPTH],
+            next: 0,
+            taken: 0,
+        }
+    }
+}
+
+impl Log {
+    /// Remember a trap, forgetting the oldest if there is no room. Called from
+    /// `take_trap` and nowhere else, so what is in here is what a handler was actually
+    /// entered for: a trap with no handler installed is not taken and is not logged.
+    pub fn push(&mut self, mut entry: Taken) {
+        entry.seq = self.taken;
+        self.entries[self.next] = Some(entry);
+        self.next = (self.next + 1) % DEPTH;
+        self.taken += 1;
+    }
+
+    /// How many traps this hart has ever taken, whether or not they are still here.
+    pub fn taken(&self) -> u64 {
+        self.taken
+    }
+
+    /// The traps still remembered, newest first, which is the order anything reading
+    /// them wants: what just happened is what is being asked about.
+    pub fn recent(&self) -> impl Iterator<Item = &Taken> {
+        (1..=DEPTH)
+            .map(move |back| self.entries[(self.next + DEPTH - back) % DEPTH].as_ref())
+            .take_while(Option::is_some)
+            .flatten()
+    }
+
+    /// The most recent one, which is what a panel with one line for it shows.
+    pub fn last(&self) -> Option<&Taken> {
+        self.recent().next()
+    }
+}

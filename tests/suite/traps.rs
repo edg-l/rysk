@@ -8,6 +8,8 @@ const MTVEC: u32 = 0x305;
 const MEPC: u32 = 0x341;
 const MCAUSE: u32 = 0x342;
 const MTVAL: u32 = 0x343;
+const MEDELEG: usize = 0x302;
+const STVEC: usize = 0x105;
 
 #[test]
 fn an_unknown_encoding_is_an_illegal_instruction() {
@@ -167,4 +169,92 @@ fn a_trap_with_no_handler_installed_ends_the_run() {
         DRAM_BASE,
         "and pc still points at the faulting instruction"
     );
+}
+
+// ------------------------------------------------------------ the trap log
+
+#[test]
+fn a_trap_that_was_taken_is_remembered_with_where_it_went() {
+    const HANDLER: u64 = DRAM_BASE + 5 * 4;
+    let machine = prog(&[
+        csrrw(ZERO, MTVEC, T0),
+        ecall(),
+        addi(A0, ZERO, 42),
+        csrrw(ZERO, MTVEC, ZERO),
+        jal(ZERO, 24),
+        // handler
+        addi(A1, ZERO, 7),
+        csrrs(T1, MEPC, ZERO),
+        addi(T1, T1, 4),
+        csrrw(ZERO, MEPC, T1),
+        mret(),
+    ])
+    .reg(T0, HANDLER)
+    .expect(Exception::IllegalInstruction(0));
+
+    let log = &machine.harts[0].traps;
+    assert_eq!(log.taken(), 1, "one trap was taken and one was not");
+    let taken = log.last().expect("it is remembered");
+    assert_eq!(taken.trap, Exception::EnvironmentCall(Mode::Machine).into());
+    assert_eq!(taken.pc, DRAM_BASE + 4, "the ecall it happened on");
+    assert_eq!(taken.from, Mode::Machine);
+    assert_eq!(taken.to, Mode::Machine, "nothing delegated it");
+    assert_eq!(taken.handler, HANDLER, "and that is where control went");
+    assert_eq!(taken.seq, 0, "it was the first");
+}
+
+#[test]
+fn a_trap_nothing_was_installed_to_take_is_not_remembered_as_taken() {
+    // It is the halt rather than an entry: the log says what a handler was entered
+    // for, and nothing was entered. Reporting it here would be reporting a handler
+    // that never ran.
+    let machine = prog(&[ecall()]).expect(Exception::EnvironmentCall(Mode::Machine));
+    let log = &machine.harts[0].traps;
+    assert_eq!(log.taken(), 0);
+    assert!(log.last().is_none());
+}
+
+#[test]
+fn the_newest_traps_are_the_ones_kept() {
+    // A handler that returns to the ecall that raised it, so the machine traps in a
+    // loop until the counter in a1 runs out and the handler stops re-arming mtvec.
+    const HANDLER: u64 = DRAM_BASE + 4 * 4;
+    let machine = prog(&[
+        csrrw(ZERO, MTVEC, T0),
+        addi(A1, ZERO, 100),
+        ecall(),
+        jal(ZERO, 20),
+        // handler: count down, uninstall at zero, and return to the ecall itself
+        addi(A1, A1, -1),
+        beq(A1, ZERO, 8),
+        mret(),
+        csrrw(ZERO, MTVEC, ZERO),
+        mret(),
+    ])
+    .reg(T0, HANDLER)
+    .expect(Exception::EnvironmentCall(Mode::Machine));
+
+    let log = &machine.harts[0].traps;
+    assert_eq!(log.taken(), 100, "every one of them was counted");
+    let kept: Vec<_> = log.recent().collect();
+    assert_eq!(kept.len(), 64, "and the last sixty-four of them kept");
+    assert_eq!(kept[0].seq, 99, "newest first");
+    assert_eq!(kept[63].seq, 36, "back to the oldest still here");
+}
+
+#[test]
+fn the_log_says_which_mode_took_the_trap_and_which_raised_it() {
+    // The one thing neither `mcause` nor `mepc` records: whether `medeleg` sent this
+    // to a supervisor or the machine kept it.
+    let machine = prog(&[ecall(), csrrw(ZERO, STVEC as u32, ZERO), addi(A0, ZERO, 1)])
+        .mode(Mode::User)
+        .csr(MEDELEG, 1 << 8)
+        .csr(STVEC, DRAM_BASE + 4)
+        .expect(Exception::IllegalInstruction(0));
+
+    let taken = machine.harts[0].traps.last().expect("it was taken");
+    assert_eq!(taken.trap, Exception::EnvironmentCall(Mode::User).into());
+    assert_eq!(taken.from, Mode::User, "it was raised in u-mode");
+    assert_eq!(taken.to, Mode::Supervisor, "and medeleg sent it to s-mode");
+    assert_eq!(taken.handler, DRAM_BASE + 4, "which is stvec, not mtvec");
 }

@@ -12,7 +12,7 @@ use crate::{
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
     mmu::{Access, PAGE_BITS, PAGE_SIZE, Tlb},
     rvc,
-    trap::{Exception, Interrupt, Trap},
+    trap::{Exception, Interrupt, Log, Taken, Trap},
 };
 
 /// A `fetch_page` naming no page, so that a fetch translates rather than believing it.
@@ -67,6 +67,10 @@ pub struct Cpu {
     /// question. `MPRV`, `SUM` and `MXR` do not come into it, because none of the three
     /// says anything about a fetch.
     fetch_page: (u64, u64),
+    /// The traps this hart has taken lately, which is what says why a guest that is
+    /// not where it should be went there. Written where a trap is taken and read by
+    /// anything inspecting the machine.
+    pub traps: Log,
     /// What the controllers and `mvip` were last seen driving into `mip`. The
     /// controllers publish rather than being asked, so the usual answer before an
     /// instruction is the same one as before the last, and writing it into `mip` again
@@ -91,6 +95,7 @@ impl Cpu {
             imsic: None,
             waiting: false,
             fetch_page: NO_PAGE,
+            traps: Log::default(),
             driven: 0,
         };
 
@@ -287,6 +292,7 @@ impl Cpu {
             _ => tvec & !0b11,
         };
 
+        let from = self.mode;
         if delegated {
             self.csrs[SEPC] = self.pc;
             self.csrs[SCAUSE] = trap.cause();
@@ -300,23 +306,29 @@ impl Cpu {
                     | (sie << MSTATUS_SPIE)
                     | ((self.mode as u64) << MSTATUS_SPP);
             self.mode = Mode::Supervisor;
-            self.fetch_page = NO_PAGE;
-            self.pc = entry;
-            return true;
+        } else {
+            self.csrs[MEPC] = self.pc;
+            self.csrs[MCAUSE] = trap.cause();
+            self.csrs[MTVAL] = trap.value();
+
+            // MIE moves to MPIE and clears, and the mode we came from lands in MPP.
+            let mie = (status >> MSTATUS_MIE) & 1;
+            self.csrs[MSTATUS] =
+                (status & !(1 << MSTATUS_MPIE) & !(1 << MSTATUS_MIE) & !MSTATUS_MPP)
+                    | (mie << MSTATUS_MPIE)
+                    | ((self.mode as u64) << MSTATUS_MPP_SHIFT);
+            self.mode = Mode::Machine;
         }
 
-        self.csrs[MEPC] = self.pc;
-        self.csrs[MCAUSE] = trap.cause();
-        self.csrs[MTVAL] = trap.value();
-
-        // MIE moves to MPIE and clears, and the mode we came from lands in MPP.
-        let mie = (status >> MSTATUS_MIE) & 1;
-        self.csrs[MSTATUS] = (status & !(1 << MSTATUS_MPIE) & !(1 << MSTATUS_MIE) & !MSTATUS_MPP)
-            | (mie << MSTATUS_MPIE)
-            | ((self.mode as u64) << MSTATUS_MPP_SHIFT);
-        self.mode = Mode::Machine;
+        self.traps.push(Taken {
+            pc: self.pc,
+            trap,
+            from,
+            to: self.mode,
+            handler: entry,
+            seq: 0,
+        });
         self.fetch_page = NO_PAGE;
-
         self.pc = entry;
         true
     }
