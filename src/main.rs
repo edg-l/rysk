@@ -13,6 +13,29 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 /// never finish.
 const MAX_STEPS: u64 = 100_000_000;
 
+/// What this takes, for someone who asked or who gave it nothing to run.
+const USAGE: &str = "\
+rysk: a RISC-V emulator. Runs a flat binary at DRAM_BASE, or an ELF at its entry.
+
+    rysk [options] <image> [image@address ...]
+
+    -m <mebibytes>              how much memory the machine has
+    -smp <harts>                how many harts it has
+    --schedule turns|threads    how they take their turns
+    --initrd <file>             a ramdisk, placed as high as it fits
+    --append <args>             the kernel command line
+    --aia none|aplic|aplic-imsic    which interrupt architecture
+    --display none|bochs        a framebuffer and the monitor it answers for
+    --usb none|hid              an xHCI controller, a keyboard and a mouse
+    --disk none|<file>|<n>M     an NVMe controller with that behind it
+    --gui                       open a window on the display
+
+An image after the first says where it goes, which is how firmware and the kernel
+it hands off to are both in memory at once:
+
+    rysk -m 1024 --initrd initrd.gz --append \"console=ttyS0\" \
+         fw_dynamic.bin vmlinux@0x80200000";
+
 /// What a boot rom would leave for firmware that asks: where to go next, and in which
 /// mode. rysk is the stage before OpenSBI, so it is the one that has to say.
 ///
@@ -106,6 +129,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ramdisk = None;
     let mut gui = false;
     let mut at = 0;
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     while at < args.len() {
         // The only option that is not a pair. Everything else names a thing the
         // machine is built with; this one names who is driving it.
@@ -144,14 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let images = &args[at..];
     let Some(first) = images.first() else {
-        panic!(
-            "Usage: rysk [-m <mebibytes>] [-smp <harts>] [--initrd <file>] \
-             [--append <args>] [--aia none|aplic|aplic-imsic] \
-             [--display none|bochs] [--usb none|hid] \
-             [--disk none|<file>|<n>M] \
-             [--schedule turns|threads] [--gui] \
-             <image> [image@address ...]"
-        );
+        // Asking for the usage is not a failure, and neither is running it with
+        // nothing to run: both are told what to say and neither is a panic.
+        println!("{USAGE}");
+        return Ok(());
     };
     let mut code = Vec::new();
     File::open(first)?.read_to_end(&mut code)?;

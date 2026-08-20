@@ -21,12 +21,17 @@ display, a keyboard, a mouse and a disk on it that stock Linux drivers bind to.
 ## Quick start
 
 ```bash
-cargo run --release -- prog.bin            # a flat binary, loaded at 0x8000_0000
-cargo run --release -- -smp 4 prog.bin     # four harts, a host thread each
+cargo install --path .        # or: cargo build --release, for target/release/rysk
 ```
 
-The run ends on a trap nothing is installed to handle, and prints the register
-file and the non-zero CSRs.
+```bash
+rysk prog.bin                 # a flat binary, loaded at 0x8000_0000
+rysk -smp 4 prog.bin          # four harts, a host thread each
+rysk vmlinux                  # or an ELF, started at its entry point
+```
+
+A run ends on a trap nothing is installed to handle, and prints the register file
+and the non-zero CSRs.
 
 ### Boot Linux
 
@@ -48,19 +53,21 @@ enumerates the PCI bus, brings up the other harts and reaches a shell.
 rysk --display bochs --usb hid --disk disk.img --gui ...
 ```
 
-`--gui` opens a window on the guest's screen and types at its USB keyboard.
-Everything else is off unless asked for, and a run stays headless without `--gui`,
-which is what CI and the benchmarks want.
+`--gui` opens a window on the guest's screen and types at its USB keyboard. Every
+device is off unless asked for, and a run stays headless without `--gui`, which is
+what CI and the benchmarks want; `--no-default-features` leaves the window out of
+the build entirely.
 
 ### Watch it execute
 
-```bash
-RUST_LOG=debug cargo run --features trace -- prog.bin   # one line per instruction
-RUST_LOG=trace cargo run --features trace -- prog.bin   # bus loads and stores too
-```
+Tracing is a feature rather than a flag, because the spans cost several times what
+interpreting the instruction does; without it they compile to nothing.
 
-Tracing is off by default because the spans cost several times what interpreting
-the instruction does; without the feature it compiles to nothing.
+```bash
+cargo install --path . --features trace
+RUST_LOG=debug rysk prog.bin   # one line per instruction
+RUST_LOG=trace rysk prog.bin   # bus loads and stores too
+```
 
 ## The machine
 
@@ -86,7 +93,7 @@ attached them, so the two cannot disagree, and nothing about the guest is
 special-cased: it enumerates the bus, walks page tables, takes interrupts and
 starts its other harts the way it would on a board.
 
-| | |
+| what | how it works here |
 |---|---|
 | **RV64GC** | the base integer set, multiply, atomics, compressed instructions, and single and double floating point done in integers because no host rounds the five ways this machine can |
 | **Zicsr, Zicntr, Zifencei** | the CSR instructions, `cycle`/`time`/`instret`, and instruction-fetch fencing |
