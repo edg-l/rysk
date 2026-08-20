@@ -393,6 +393,11 @@ fn tick(cpu: &mut Cpu, bus: &mut Bus, max: u64) -> Result<u64, Trap> {
             // Whatever raised did not retire, and `pc` is the handler's now.
             return Ok(retired);
         }
+        // Turns of this loop, not instructions: a fused pair is two instructions and
+        // one turn. The quantum is how long a hart holds the host, and reading what a
+        // pair is worth out of the instruction here would keep the whole of it in a
+        // register across the instruction being executed, which costs 10% of the host
+        // instructions a benchmark retires.
         retired += 1;
         // A park and a trap both leave the rest of the block for another round, since
         // neither one continues at the instruction after this.

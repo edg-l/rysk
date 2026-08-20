@@ -7,6 +7,7 @@ mod control;
 mod csr;
 mod device;
 mod encoding;
+mod fusion;
 mod integer;
 mod interrupt;
 mod memory;

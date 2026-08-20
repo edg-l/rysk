@@ -2,7 +2,7 @@
 use tracing::instrument;
 
 use crate::{
-    block::{Block, Blocks, Decoded, LENGTH, ends},
+    block::{Block, Blocks, Decoded, LENGTH, ends, fuse},
     bus::{Bus, DRAM_BASE},
     clint,
     csr::{self, *},
@@ -227,7 +227,8 @@ impl Cpu {
             inst,
             encoding,
             length,
-            writes_instret,
+            cycles,
+            instret,
         } = decoded;
         trace_insn!("{:#x}  {inst}", self.pc);
 
@@ -236,7 +237,7 @@ impl Cpu {
         // The RISC-V Instruction Set Manual Volume II, 3.1.12.
         let inhibit = self.csrs[MCOUNTINHIBIT];
         if inhibit & 1 == 0 {
-            self.csrs[MCYCLE] = self.csrs[MCYCLE].wrapping_add(1);
+            self.csrs[MCYCLE] = self.csrs[MCYCLE].wrapping_add(cycles as u64);
         }
         self.execute(bus, inst, encoding)?;
 
@@ -244,9 +245,9 @@ impl Cpu {
         // one that trapped did not, and `ecall` and `ebreak` are specified as never
         // retiring at all. The RISC-V Instruction Set Manual Volume II, 3.3.1.
         // An instruction that names the retired-instruction counter has said what it
-        // should hold, so it does not also count itself.
-        if inhibit & 0b100 == 0 && !writes_instret {
-            self.csrs[MINSTRET] = self.csrs[MINSTRET].wrapping_add(1);
+        // should hold, so it owes it nothing.
+        if inhibit & 0b100 == 0 {
+            self.csrs[MINSTRET] = self.csrs[MINSTRET].wrapping_add(instret as u64);
         }
 
         self.regs[0] = 0;
@@ -649,15 +650,25 @@ impl Cpu {
                 Err(exception) if decoded == 0 => return Err(exception),
                 Err(_) => break,
             };
-            run[decoded] = next;
-            decoded += 1;
             at = at.wrapping_add(next.length as u64);
             va = va.wrapping_add(next.length as u64);
+            // A pair the machine can do as one instruction takes the slot the first of
+            // the two is already in.
+            match decoded
+                .checked_sub(1)
+                .and_then(|last| fuse(run[last], next))
+            {
+                Some(fused) => run[decoded - 1] = fused,
+                None => {
+                    run[decoded] = next;
+                    decoded += 1;
+                }
+            }
             // A run holds one page's instructions, so that the translation its first
             // one paid for answers for all of them. An instruction whose halves are in
             // two pages is left as the last of the run that reaches it: it is the one
             // place the second half translates on its own.
-            if ends(next.inst.op) || (at ^ pa) & !(PAGE_SIZE - 1) != 0 {
+            if ends(run[decoded - 1].inst.op) || (at ^ pa) & !(PAGE_SIZE - 1) != 0 {
                 break;
             }
         }
@@ -693,10 +704,13 @@ impl Cpu {
             inst,
             encoding: if length == 2 { word & 0xffff } else { word },
             length: length as u8,
-            writes_instret: matches!(
-                inst.op,
-                Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
-            ) && matches!(inst.imm as usize, MINSTRET | MINSTRETH),
+            cycles: 1,
+            instret: u8::from(
+                !matches!(
+                    inst.op,
+                    Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
+                ) || !matches!(inst.imm as usize, MINSTRET | MINSTRETH),
+            ),
         })
     }
 
