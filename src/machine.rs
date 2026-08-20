@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{
-            AtomicBool, AtomicUsize,
+            AtomicU8, AtomicUsize,
             Ordering::{Relaxed, SeqCst},
         },
     },
@@ -414,36 +414,109 @@ impl std::str::FromStr for Schedule {
     }
 }
 
+/// What a machine is doing, which is one of three things rather than two: a machine
+/// that has stopped has either stopped for now or stopped for good, and only the
+/// first of them can be asked to carry on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// The harts are to go on taking their turns.
+    Running,
+    /// They are to stop at the end of the quantum each is in, and may be asked to
+    /// carry on from exactly there.
+    Paused,
+    /// They are to stop and stay stopped. A trap nothing was installed to take is
+    /// this, and so is a window being closed: neither leaves anywhere to carry on to.
+    Halted,
+}
+
+impl State {
+    /// The byte it is kept as, since there is no atomic of the enum itself.
+    fn code(self) -> u8 {
+        match self {
+            Self::Running => 0,
+            Self::Paused => 1,
+            Self::Halted => 2,
+        }
+    }
+
+    fn from(code: u8) -> Self {
+        match code {
+            0 => Self::Running,
+            1 => Self::Paused,
+            2 => Self::Halted,
+            _ => unreachable!("a machine is running, paused or halted"),
+        }
+    }
+}
+
 /// Whether the harts are to go on running, for something outside them that may want
 /// them to stop: the first hart to reach a trap nothing handles, a window being
-/// closed, or a control channel being told to.
+/// closed, an inspector wanting to read the machine, or a control channel being told
+/// to.
 ///
 /// It is read between quanta rather than between instructions, so stopping is a
-/// request rather than a halt: whatever a hart is part way through finishes first, and
-/// the machine is left at an instruction boundary either way.
+/// request rather than an event: whatever a hart is part way through finishes first,
+/// and the machine is left at an instruction boundary either way. That is also what
+/// makes a pause safe to read across: the run that was asked to pause returns, and a
+/// frontend holding the machine after it returned holds every hart between
+/// instructions.
 ///
-/// A machine that has been stopped stays stopped. Asking a stopped machine to run
-/// answers immediately, which is what a frontend pausing one wants and is why this is
-/// a handle rather than an argument to `run`.
+/// A machine that has been *halted* stays halted, and asking it to run answers
+/// immediately. A machine that has been *paused* is asked to carry on with `resume`,
+/// which is what separates a frontend looking at a machine from a frontend finished
+/// with it. Neither transition can raise a halted machine, so a halt racing a pause
+/// leaves it halted whichever lands second.
 #[derive(Debug, Clone)]
-pub struct Running(Arc<AtomicBool>);
+pub struct Running(Arc<AtomicU8>);
 
 impl Default for Running {
     fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
+        Self(Arc::new(AtomicU8::new(State::Running.code())))
     }
 }
 
 impl Running {
-    /// Ask for the machine to stop, at the end of whatever quantum each hart is in.
-    pub fn stop(&self) {
-        self.0.store(false, SeqCst);
+    /// What the machine is doing.
+    pub fn state(&self) -> State {
+        State::from(self.0.load(Relaxed))
     }
 
-    /// Whether it is still to run, which is what a frontend watching a machine on a
-    /// thread of its own asks.
+    /// Ask for the machine to stop for good, at the end of whatever quantum each hart
+    /// is in. Nothing carries on from here.
+    pub fn halt(&self) {
+        self.0.store(State::Halted.code(), SeqCst);
+    }
+
+    /// Ask for the machine to stop where it is, so that something can look at it.
+    /// A halted machine is left halted: there is nothing to look at that carrying on
+    /// would change.
+    pub fn pause(&self) {
+        let _ =
+            self.0
+                .compare_exchange(State::Running.code(), State::Paused.code(), SeqCst, Relaxed);
+    }
+
+    /// Ask a paused machine to carry on from where it stopped. A halted one stays
+    /// halted, and a running one is already running.
+    pub fn resume(&self) {
+        let _ =
+            self.0
+                .compare_exchange(State::Paused.code(), State::Running.code(), SeqCst, Relaxed);
+    }
+
+    /// Whether the harts are to go on running, which is what each of them asks between
+    /// quanta and what a frontend watching a machine on a thread of its own asks.
+    ///
+    /// One relaxed load, on the path a quantum ends on rather than the one an
+    /// instruction does.
     pub fn going(&self) -> bool {
-        self.0.load(Relaxed)
+        self.0.load(Relaxed) == State::Running.code()
+    }
+
+    /// Whether it has stopped for good, so that a frontend can tell a machine waiting
+    /// to be looked at from one that has finished.
+    pub fn halted(&self) -> bool {
+        self.state() == State::Halted
     }
 }
 
@@ -492,14 +565,20 @@ impl Machine {
     /// it, or until something asked the machine to stop, which is no halt at all.
     ///
     /// Which of the two schedules gives them their turns is the machine's to say.
+    ///
+    /// A run that came back has stopped, but it has not necessarily finished: a trap
+    /// nothing took is a halt and nothing carries on from it, while a run that was
+    /// paused is left paused, and calling this again after `Running::resume` carries on
+    /// from exactly where the harts stopped. Every hart is between instructions either
+    /// way, which is what makes the gap safe to look at the machine through.
     pub fn run(&mut self) -> Option<Halt> {
         let halt = match self.schedule {
             Schedule::RoundRobin => self.run_in_turn(),
             Schedule::Threads => self.run_on_threads(),
         };
-        // However it ended, it has ended: a run that came back is not still going, and
-        // a frontend watching the flag is what says so.
-        self.running.stop();
+        if halt.is_some() {
+            self.running.halt();
+        }
         halt
     }
 
@@ -563,7 +642,7 @@ impl Machine {
                         if let Some(halt) = run_quantum(cpu, bus, quantum, hart) {
                             let mut held = first.lock().unwrap_or_else(|h| h.into_inner());
                             held.get_or_insert(halt);
-                            running.stop();
+                            running.halt();
                             return;
                         }
                     }
@@ -1118,6 +1197,74 @@ pub fn describe(isa: &str, memory: u64, harts: usize, options: &Boot, aia: Aia) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `j .`, a jump to itself, which is a machine that runs for ever without leaving
+    /// the word it started on. What a run of it does is decided entirely by what asked
+    /// it to stop.
+    const FOREVER: u32 = 0x0000_006f;
+
+    fn looping() -> Machine {
+        let mut machine = Machine::new(FOREVER.to_le_bytes().to_vec(), 1 << 20, 1);
+        // Short, so that a run reaches the top of the loop that reads the flag often.
+        machine.quantum = 4;
+        machine
+    }
+
+    /// The distinction the whole inspection surface rests on: a run that was paused
+    /// comes back without having halted, and running it again carries on rather than
+    /// answering immediately.
+    #[test]
+    fn a_paused_run_comes_back_paused_rather_than_halted() {
+        let mut machine = looping();
+        let running = machine.running.clone();
+
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(10));
+                running.pause();
+            });
+            assert_eq!(machine.run(), None);
+        });
+
+        assert_eq!(machine.running.state(), State::Paused);
+        assert!(!machine.running.halted());
+        // It never left the jump, so wherever it stopped is that jump.
+        assert_eq!(machine.harts[0].pc, DRAM_BASE);
+
+        machine.running.resume();
+        assert_eq!(machine.running.state(), State::Running);
+        assert_eq!(machine.advance(0, 4), Ok(1));
+    }
+
+    /// And a halted machine stays halted, which is what keeps a frontend that has
+    /// finished with a machine from being handed a running one by a stray resume.
+    #[test]
+    fn nothing_carries_a_halted_machine_on() {
+        let running = Running::default();
+        running.halt();
+
+        running.resume();
+        assert_eq!(running.state(), State::Halted);
+        running.pause();
+        assert_eq!(running.state(), State::Halted);
+        assert!(!running.going());
+    }
+
+    /// A halt and a pause racing leaves the machine halted whichever of them lands
+    /// second, since neither transition can raise one that has already halted. A window
+    /// closing while a panel is reading is exactly this race.
+    #[test]
+    fn a_halt_outranks_a_pause_either_way_round() {
+        let first = Running::default();
+        first.pause();
+        first.halt();
+        assert_eq!(first.state(), State::Halted);
+
+        let second = Running::default();
+        second.halt();
+        second.pause();
+        assert_eq!(second.state(), State::Halted);
+    }
 
     /// A machine has to be able to cross a thread boundary, because the window belongs
     /// on the main thread and the harts do not. This is what notices the day something

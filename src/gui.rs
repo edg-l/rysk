@@ -27,7 +27,7 @@ use crate::{
     bochs::{Dirty, Format, Mode, PAGE, Screen},
     hid::{Keys, Pointer},
     input::{Keyboard, Mouse},
-    machine::{Halt, Machine, Running},
+    machine::{Halt, Machine, Running, State},
 };
 
 /// The ends of the machine a window drives it through: what a frame is read out of,
@@ -128,7 +128,7 @@ struct Watching(Running);
 
 impl Drop for Watching {
     fn drop(&mut self) {
-        self.0.stop();
+        self.0.halt();
     }
 }
 
@@ -257,9 +257,10 @@ impl Window {
                 mode.width, mode.height, mode.format, mode.stride
             ),
         };
-        let state = match self.running.going() {
-            true => "running",
-            false => "stopped",
+        let state = match self.running.state() {
+            State::Running => "running",
+            State::Paused => "paused",
+            State::Halted => "halted",
         };
         ui.horizontal(|ui| {
             ui.label(showing);
@@ -295,7 +296,7 @@ impl eframe::App for Window {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.running.stop();
+        self.running.halt();
     }
 }
 
