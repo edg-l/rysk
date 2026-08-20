@@ -301,9 +301,14 @@ impl Machine {
     fn run_hart(&mut self, hart: usize, steps: u64) -> Option<Halt> {
         let cpu = &mut self.harts[hart];
         let bus = &mut self.bus;
-        for _ in 0..steps {
-            if let Some(trap) = tick(cpu, bus) {
-                return Some(Halt { hart, trap });
+        let mut left = steps;
+        while left > 0 {
+            match tick(cpu, bus, left) {
+                // A round that retired nothing still took one of the quantum: it
+                // entered a handler, and a hart that did nothing else would otherwise
+                // never give the others their turn.
+                Ok(retired) => left -= retired.max(1),
+                Err(trap) => return Some(Halt { hart, trap }),
             }
             if cpu.waiting {
                 break;
@@ -316,11 +321,18 @@ impl Machine {
     /// machine between instructions rather than leave it running. A hart that is
     /// parked and has nothing to wake it runs nothing.
     pub fn step(&mut self, hart: usize) -> Option<Trap> {
+        self.advance(hart, 1).err()
+    }
+
+    /// Run one hart to the end of the run of instructions at its `pc`, or for `max` of
+    /// them, whichever comes first. Answers how many retired, or the trap nothing was
+    /// installed to take.
+    pub fn advance(&mut self, hart: usize, max: u64) -> Result<u64, Trap> {
         self.bus.poll();
         if !ready(&mut self.harts[hart], &self.bus) {
-            return None;
+            return Ok(0);
         }
-        tick(&mut self.harts[hart], &mut self.bus)
+        tick(&mut self.harts[hart], &mut self.bus, max)
     }
 }
 
@@ -334,28 +346,70 @@ fn ready(cpu: &mut Cpu, bus: &Bus) -> bool {
     !cpu.waiting
 }
 
-/// One instruction on one hart: offer it an interrupt, then execute. Answers the trap
-/// that nothing was installed to take, which is where a run ends.
+/// Run the instructions of one block on one hart, up to `max` of them: offer an
+/// interrupt before each, then execute. Answers how many retired, or the trap that
+/// nothing was installed to take, which is where a run ends.
+///
+/// The interrupt is offered per instruction rather than per block, so that one is
+/// takeable between any two instructions and its latency is what it was. What a block
+/// saves is the fetch: translating, finding the decoded instruction and deciding where
+/// the run ends happen once for the whole of it.
 ///
 /// Left to the compiler to inline or not, and it does not: the body is large, and
 /// forcing it into the loop that runs a quantum is 3.6% slower on a Linux boot even
-/// though it removes a call frame per instruction. What the frame saves and restores
-/// is registers the body needs, so taking the boundary away does not remove that work,
-/// it spreads the spills through the loop instead.
+/// though it removes a call frame. What the frame saves and restores is registers the
+/// body needs, so taking the boundary away does not remove that work, it spreads the
+/// spills through the loop instead.
 #[inline]
-fn tick(cpu: &mut Cpu, bus: &mut Bus) -> Option<Trap> {
+fn tick(cpu: &mut Cpu, bus: &mut Bus, max: u64) -> Result<u64, Trap> {
     if let Some(interrupt) = cpu.interrupt(bus) {
         let trap = Trap::Interrupt(interrupt);
         if !cpu.take_trap(trap) {
-            return Some(trap);
+            return Err(trap);
+        }
+        return Ok(0);
+    }
+    let block = match cpu.block(bus) {
+        Ok(block) => block,
+        Err(exception) => {
+            let trap = exception.into();
+            if !cpu.take_trap(trap) {
+                return Err(trap);
+            }
+            return Ok(0);
+        }
+    };
+    let length = block.len.min(max as usize);
+    let mut retired = 0;
+    for index in 0..length {
+        // The instructions of a block are consecutive, so the one at `pc` is the one
+        // after the last, without asking where `pc` is.
+        let decoded = cpu.blocks.at(block.start + index);
+        if let Err(exception) = cpu.retire(bus, decoded) {
+            let trap = exception.into();
+            if !cpu.take_trap(trap) {
+                return Err(trap);
+            }
+            // Whatever raised did not retire, and `pc` is the handler's now.
+            return Ok(retired);
+        }
+        retired += 1;
+        // A park and a trap both leave the rest of the block for another round, since
+        // neither one continues at the instruction after this.
+        if cpu.waiting {
+            break;
+        }
+        if index + 1 < length
+            && let Some(interrupt) = cpu.interrupt(bus)
+        {
+            let trap = Trap::Interrupt(interrupt);
+            if !cpu.take_trap(trap) {
+                return Err(trap);
+            }
+            break;
         }
     }
-    if let Err(exception) = cpu.step(bus)
-        && !cpu.take_trap(exception.into())
-    {
-        return Some(exception.into());
-    }
-    None
+    Ok(retired)
 }
 
 /// Attach what a `virt` machine has, and hand back the end of the serial port that

@@ -253,6 +253,32 @@ fn an_instruction_that_straddles_two_pages_is_fetched_through_both() {
 }
 
 #[test]
+fn a_run_of_instructions_stops_at_the_page_it_started_in() {
+    // Straight-line code that reaches the end of a page continues in whatever the next
+    // page is mapped to, and the two pages here are mapped to frames that are not next
+    // to each other. Decoding ahead past the edge would find the decoy.
+    let next = FRAME + 0x2000;
+    let decoy = FRAME + 0x1000;
+    let machine = mapped(&[jalr(ZERO, T0, 0)], V | R | X | A)
+        .memory(LEAF + 16, pte(next, V | R | X | A))
+        .memory(
+            FRAME + 0xff8,
+            addi(A0, ZERO, 1) as u64 | ((addi(A1, ZERO, 1) as u64) << 32),
+        )
+        .memory(next, addi(A2, ZERO, 1) as u64)
+        .memory(decoy, addi(A2, ZERO, 2) as u64)
+        .reg(T0, VA + 0xff8)
+        .run();
+    assert_eq!(machine.reg(A0), 1, "the last two instructions of the page");
+    assert_eq!(machine.reg(A1), 1, "the last two instructions of the page");
+    assert_eq!(
+        machine.reg(A2),
+        1,
+        "the instruction the next page is mapped to, not the frame beside this one"
+    );
+}
+
+#[test]
 fn a_page_that_may_not_be_executed_faults_on_the_fetch() {
     mapped(&[jalr(ZERO, T0, 0)], V | R | W | A | D)
         .memory(FRAME, addi(A0, ZERO, 1) as u64)

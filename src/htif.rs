@@ -46,16 +46,23 @@ pub fn tohost(image: &Image) -> Option<u64> {
 /// Run until the image writes to `tohost`, traps with nothing to handle it, or runs
 /// longer than `max_steps`.
 ///
-/// One instruction at a time rather than through the machine's own loop, because the
-/// address has to be read back between any two of them. The corpus is single-hart, so
-/// the hart it runs is hart zero.
+/// A block at a time rather than through the machine's own loop, because the address
+/// has to be read back between them: the corpus reports by writing it and then spinning
+/// on a jump to itself, which is where a block ends. The corpus is single-hart, so the
+/// hart it runs is hart zero.
 pub fn run(machine: &mut Machine, tohost: u64, max_steps: u64) -> Outcome {
-    for _ in 0..max_steps {
-        if let Some(trap) = machine.step(0) {
-            return Outcome::Trapped {
-                trap,
-                pc: machine.harts[0].pc,
-            };
+    let mut left = max_steps;
+    while left > 0 {
+        match machine.advance(0, left) {
+            // A round that retired nothing is a hart that took a trap or has parked,
+            // and counts as one so that neither spins here forever.
+            Ok(retired) => left -= retired.max(1),
+            Err(trap) => {
+                return Outcome::Trapped {
+                    trap,
+                    pc: machine.harts[0].pc,
+                };
+            }
         }
 
         // The store lands through the bus like any other, so reading it back is how

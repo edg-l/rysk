@@ -2,12 +2,12 @@
 use tracing::instrument;
 
 use crate::{
+    block::{Block, Blocks, Decoded, LENGTH, ends},
     bus::{Bus, DRAM_BASE},
     clint,
     csr::{self, *},
     device::Level,
     fpu::{self, F32, F64, Format, Round},
-    icache::{Decoded, Icache},
     imsic::{self, Imsic},
     inst::{self, AmoOp, CasWidth, Cond, FpOp, Inst, Op, Width, decode},
     mmu::{Access, PAGE_BITS, PAGE_SIZE, Tlb},
@@ -40,8 +40,9 @@ pub struct Cpu {
     pub mode: Mode,
     /// What the last few page table walks found, so most of them do not happen.
     pub tlb: Tlb,
-    /// What the last few fetches decoded to, so most of them do not happen either.
-    pub icache: Icache,
+    /// What the last few runs of straight-line code decoded to, so most fetches do
+    /// not happen either.
+    pub blocks: Blocks,
     /// Which hart this is. It is the index the machine holds it at, the reservation on
     /// the bus that is its own, the interrupt bits the controllers drive for it, and
     /// what `mhartid` reads.
@@ -85,7 +86,7 @@ impl Cpu {
             fregs: [0; 32],
             mode: Mode::Machine,
             tlb: Tlb::default(),
-            icache: Icache::default(),
+            blocks: Blocks::default(),
             hart,
             imsic: None,
             waiting: false,
@@ -214,14 +215,20 @@ impl Cpu {
     }
 
     /// Fetch, decode and execute one instruction.
-    #[inline]
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), Exception> {
+        let block = self.block(bus)?;
+        self.retire(bus, self.blocks.at(block.start))
+    }
+
+    /// Execute one instruction of a run that has already been decoded.
+    #[inline]
+    pub fn retire(&mut self, bus: &mut Bus, decoded: Decoded) -> Result<(), Exception> {
         let Decoded {
             inst,
             encoding,
             length,
             writes_instret,
-        } = self.fetch(bus)?;
+        } = decoded;
         trace_insn!("{:#x}  {inst}", self.pc);
 
         self.next_pc = self.pc.wrapping_add(length as u64);
@@ -599,15 +606,14 @@ impl Cpu {
         Ok(())
     }
 
-    /// Read the instruction at `pc`, and hand back its encoding along with it: a trap
-    /// this instruction raises owes that encoding to `mtval`, and how long it was is
-    /// read back out of it.
+    /// The run of instructions starting at `pc`: the one already decoded there, or a
+    /// new one decoded and kept now.
     ///
-    /// It arrives a halfword at a time because its length is in its first two bytes: a
-    /// compressed instruction can sit in the last two bytes of memory, and reading four
-    /// there would fault on bytes it does not have.
+    /// Only the first instruction of a run is translated. The rest are in the page it
+    /// is in, which is what a run ending at the page edge is for, so they share its
+    /// permissions and its frame.
     #[inline]
-    fn fetch(&mut self, bus: &mut Bus) -> Result<Decoded, Exception> {
+    pub fn block(&mut self, bus: &mut Bus) -> Result<Block, Exception> {
         // Where the last instruction came from answers for the whole page it was in,
         // and most instructions are in the page the one before them was.
         let vpn = self.pc >> PAGE_BITS;
@@ -618,9 +624,52 @@ impl Cpu {
             self.fetch_page = (vpn, pa & !(PAGE_SIZE - 1));
             pa
         };
-        if let Some(decoded) = self.icache.get(pa) {
-            return Ok(decoded);
+        match self.blocks.get(pa) {
+            Some(block) => Ok(block),
+            None => self.build(bus, pa),
         }
+    }
+
+    /// Decode from `pa` until the run ends, and keep what was decoded.
+    ///
+    /// Out of line: it runs once for as many instructions as it decodes, and letting it
+    /// into the caller would spread its registers through a path that mostly hits.
+    #[inline(never)]
+    fn build(&mut self, bus: &mut Bus, pa: u64) -> Result<Block, Exception> {
+        let mut run = [Decoded::NONE; LENGTH];
+        let mut decoded = 0;
+        let (mut at, mut va) = (pa, self.pc);
+        while decoded < LENGTH {
+            let next = match self.decode_at(bus, at, va) {
+                Ok(next) => next,
+                // Only the first instruction is one the hart has asked for. Everything
+                // past it is read ahead of being reached, so an encoding this machine
+                // refuses ends the run instead of raising: the hart may never arrive
+                // there, and if it does, the run starting there raises it then.
+                Err(exception) if decoded == 0 => return Err(exception),
+                Err(_) => break,
+            };
+            run[decoded] = next;
+            decoded += 1;
+            at = at.wrapping_add(next.length as u64);
+            va = va.wrapping_add(next.length as u64);
+            // A run holds one page's instructions, so that the translation its first
+            // one paid for answers for all of them. An instruction whose halves are in
+            // two pages is left as the last of the run that reaches it: it is the one
+            // place the second half translates on its own.
+            if ends(next.inst.op) || (at ^ pa) & !(PAGE_SIZE - 1) != 0 {
+                break;
+            }
+        }
+        Ok(self.blocks.insert(pa, &run[..decoded]))
+    }
+
+    /// Read and decode the instruction at `pa`, whose virtual address is `va`.
+    ///
+    /// It arrives a halfword at a time because its length is in its first two bytes: a
+    /// compressed instruction can sit in the last two bytes of memory, and reading four
+    /// there would fault on bytes it does not have.
+    fn decode_at(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<Decoded, Exception> {
         // The whole word at once, where both halves are certain to be in the same page
         // and in dram. A page is the granularity of translation and of dram alike, so
         // reading the wider one there cannot fault where the two narrower ones would
@@ -628,9 +677,9 @@ impl Cpu {
         // that is not dram is read a half at a time, and so is the last halfword of a
         // page, which is the only place the two halves translate differently.
         let word = if pa & 0xfff <= 0xffc && bus.in_dram(pa, 32) {
-            self.word(bus, pa)?
+            self.word(bus, pa, va)?
         } else {
-            self.halves(bus, pa)?
+            self.halves(bus, pa, va)?
         };
         // A compressed instruction is the low half alone, and the high half of what was
         // read is not part of it.
@@ -640,7 +689,7 @@ impl Cpu {
         } else {
             decode(word)?
         };
-        let decoded = Decoded {
+        Ok(Decoded {
             inst,
             encoding: if length == 2 { word & 0xffff } else { word },
             length: length as u8,
@@ -648,41 +697,37 @@ impl Cpu {
                 inst.op,
                 Op::Csrrw { .. } | Op::Csrrs { .. } | Op::Csrrc { .. }
             ) && matches!(inst.imm as usize, MINSTRET | MINSTRETH),
-        };
-        // Only what decoded. An encoding this machine refuses raises the same exception
-        // every time it is fetched, and remembering it would save nothing.
-        self.icache.insert(pa, decoded);
-        Ok(decoded)
+        })
     }
 
     /// The instruction at `pa`, read a halfword at a time, with the second half
     /// translated on its own where the first one ends a page. A compressed instruction
     /// is answered by its own half and the one after it is never read.
-    fn halves(&mut self, bus: &mut Bus, pa: u64) -> Result<u32, Exception> {
-        let half = self.halfword(bus, pa)?;
+    fn halves(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<u32, Exception> {
+        let half = self.halfword(bus, pa, va)?;
         if inst::length(half) == 2 {
             return Ok(half as u32);
         }
-        let next = if self.pc & 0xfff == 0xffe {
-            self.translate(bus, self.pc + 2, Access::Fetch)?
+        let next = if va & 0xfff == 0xffe {
+            self.translate(bus, va + 2, Access::Fetch)?
         } else {
             pa + 2
         };
-        Ok(half as u32 | (self.halfword(bus, next)? as u32) << 16)
+        Ok(half as u32 | (self.halfword(bus, next, va)? as u32) << 16)
     }
 
     #[inline]
-    fn halfword(&mut self, bus: &mut Bus, pa: u64) -> Result<u16, Exception> {
+    fn halfword(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<u16, Exception> {
         bus.load(pa, 16)
             .map(|half| half as u16)
-            .map_err(|_| Exception::InstructionAccessFault(self.pc))
+            .map_err(|_| Exception::InstructionAccessFault(va))
     }
 
     #[inline]
-    fn word(&mut self, bus: &mut Bus, pa: u64) -> Result<u32, Exception> {
+    fn word(&mut self, bus: &mut Bus, pa: u64, va: u64) -> Result<u32, Exception> {
         bus.load(pa, 32)
             .map(|word| word as u32)
-            .map_err(|_| Exception::InstructionAccessFault(self.pc))
+            .map_err(|_| Exception::InstructionAccessFault(va))
     }
 
     /// Read `bits` at a virtual address.
@@ -1013,7 +1058,7 @@ impl Cpu {
             // be fetched by another needs that hart to execute its own.
             // The RISC-V Instruction Set Manual Volume I, 5.
             Op::Fence => {}
-            Op::FenceI => self.icache.flush(),
+            Op::FenceI => self.blocks.flush(),
 
             // ------------------------------------------------- floating point
             Op::FpLoad { .. } | Op::FpStore { .. } | Op::Fp { .. } | Op::FpFused { .. }

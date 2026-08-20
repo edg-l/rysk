@@ -144,6 +144,12 @@ fn software_cannot_clear_a_pending_bit_a_device_is_driving() {
 fn a_timer_that_is_armed_and_enabled_eventually_fires() {
     let [off, uninstall] = quiesce(true);
     let machine = timed(&[
+        // A deadline read off the clock and added to, the way a driver arms one. An
+        // absolute deadline would be a race against however long the machine took to
+        // build, since `mtime` counts from when the clint was made rather than from
+        // the first instruction.
+        ld(T3, T4, 0),
+        add(T1, T3, T1),
         sd(T1, T0, 0),
         wfi(),
         addi(A1, ZERO, 1),
@@ -156,9 +162,10 @@ fn a_timer_that_is_armed_and_enabled_eventually_fires() {
     ])
     .reg(T1, SOON)
     .reg(T2, u64::MAX)
+    .reg(T4, clint::BASE + clint::MTIME)
     .csr(MIE, MTIE)
     .csr(MSTATUS, 1 << MSTATUS_MIE)
-    .csr(MTVEC, DRAM_BASE + 12)
+    .csr(MTVEC, DRAM_BASE + 20)
     .expect(Exception::IllegalInstruction(0));
     assert_eq!(machine.reg(A0), 1, "the timer handler ran");
     assert_eq!(
@@ -172,7 +179,7 @@ fn a_timer_that_is_armed_and_enabled_eventually_fires() {
     );
     assert_eq!(
         machine.csr(MEPC),
-        DRAM_BASE + 8,
+        DRAM_BASE + 16,
         "wfi retires and the trap lands on the instruction after it, so returning from \
          the handler resumes past the wait"
     );
